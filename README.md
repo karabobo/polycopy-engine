@@ -39,22 +39,36 @@ token balance adapter. It has no order-writing API; see
 ## Authenticated GHOST verification
 
 `ghost_verify` performs only authenticated balance reads; it has no order,
-cancel, approval, deposit, or credential-creation path. It requires a
-timestamped manual snapshot plus **existing** CLOB L2 API credentials, so the
-SDK cannot auto-create credentials. Supply them only through the local process
-environment, never a committed file:
+cancel, approval, deposit, or credential-creation path. By default it uses the
+signing key to derive an **existing** CLOB L2 credential; a failed derivation
+does not create one. It needs a timestamped manual snapshot and these local
+process-environment variables, never a committed file:
 
 ```text
 POLYCOPY_CLOB_PRIVATE_KEY=[signing key]
-POLYCOPY_CLOB_L2_API_KEY=[existing UUID]
-POLYCOPY_CLOB_L2_API_SECRET=[existing secret]
-POLYCOPY_CLOB_L2_API_PASSPHRASE=[existing passphrase]
 POLYCOPY_CLOB_SIGNATURE_TYPE=eoa|proxy|gnosis_safe|poly1271
-POLYCOPY_CLOB_FUNDER=[required only for poly1271]
+POLYCOPY_CLOB_FUNDER=[optional for proxy/gnosis_safe; required for poly1271]
 POLYCOPY_GHOST_SNAPSHOT_AT_UTC=2026-08-30T00:00:00Z
 POLYCOPY_GHOST_EXPECTED_COLLATERAL=[decimal]
 POLYCOPY_GHOST_EXPECTED_TOKEN_BALANCES=123456789=1.5,987654321=0
 ```
+
+If the existing API credential was created with a non-default nonce, set
+`POLYCOPY_CLOB_L2_NONCE=[u32]`. Alternatively, provide all three existing L2
+credential variables (`POLYCOPY_CLOB_L2_API_KEY`,
+`POLYCOPY_CLOB_L2_API_SECRET`, and `POLYCOPY_CLOB_L2_API_PASSPHRASE`) to skip
+derivation. Partial credentials are rejected, and a nonce cannot be combined
+with supplied credentials.
+
+The derive-only request uses the signing EOA and optional nonce. `funder` and
+`signature_type` configure the subsequently authenticated CLOB client; they do
+not cause a different L2 credential to be created or selected.
+
+For Proxy or Gnosis Safe wallets, explicitly set `POLYCOPY_CLOB_FUNDER` to the
+funded address shown in Polymarket before GHOST verification. The current SDK
+can derive a proxy/Safe address from the signing EOA, but the real balance check
+must prove it selects the intended funded account. `poly1271` requires an
+explicit funder and is GHOST-only until Phase 0.5 proves the venue behavior.
 
 Then run `cargo run --locked --features intl_clob --bin ghost_verify`. The
 command prints only redacted per-row status, returns exit code `3` for a

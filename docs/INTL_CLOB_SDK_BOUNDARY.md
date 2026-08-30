@@ -34,10 +34,11 @@ only to collect a complete read-only diagnostic report, never to retry or change
 venue state. The redacted evidence template is
 [`PHASE_0_GHOST_REPORT.md`](PHASE_0_GHOST_REPORT.md).
 
-The `ghost_verify` command supplies the adapter only with pre-existing L2 API
-credentials. This is intentional: the SDK's default credential path can create
-an API key before falling back to derivation. Phase 0 may authenticate using
-existing credentials and make balance reads, but it must not create keys,
+The `ghost_verify` command either supplies pre-existing L2 API credentials or
+uses the SDK's explicit derive-only endpoint to recover an existing credential
+from the signing key. It never uses the SDK's create-or-derive path, which can
+create an API key before falling back to derivation. Phase 0 may authenticate
+using existing credentials and make balance reads, but it must not create keys,
 update balance allowances, or place orders.
 
 This surface intentionally has no API for order construction, signing,

@@ -7,9 +7,10 @@ private keys, API credentials, full wallet addresses, signed requests, raw API
 responses, or database files in this repository.
 
 The command is `cargo run --locked --features intl_clob --bin ghost_verify`.
-It refuses to start without existing L2 credentials, so it cannot take the
-SDK's automatic API-key creation path. Provide its configuration only through
-the local process environment; see the README for the exact variable names.
+It derives an existing L2 credential from the supplied signing key when one is
+not supplied, but never calls API-key creation. Provide its configuration only
+through the local process environment; see the README for the exact variable
+names.
 
 ## Scope
 

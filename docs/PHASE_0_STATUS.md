@@ -25,11 +25,10 @@ lock test, or a healthy connection is not permission to place an order.
   non-negative, non-duplicated snapshot entries, applies exact comparisons, and
   marks any mismatch or query error unclean. It has no order, credential,
   persistence, or retry surface.
-- The `ghost_verify` command reads existing L2 API credentials only from its
-  local process environment and refuses incomplete configuration before it
-  builds a client. It uses the supplied credentials to avoid the SDK's
-  API-key-creation path, prints only row status, and exits non-zero for an
-  unclean verification.
+- The `ghost_verify` command can derive an existing L2 API credential from the
+  local signing key or accept a complete pre-existing L2 credential set. It
+  refuses partial configuration, never uses API-key creation, prints only row
+  status, and exits non-zero for an unclean verification.
 - The complete optional SDK feature compiles and its safety regressions pass
   locally with `cargo test --all-features` and `cargo build --release --all-features`.
 - Git excludes credentials, local database files, raw wallet evidence, and

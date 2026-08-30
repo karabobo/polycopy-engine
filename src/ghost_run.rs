@@ -1,8 +1,8 @@
 //! Configuration and execution boundary for an authenticated, read-only GHOST run.
 //!
-//! The runner requires existing L2 credentials. It deliberately does not invoke
-//! the SDK path that creates or derives API credentials, because credential
-//! creation is an account mutation outside Phase 0's read-only scope.
+//! The runner derives an existing L2 credential from the signing key when one
+//! is not supplied. It deliberately never invokes the SDK path that can create
+//! an API credential, because creation is outside Phase 0's read-only scope.
 
 use std::{error::Error, fmt, str::FromStr};
 
@@ -24,6 +24,7 @@ const PRIVATE_KEY_ENV: &str = "POLYCOPY_CLOB_PRIVATE_KEY";
 const API_KEY_ENV: &str = "POLYCOPY_CLOB_L2_API_KEY";
 const API_SECRET_ENV: &str = "POLYCOPY_CLOB_L2_API_SECRET";
 const API_PASSPHRASE_ENV: &str = "POLYCOPY_CLOB_L2_API_PASSPHRASE";
+const API_NONCE_ENV: &str = "POLYCOPY_CLOB_L2_NONCE";
 const SIGNATURE_TYPE_ENV: &str = "POLYCOPY_CLOB_SIGNATURE_TYPE";
 const FUNDER_ENV: &str = "POLYCOPY_CLOB_FUNDER";
 const SNAPSHOT_AT_ENV: &str = "POLYCOPY_GHOST_SNAPSHOT_AT_UTC";
@@ -36,9 +37,7 @@ const TOKEN_BALANCES_ENV: &str = "POLYCOPY_GHOST_EXPECTED_TOKEN_BALANCES";
 /// disk, and are never printed by the command-line surface.
 pub struct GhostRunConfig {
     private_key: String,
-    api_key: String,
-    api_secret: String,
-    api_passphrase: String,
+    credential_source: CredentialSource,
     signature_type: GhostSignatureType,
     funder: Option<Address>,
     snapshot_at_utc: String,
@@ -56,9 +55,7 @@ impl GhostRunConfig {
         F: Fn(&str) -> Option<String>,
     {
         let private_key = required(&lookup, PRIVATE_KEY_ENV)?;
-        let api_key = required(&lookup, API_KEY_ENV)?;
-        let api_secret = required(&lookup, API_SECRET_ENV)?;
-        let api_passphrase = required(&lookup, API_PASSPHRASE_ENV)?;
+        let credential_source = credential_source(&lookup)?;
 
         let signature_type = match lookup(SIGNATURE_TYPE_ENV) {
             Some(raw) if !raw.trim().is_empty() => GhostSignatureType::from_str(&raw)?,
@@ -87,9 +84,7 @@ impl GhostRunConfig {
 
         Ok(Self {
             private_key,
-            api_key,
-            api_secret,
-            api_passphrase,
+            credential_source,
             signature_type,
             funder,
             snapshot_at_utc,
@@ -101,23 +96,29 @@ impl GhostRunConfig {
         &self.snapshot_at_utc
     }
 
-    /// Builds an authenticated client from supplied credentials without using
-    /// the SDK's API-key creation or derivation flow.
+    /// Builds an authenticated client using supplied credentials or a strict
+    /// derive-only L2 request. It never calls API-key creation.
     async fn strict_reader(&self) -> Result<IntlClobReadAdapter, GhostRunError> {
         let signer = LocalSigner::from_str(&self.private_key)
             .map_err(|_| GhostRunError::InvalidPrivateKey)?
             .with_chain_id(Some(POLYGON));
-        let api_key = self
-            .api_key
-            .parse()
-            .map_err(|_| GhostRunError::InvalidApiKey)?;
-        let credentials = Credentials::new(
-            api_key,
-            self.api_secret.clone(),
-            self.api_passphrase.clone(),
-        );
-        let builder = Client::new(CLOB_HOST, Config::default())
-            .map_err(|_| GhostRunError::ClientInitialization)?
+        let unauthenticated = Client::new(CLOB_HOST, Config::default())
+            .map_err(|_| GhostRunError::ClientInitialization)?;
+        let credentials = match &self.credential_source {
+            CredentialSource::Existing {
+                api_key,
+                api_secret,
+                api_passphrase,
+            } => {
+                let api_key = api_key.parse().map_err(|_| GhostRunError::InvalidApiKey)?;
+                Credentials::new(api_key, api_secret.clone(), api_passphrase.clone())
+            }
+            CredentialSource::Derive { nonce } => unauthenticated
+                .derive_api_key(&signer, *nonce)
+                .await
+                .map_err(|_| GhostRunError::CredentialDerivation)?,
+        };
+        let builder = unauthenticated
             .authentication_builder(&signer)
             .credentials(credentials)
             .signature_type(self.signature_type.as_sdk());
@@ -132,6 +133,17 @@ impl GhostRunConfig {
 
         Ok(IntlClobReadAdapter::new(client))
     }
+}
+
+enum CredentialSource {
+    Existing {
+        api_key: String,
+        api_secret: String,
+        api_passphrase: String,
+    },
+    Derive {
+        nonce: Option<u32>,
+    },
 }
 
 /// Executes one authenticated GHOST check. The only venue calls are strict
@@ -199,6 +211,9 @@ pub enum GhostRunConfigError {
     InvalidTokenBalanceEntry,
     EmptyTokenBalanceList,
     InvalidTokenId,
+    IncompleteL2Credentials,
+    InvalidL2Nonce,
+    NonceWithExistingCredentials,
     Snapshot(GhostSnapshotError),
 }
 
@@ -227,6 +242,15 @@ impl fmt::Display for GhostRunConfigError {
                 "GHOST verification requires at least one expected outcome-token balance"
             ),
             Self::InvalidTokenId => write!(formatter, "invalid outcome token ID in GHOST snapshot"),
+            Self::IncompleteL2Credentials => write!(
+                formatter,
+                "supply all three L2 credential variables or none to derive an existing credential"
+            ),
+            Self::InvalidL2Nonce => write!(formatter, "invalid L2 credential derivation nonce"),
+            Self::NonceWithExistingCredentials => write!(
+                formatter,
+                "L2 credential nonce is only valid when deriving credentials"
+            ),
             Self::Snapshot(source) => source.fmt(formatter),
         }
     }
@@ -252,6 +276,7 @@ pub enum GhostRunError {
     InvalidPrivateKey,
     InvalidApiKey,
     ClientInitialization,
+    CredentialDerivation,
     Authentication,
 }
 
@@ -261,11 +286,49 @@ impl fmt::Display for GhostRunError {
             Self::InvalidPrivateKey => write!(formatter, "invalid CLOB signing key"),
             Self::InvalidApiKey => write!(formatter, "invalid CLOB L2 API key"),
             Self::ClientInitialization => write!(formatter, "unable to initialize the CLOB client"),
+            Self::CredentialDerivation => write!(
+                formatter,
+                "unable to derive an existing CLOB L2 API credential; no credential was created"
+            ),
             Self::Authentication => write!(
                 formatter,
-                "unable to construct an authenticated CLOB client from existing L2 credentials"
+                "unable to construct an authenticated CLOB client"
             ),
         }
+    }
+}
+
+fn credential_source<F>(lookup: &F) -> Result<CredentialSource, GhostRunConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let api_key = optional(lookup, API_KEY_ENV);
+    let api_secret = optional(lookup, API_SECRET_ENV);
+    let api_passphrase = optional(lookup, API_PASSPHRASE_ENV);
+    let supplied_count = [
+        api_key.is_some(),
+        api_secret.is_some(),
+        api_passphrase.is_some(),
+    ]
+    .into_iter()
+    .filter(|supplied| *supplied)
+    .count();
+    let nonce = optional(lookup, API_NONCE_ENV)
+        .map(|raw| {
+            raw.parse::<u32>()
+                .map_err(|_| GhostRunConfigError::InvalidL2Nonce)
+        })
+        .transpose()?;
+
+    match supplied_count {
+        0 => Ok(CredentialSource::Derive { nonce }),
+        3 if nonce.is_none() => Ok(CredentialSource::Existing {
+            api_key: api_key.expect("three supplied values include API key"),
+            api_secret: api_secret.expect("three supplied values include API secret"),
+            api_passphrase: api_passphrase.expect("three supplied values include API passphrase"),
+        }),
+        3 => Err(GhostRunConfigError::NonceWithExistingCredentials),
+        _ => Err(GhostRunConfigError::IncompleteL2Credentials),
     }
 }
 
@@ -278,6 +341,13 @@ where
     lookup(name)
         .filter(|value| !value.trim().is_empty())
         .ok_or(GhostRunConfigError::MissingEnvironment { name })
+}
+
+fn optional<F>(lookup: &F, name: &str) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    lookup(name).filter(|value| !value.trim().is_empty())
 }
 
 fn parse_decimal(raw: &str, name: &'static str) -> Result<Decimal, GhostRunConfigError> {
@@ -312,12 +382,6 @@ mod tests {
     fn valid_environment() -> HashMap<&'static str, String> {
         HashMap::from([
             (PRIVATE_KEY_ENV, "not-checked-until-client-build".to_owned()),
-            (
-                API_KEY_ENV,
-                "00000000-0000-0000-0000-000000000000".to_owned(),
-            ),
-            (API_SECRET_ENV, "secret".to_owned()),
-            (API_PASSPHRASE_ENV, "passphrase".to_owned()),
             (SNAPSHOT_AT_ENV, "2026-08-30T00:00:00Z".to_owned()),
             (COLLATERAL_ENV, "25.5".to_owned()),
             (TOKEN_BALANCES_ENV, "123=1.5,456=0".to_owned()),
@@ -325,28 +389,64 @@ mod tests {
     }
 
     #[test]
-    fn configuration_accepts_existing_credentials_and_a_timestamped_snapshot() {
+    fn configuration_derives_an_existing_credential_by_default() {
         let environment = valid_environment();
         let config = GhostRunConfig::from_lookup(|name| environment.get(name).cloned())
             .expect("the complete GHOST configuration is valid without a network call");
 
         assert_eq!(config.snapshot_at_utc(), "2026-08-30T00:00:00Z");
         assert_eq!(config.snapshot.token_balances().len(), 2);
+        assert!(matches!(
+            config.credential_source,
+            CredentialSource::Derive { nonce: None }
+        ));
     }
 
     #[test]
-    fn configuration_requires_existing_l2_credentials_and_a_token_snapshot() {
+    fn configuration_accepts_complete_existing_l2_credentials() {
         let mut environment = valid_environment();
-        environment.remove(API_SECRET_ENV);
+        environment.insert(
+            API_KEY_ENV,
+            "00000000-0000-0000-0000-000000000000".to_owned(),
+        );
+        environment.insert(API_SECRET_ENV, "secret".to_owned());
+        environment.insert(API_PASSPHRASE_ENV, "passphrase".to_owned());
+
+        let config = GhostRunConfig::from_lookup(|name| environment.get(name).cloned())
+            .expect("complete existing L2 credentials are accepted");
 
         assert!(matches!(
+            config.credential_source,
+            CredentialSource::Existing { .. }
+        ));
+    }
+
+    #[test]
+    fn configuration_rejects_partial_credentials_and_incompatible_nonce() {
+        let mut environment = valid_environment();
+        environment.insert(API_SECRET_ENV, "secret".to_owned());
+        assert!(matches!(
             GhostRunConfig::from_lookup(|name| environment.get(name).cloned()),
-            Err(GhostRunConfigError::MissingEnvironment {
-                name: API_SECRET_ENV
-            })
+            Err(GhostRunConfigError::IncompleteL2Credentials)
         ));
 
+        let mut environment = valid_environment();
+        environment.insert(
+            API_KEY_ENV,
+            "00000000-0000-0000-0000-000000000000".to_owned(),
+        );
         environment.insert(API_SECRET_ENV, "secret".to_owned());
+        environment.insert(API_PASSPHRASE_ENV, "passphrase".to_owned());
+        environment.insert(API_NONCE_ENV, "7".to_owned());
+        assert!(matches!(
+            GhostRunConfig::from_lookup(|name| environment.get(name).cloned()),
+            Err(GhostRunConfigError::NonceWithExistingCredentials)
+        ));
+    }
+
+    #[test]
+    fn configuration_rejects_an_empty_token_snapshot() {
+        let mut environment = valid_environment();
         environment.insert(TOKEN_BALANCES_ENV, "".to_owned());
         assert!(matches!(
             GhostRunConfig::from_lookup(|name| environment.get(name).cloned()),
