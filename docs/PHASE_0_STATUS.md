@@ -41,6 +41,12 @@ lock test, or a healthy connection is not permission to place an order.
    snapshot. Record the redacted result using
    [`PHASE_0_GHOST_REPORT.md`](PHASE_0_GHOST_REPORT.md).
 
+   **Evidence recorded 2026-08-30**: collateral and one outcome token both
+   matched exactly against a manual snapshot for a Gnosis Safe account. Final
+   sign-off on closing Phase 0 is a human decision per the
+   financial-correctness gate review, not an automated result — see the
+   report's Decision section.
+
 ## Hard stop
 
 No order-submission client exists in this project. The Phase 0.5 canary report

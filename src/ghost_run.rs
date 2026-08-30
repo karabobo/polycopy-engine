@@ -9,6 +9,7 @@ use std::{error::Error, fmt, str::FromStr};
 use polymarket_client_sdk_v2::{
     auth::{Credentials, LocalSigner, Signer as _},
     clob::{types::SignatureType, Client, Config},
+    error::Error as SdkError,
     types::{Address, DateTime, Decimal},
     POLYGON,
 };
@@ -18,7 +19,7 @@ use crate::{
     IntlClobReadAdapter, OutcomeTokenId,
 };
 
-const CLOB_HOST: &str = "https://clob-v2.polymarket.com";
+const CLOB_HOST: &str = "https://clob.polymarket.com";
 
 const PRIVATE_KEY_ENV: &str = "POLYCOPY_CLOB_PRIVATE_KEY";
 const API_KEY_ENV: &str = "POLYCOPY_CLOB_L2_API_KEY";
@@ -103,7 +104,7 @@ impl GhostRunConfig {
             .map_err(|_| GhostRunError::InvalidPrivateKey)?
             .with_chain_id(Some(POLYGON));
         let unauthenticated = Client::new(CLOB_HOST, Config::default())
-            .map_err(|_| GhostRunError::ClientInitialization)?;
+            .map_err(GhostRunError::ClientInitialization)?;
         let credentials = match &self.credential_source {
             CredentialSource::Existing {
                 api_key,
@@ -116,7 +117,7 @@ impl GhostRunConfig {
             CredentialSource::Derive { nonce } => unauthenticated
                 .derive_api_key(&signer, *nonce)
                 .await
-                .map_err(|_| GhostRunError::CredentialDerivation)?,
+                .map_err(GhostRunError::CredentialDerivation)?,
         };
         let builder = unauthenticated
             .authentication_builder(&signer)
@@ -129,7 +130,7 @@ impl GhostRunConfig {
         let client = builder
             .authenticate()
             .await
-            .map_err(|_| GhostRunError::Authentication)?;
+            .map_err(GhostRunError::Authentication)?;
 
         Ok(IntlClobReadAdapter::new(client))
     }
@@ -271,13 +272,13 @@ impl From<GhostSnapshotError> for GhostRunConfigError {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum GhostRunError {
     InvalidPrivateKey,
     InvalidApiKey,
-    ClientInitialization,
-    CredentialDerivation,
-    Authentication,
+    ClientInitialization(SdkError),
+    CredentialDerivation(SdkError),
+    Authentication(SdkError),
 }
 
 impl fmt::Display for GhostRunError {
@@ -285,14 +286,16 @@ impl fmt::Display for GhostRunError {
         match self {
             Self::InvalidPrivateKey => write!(formatter, "invalid CLOB signing key"),
             Self::InvalidApiKey => write!(formatter, "invalid CLOB L2 API key"),
-            Self::ClientInitialization => write!(formatter, "unable to initialize the CLOB client"),
-            Self::CredentialDerivation => write!(
+            Self::ClientInitialization(source) => {
+                write!(formatter, "unable to initialize the CLOB client: {source}")
+            }
+            Self::CredentialDerivation(source) => write!(
                 formatter,
-                "unable to derive an existing CLOB L2 API credential; no credential was created"
+                "unable to derive an existing CLOB L2 API credential; no credential was created: {source}"
             ),
-            Self::Authentication => write!(
+            Self::Authentication(source) => write!(
                 formatter,
-                "unable to construct an authenticated CLOB client"
+                "unable to construct an authenticated CLOB client: {source}"
             ),
         }
     }
@@ -332,7 +335,16 @@ where
     }
 }
 
-impl Error for GhostRunError {}
+impl Error for GhostRunError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidPrivateKey | Self::InvalidApiKey => None,
+            Self::ClientInitialization(source)
+            | Self::CredentialDerivation(source)
+            | Self::Authentication(source) => Some(source),
+        }
+    }
+}
 
 fn required<F>(lookup: &F, name: &'static str) -> Result<String, GhostRunConfigError>
 where
