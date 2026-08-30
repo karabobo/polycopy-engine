@@ -1,6 +1,6 @@
-# polydeft
+# polycopy-engine
 
-`polydeft` is the standalone implementation project for a Polymarket copy engine.
+`polycopy-engine` is the standalone implementation project for a Polymarket copy engine.
 It begins with the financial-correctness blueprint in
 [`docs/COPY_ENGINE_BLUEPRINT.md`](docs/COPY_ENGINE_BLUEPRINT.md).
 
