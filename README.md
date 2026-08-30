@@ -15,9 +15,10 @@ the Phase 0 and Phase 0.5 gates in the blueprint are completed.
 
 ## Current development status
 
-Phase 0 is in progress. The first implemented primitive is a cross-process
-database ownership lock: a second engine instance fails instead of sharing a
-database and sending concurrently for the same account/token.
+Phase 0 is closed (2026-08-30); Phase 0.5 has not started. The first
+implemented primitive is a cross-process database ownership lock: a second
+engine instance fails instead of sharing a database and sending concurrently
+for the same account/token.
 
 Run the complete local checks with:
 

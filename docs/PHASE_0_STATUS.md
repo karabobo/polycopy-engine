@@ -1,6 +1,6 @@
 # Phase 0 status
 
-Status: **in progress; not approved for automated trading.**
+Status: **closed 2026-08-30; still not approved for automated trading — that requires Phase 0.5.**
 
 This document records evidence for Phase 0 of
 [`COPY_ENGINE_BLUEPRINT.md`](COPY_ENGINE_BLUEPRINT.md). A build, a passing
@@ -34,18 +34,15 @@ lock test, or a healthy connection is not permission to place an order.
 - Git excludes credentials, local database files, raw wallet evidence, and
   signed-order artifacts. Redacted Markdown reports remain reviewable.
 
-## Required before Phase 0 can close
+## Phase 0 close-out
 
-1. Complete a GHOST-only, read-only CLOB check with authenticated collateral
+1. Completed a GHOST-only, read-only CLOB check with authenticated collateral
    and strict token balances matched against a timestamped manual wallet
-   snapshot. Record the redacted result using
-   [`PHASE_0_GHOST_REPORT.md`](PHASE_0_GHOST_REPORT.md).
-
-   **Evidence recorded 2026-08-30**: collateral and one outcome token both
-   matched exactly against a manual snapshot for a Gnosis Safe account. Final
-   sign-off on closing Phase 0 is a human decision per the
-   financial-correctness gate review, not an automated result — see the
-   report's Decision section.
+   snapshot. Redacted result recorded in
+   [`PHASE_0_GHOST_REPORT.md`](PHASE_0_GHOST_REPORT.md): collateral and one
+   outcome token both matched exactly for a Gnosis Safe account.
+2. The account owner approved closing Phase 0 on 2026-08-30 per the
+   financial-correctness gate review (see the report's Decision section).
 
 ## Hard stop
 

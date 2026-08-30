@@ -43,9 +43,8 @@ account in GHOST / reconciliation-required status.
   funder address and outcome token ID live only in the local, gitignored
   `.env`; this report carries only a redacted label and the human-readable
   market name)
-- Approved to close Phase 0: `pending — requires your sign-off per the
-  financial-correctness gate review; this report only records that the strict
-  CLOB reads matched a manual snapshot exactly`
+- Approved to close Phase 0: `yes — approved 2026-08-30 by the account owner
+  per the financial-correctness gate review`
 
 ## Note on this verification run
 
