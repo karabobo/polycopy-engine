@@ -471,7 +471,7 @@ Label historical PolyHermes rows before using them:
 ## 13. Dependency Order
 
 ```text
-Phase 0    Fork baseline, venue fix, single-instance lock
+Phase 0    Audit baseline, venue fix, single-instance lock
     |
 Phase 0.5  Tiny CLOB submission-safety canary
     |

@@ -69,6 +69,15 @@ pub trait StrictTokenBalanceReader: Send + Sync {
     ) -> Result<Decimal, StrictPositionError>;
 }
 
+/// Strict account-level reads required before an account can leave GHOST mode.
+///
+/// The collateral query is deliberately separate from outcome-token queries:
+/// neither a missing token nor a venue error may be inferred from the other.
+#[async_trait]
+pub trait StrictAccountBalanceReader: StrictTokenBalanceReader {
+    async fn collateral_balance_strict(&self) -> Result<Decimal, StrictCollateralError>;
+}
+
 /// Read-only adapter for an already authenticated official CLOB SDK client.
 ///
 /// Authentication is intentionally performed outside this type. This avoids
@@ -107,6 +116,21 @@ impl StrictTokenBalanceReader for IntlClobReadAdapter {
     }
 }
 
+#[async_trait]
+impl StrictAccountBalanceReader for IntlClobReadAdapter {
+    async fn collateral_balance_strict(&self) -> Result<Decimal, StrictCollateralError> {
+        let request = BalanceAllowanceRequest::builder()
+            .asset_type(AssetType::Collateral)
+            .build();
+
+        self.client
+            .balance_allowance(request)
+            .await
+            .map(|response| response.balance)
+            .map_err(|source| StrictCollateralError::Query { source })
+    }
+}
+
 #[derive(Debug)]
 pub enum StrictPositionError {
     Query {
@@ -130,6 +154,33 @@ impl Error for StrictPositionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Query { source, .. } => Some(source),
+        }
+    }
+}
+
+/// A strict collateral query: any venue error remains an error, never zero.
+#[derive(Debug)]
+pub enum StrictCollateralError {
+    Query { source: SdkError },
+}
+
+impl fmt::Display for StrictCollateralError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Query { source } => {
+                write!(
+                    formatter,
+                    "strict collateral balance query failed: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for StrictCollateralError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Query { source } => Some(source),
         }
     }
 }

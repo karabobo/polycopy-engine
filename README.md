@@ -19,12 +19,12 @@ Phase 0 is in progress. The first implemented primitive is a cross-process
 database ownership lock: a second engine instance fails instead of sharing a
 database and sending concurrently for the same account/token.
 
-Run the local checks with:
+Run the complete local checks with:
 
 ```sh
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo build --release
+cargo test --all-features --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo build --release --all-features --locked
 ```
 
 The project contains no CLOB write client and no live-order path. See
@@ -35,3 +35,29 @@ for the required real-order safety evidence template.
 The optional `intl_clob` feature enables a **read-only**, strict per-outcome
 token balance adapter. It has no order-writing API; see
 [`docs/INTL_CLOB_SDK_BOUNDARY.md`](docs/INTL_CLOB_SDK_BOUNDARY.md).
+
+## Authenticated GHOST verification
+
+`ghost_verify` performs only authenticated balance reads; it has no order,
+cancel, approval, deposit, or credential-creation path. It requires a
+timestamped manual snapshot plus **existing** CLOB L2 API credentials, so the
+SDK cannot auto-create credentials. Supply them only through the local process
+environment, never a committed file:
+
+```text
+POLYCOPY_CLOB_PRIVATE_KEY=[signing key]
+POLYCOPY_CLOB_L2_API_KEY=[existing UUID]
+POLYCOPY_CLOB_L2_API_SECRET=[existing secret]
+POLYCOPY_CLOB_L2_API_PASSPHRASE=[existing passphrase]
+POLYCOPY_CLOB_SIGNATURE_TYPE=eoa|proxy|gnosis_safe|poly1271
+POLYCOPY_CLOB_FUNDER=[required only for poly1271]
+POLYCOPY_GHOST_SNAPSHOT_AT_UTC=2026-08-30T00:00:00Z
+POLYCOPY_GHOST_EXPECTED_COLLATERAL=[decimal]
+POLYCOPY_GHOST_EXPECTED_TOKEN_BALANCES=123456789=1.5,987654321=0
+```
+
+Then run `cargo run --locked --features intl_clob --bin ghost_verify`. The
+command prints only redacted per-row status, returns exit code `3` for a
+mismatch or query failure, and never treats a clean result as trading approval.
+Record the result using
+[`docs/PHASE_0_GHOST_REPORT.md`](docs/PHASE_0_GHOST_REPORT.md).

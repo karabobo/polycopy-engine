@@ -20,6 +20,16 @@ lock test, or a healthy connection is not permission to place an order.
 - The strict read-only Intl CLOB boundary uses the official SDK's single-token
   conditional-balance query. A query failure remains typed failure, never zero
   position; it has no order-writing method.
+- The GHOST verifier compares the same strict CLOB reads with a manual snapshot
+  of collateral and configured outcome-token balances. It accepts only
+  non-negative, non-duplicated snapshot entries, applies exact comparisons, and
+  marks any mismatch or query error unclean. It has no order, credential,
+  persistence, or retry surface.
+- The `ghost_verify` command reads existing L2 API credentials only from its
+  local process environment and refuses incomplete configuration before it
+  builds a client. It uses the supplied credentials to avoid the SDK's
+  API-key-creation path, prints only row status, and exits non-zero for an
+  unclean verification.
 - The complete optional SDK feature compiles and its safety regressions pass
   locally with `cargo test --all-features` and `cargo build --release --all-features`.
 - Git excludes credentials, local database files, raw wallet evidence, and
@@ -29,7 +39,8 @@ lock test, or a healthy connection is not permission to place an order.
 
 1. Complete a GHOST-only, read-only CLOB check with authenticated collateral
    and strict token balances matched against a timestamped manual wallet
-   snapshot. Store only redacted evidence.
+   snapshot. Record the redacted result using
+   [`PHASE_0_GHOST_REPORT.md`](PHASE_0_GHOST_REPORT.md).
 
 ## Hard stop
 

@@ -22,10 +22,23 @@ Sources:
 ## Phase 0 adapter surface
 
 `IntlClobReadAdapter` accepts an already-authenticated SDK client and calls the
-SDK's conditional-token balance-and-allowance endpoint for exactly one outcome
-token. It returns the venue balance or a typed error. It never converts an
-error into `0`, and it cannot list a mutable active-token set as a substitute
+SDK's balance-and-allowance endpoint for collateral or exactly one conditional
+outcome token. It returns the venue balance or a typed error. It never converts
+an error into `0`, and it cannot list a mutable active-token set as a substitute
 for a strict query.
+
+`GhostVerifier` is a pure orchestration layer over those strict reads. It
+compares each response with a timestamped manual snapshot using exact decimal
+equality; a mismatch or a query failure makes the report unclean. It continues
+only to collect a complete read-only diagnostic report, never to retry or change
+venue state. The redacted evidence template is
+[`PHASE_0_GHOST_REPORT.md`](PHASE_0_GHOST_REPORT.md).
+
+The `ghost_verify` command supplies the adapter only with pre-existing L2 API
+credentials. This is intentional: the SDK's default credential path can create
+an API key before falling back to derivation. Phase 0 may authenticate using
+existing credentials and make balance reads, but it must not create keys,
+update balance allowances, or place orders.
 
 This surface intentionally has no API for order construction, signing,
 submission, cancellation, retries, envelope lookup, or credential persistence.

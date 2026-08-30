@@ -6,11 +6,23 @@
 pub mod engine_lock;
 pub mod venue;
 
+#[cfg(feature = "intl_clob")]
+pub mod ghost;
+
+#[cfg(feature = "intl_clob")]
+pub mod ghost_run;
+
 pub use engine_lock::{EngineLock, EngineLockError};
 pub use venue::{OrderReceipt, ReceiptError};
 
 #[cfg(feature = "intl_clob")]
+pub use ghost::{
+    BalanceVerification, ExpectedTokenBalance, GhostSnapshot, GhostSnapshotError,
+    GhostVerification, GhostVerifier, TokenBalanceVerification,
+};
+
+#[cfg(feature = "intl_clob")]
 pub use venue::intl_clob::{
-    IntlClobReadAdapter, OutcomeTokenId, OutcomeTokenIdError, StrictPositionError,
-    StrictTokenBalanceReader,
+    IntlClobReadAdapter, OutcomeTokenId, OutcomeTokenIdError, StrictAccountBalanceReader,
+    StrictCollateralError, StrictPositionError, StrictTokenBalanceReader,
 };
