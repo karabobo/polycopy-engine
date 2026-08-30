@@ -1,0 +1,21 @@
+[package]
+name = "polycopy-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Safety-first Polymarket copy-execution engine"
+publish = false
+
+[features]
+default = []
+intl_clob = [
+    "dep:async-trait",
+    "dep:polymarket_client_sdk_v2",
+    "dep:tokio",
+]
+
+[dependencies]
+async-trait = { version = "0.1", optional = true }
+fs2 = "0.4.3"
+polymarket_client_sdk_v2 = { version = "=0.7.0", default-features = false, features = ["clob"], optional = true }
+rust_decimal = { version = "1", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false, features = ["macros", "rt"], optional = true }

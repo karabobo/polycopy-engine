@@ -48,9 +48,15 @@ until the Phase 0.5 canary and every Phase 7 gate pass.
     history from entering the ledger; signal age and a persisted decision deadline
     prevent delayed data from becoming a current-market order.
 
-## 2. Facts Verified in the DRADIS Baseline
+## 2. Facts Verified in the DRADIS Reference Baseline
 
 These are implementation constraints, not hypotheses.
+
+The fixed audit reference is recorded in
+[`DRADIS_REFERENCE_BASELINE.md`](DRADIS_REFERENCE_BASELINE.md). This project is
+an independent implementation: it does not vendor or build against DRADIS, and
+it does not preserve DRADIS Git history. Official Polymarket documentation and
+the Phase 0.5 canary remain the authority for CLOB behavior.
 
 - `src/venues/intl/orders.rs` builds order salt and timestamp from wall-clock
   time, then signs the full EIP-712 order. Rebuilding a logical order therefore
@@ -69,9 +75,11 @@ These are implementation constraints, not hypotheses.
 - The installed CLOB SDK exposes order lookup by order ID and list filters by
   order ID, market, or asset. It has no verified lookup-by-envelope/salt API.
 
-Phase 0 fixes the `Fill.filled` defect before copy-engine code depends on the
-venue. The exact CLOB behavior for repeated submission of an identical signed
-envelope remains unverified and is a Phase 0.5 release gate.
+The independent adapter must not reproduce the `Fill.filled` defect: it must
+keep requested, accepted, and filled quantities distinct, with FAK zero-fill
+and partial-fill regression coverage before copy-engine code depends on it. The
+exact CLOB behavior for repeated submission of an identical signed envelope
+remains unverified and is a Phase 0.5 release gate.
 
 ## 3. State Model
 
@@ -110,19 +118,21 @@ Therefore `actual_balance == 0` is not proof that a particular SELL completed.
 Only a venue receipt can finalize that intent automatically; otherwise it is
 `needs_reconcile`.
 
-## 4. Phase 0: Fork Baseline and Venue Repair
+## 4. Phase 0: Independent Baseline and Venue Repair
 
 ### Work
 
-- Fork DRADIS at the selected commit and pin that commit. Do not track upstream
-  `main` during this implementation.
-- Feature-gate or unregister unused legacy Vipers, Raptors, and LLM advisor
-  modules. Do not physically delete them until Phase 7 passes.
-- Fix `IntlClobVenue` so `Fill.filled` returns actual `matched_shares`, not the
-  requested quantity.
-- Add a regression test for FAK zero-fill and partial-fill responses.
-- Build and run the existing GHOST path to verify CLOB connection, authentication,
-  collateral, and a manually checked read-only balance.
+- Pin the DRADIS audit reference in `DRADIS_REFERENCE_BASELINE.md`; do not track
+  upstream `main` and do not import DRADIS source or history.
+- Create a dedicated, strict Polymarket Intl CLOB adapter from official SDK and
+  venue evidence. It must not reuse DRADIS's permissive `Execution` trait.
+- Ensure the adapter records actual `matched_shares` as filled quantity, never
+  the requested quantity. Keep requested, accepted, and filled quantities
+  distinct from the first adapter boundary.
+- Add a regression test for FAK zero-fill and partial-fill responses using the
+  independent adapter's response representation.
+- Build and run the independent GHOST path to verify CLOB connection,
+  authentication, collateral, and a manually checked read-only balance.
 - Add an exclusive local process lock (for example a `flock` lock file next to the
   copy database). Startup must fail if another copy-engine instance holds it.
   Compose/systemd must run exactly one replica and mount the database only from
@@ -130,9 +140,10 @@ Only a venue receipt can finalize that intent automatically; otherwise it is
 
 ### Acceptance
 
-- `cargo build --release --features intl_clob` succeeds.
-- `cargo test` succeeds, including a test that would fail before the
-  `matched_shares` correction.
+- `cargo build --release` succeeds; once the CLOB adapter feature exists,
+  `cargo build --release --features intl_clob` also succeeds.
+- `cargo test` succeeds, including a test that would fail if requested quantity
+  were reported as FAK zero-fill or partial-fill quantity.
 - A second process cannot acquire the copy-engine lock.
 - GHOST balances agree with one manually checked wallet snapshot.
 

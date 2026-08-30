@@ -1,0 +1,29 @@
+# Rust build products
+/target/
+
+# Runtime state: it belongs on local storage and must never be committed.
+/.data/
+/runtime/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Credentials and live-order material.  Keep documented examples tracked.
+.env
+.env.*
+!.env.example
+/secrets/
+/keys/
+*.pem
+*.p12
+*.pfx
+*.key
+
+# Deliberately generated operational evidence; commit a redacted Markdown
+# report instead of raw signed envelopes, request bodies, or wallet snapshots.
+/artifacts/
+/canary-artifacts/
+/ghost-artifacts/
