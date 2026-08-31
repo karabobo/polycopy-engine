@@ -17,9 +17,10 @@ blocked until the Phase 0.5 and Phase 7 gates in the blueprint are completed.
 
 ## Current development status
 
-Phase 0 is closed (2026-08-30); Phase 0.5 is in progress (one real canary
-order placed and observed on 2026-08-31; not every gate box is checked yet —
-see [`docs/PHASE_0_5_CANARY_REPORT.md`](docs/PHASE_0_5_CANARY_REPORT.md)). The
+Phase 0 is closed (2026-08-30); Phase 0.5 is in progress (three real canary
+orders placed and observed across 2026-08-31 and 2026-09-01; two of four gate
+boxes checked, two still open — see
+[`docs/PHASE_0_5_CANARY_REPORT.md`](docs/PHASE_0_5_CANARY_REPORT.md)). The
 first implemented primitive is a cross-process database ownership lock: a
 second engine instance fails instead of sharing a database and sending
 concurrently for the same account/token.

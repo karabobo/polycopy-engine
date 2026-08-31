@@ -1,8 +1,10 @@
 # Phase 0.5 CLOB submission-safety canary
 
-Status: **in progress — one real canary order placed and observed; not every
-gate box below is checked yet, so this does not authorize automated retry or
-a live-order path.**
+Status: **in progress — three real canary orders placed and observed across
+2026-08-31 and 2026-09-01 (one full fill, one killed-for-no-match, one full
+fill plus a rejected duplicate resubmission); two of the four gate boxes
+below are now checked, two are not, so this still does not authorize
+automated retry or a live-order path.**
 
 This report is required by
 [`COPY_ENGINE_BLUEPRINT.md`](COPY_ENGINE_BLUEPRINT.md) before any automatic
@@ -83,7 +85,10 @@ second, independently-signed copy of the identical order for Result 2 below.
 
 ## Result 2: byte-identical duplicate submission
 
-**Not tested live.** The necessary precondition — that two independent
+**Tested live and answered on 2026-09-01** (see "Live result" below, after
+the earlier attempts that could not reach this step).
+
+The necessary precondition — that two independent
 `sign()` calls over one built `SignableOrder` (same salt, cloned before
 signing) produce byte-identical `SignedOrder` JSON — was confirmed in
 multiple dry runs, both locally and on the remote host, before any live
@@ -115,10 +120,43 @@ post-first-trade account review or a market-specific hold) — the account
 was independently confirmed not to be in `closed_only` mode
 (`BanStatusResponse { closed_only: false }`) and a second, unrelated market
 also failed identically, which is only consistent with a venue-wide cause.
-This question remains open and requires a further live attempt made after
-Polymarket confirms the incident is resolved (not merely during its
+This question remained open and required a further live attempt made after
+Polymarket confirmed the incident was resolved (not merely during its
 cancel-only window) — a decision for the account owner, not something to
 retry automatically or on a timer.
+
+### Live result (2026-09-01)
+
+- Label: `order-id-verify-2-2026-09-01`. Market: "Will Arsenal FC win on
+  2026-08-31?" (EPL, Aston Villa vs. Arsenal), a different market from the
+  original Fed canary and from all three outage-blocked attempts above.
+  BUY, `price=0.66`, `size=5`, FAK.
+- First submission: **matched in full.** `order_id
+  0x828d2fc088f1c10cb5723b77a59cdf9a53673520b1984fa0309dabe9cc90489e`,
+  `status: Matched`, `success: true`, `making_amount=3.3`, `taking_amount=5`
+  (filled exactly at the limit price this time — no better-price improvement
+  like the original Fed run).
+- Second submission (the byte-identical duplicate, same salt, independently
+  signed): rejected with `400 Bad Request`:
+  `{"error":"order
+  0x828d2fc088f1c10cb5723b77a59cdf9a53673520b1984fa0309dabe9cc90489e is
+  invalid. Duplicated."}` — the venue recognized the resubmitted order by its
+  own ID and refused it outright.
+- Classification: **deterministic rejection, not an independent second
+  fill, and not an ambiguous/idempotent-echo response.** The venue holds
+  enough state to recognize "this exact order already exists" and reject a
+  literal resubmission of it — it does not silently accept, silently ignore,
+  or execute it a second time. This is the safe outcome for the retry
+  question this canary exists to answer: resubmitting the *exact same
+  signed bytes* cannot double-fill.
+- Scope of what this does and does not prove: this specific test resent the
+  **identical signed envelope** (same salt) for an order that had already
+  fully matched. It does not by itself prove what happens on a resubmission
+  of an order that is still open/partially filled, nor what happens if the
+  *content* differs from a prior attempt (a new salt for "the same" logical
+  intent) — those remain distinct questions the current recovery design
+  (query-first, never blind-resubmit) is built to avoid needing an answer
+  to.
 
 ## Result 3: receipt fields
 
@@ -172,15 +210,23 @@ retry automatically or on a timer.
   fill). This directly answers, in the positive, the open question in
   `docs/INTL_CLOB_SDK_BOUNDARY.md` about whether a locally computed
   signed-envelope identifier matches the venue's own field.
-- What remains open: this proves equivalence against the order-submission
-  response's `orderID` field for a rejected order. It does **not** yet prove
-  the same equivalence against the authenticated `GET /data/trades`
-  endpoint's `taker_order_id` field for a **matched** fill — which is
-  specifically what `reconcile.rs`'s `recover_fak_taker_order_from_trades`
-  depends on for lost-response recovery. A further live run that actually
-  matches (not just gets accepted-and-rejected) is still needed to close that
-  narrower gap. Result 2 (duplicate submission) was also not tested this run:
-  the first submission itself was rejected before reaching that step.
+- What remains open: this run proved equivalence against the
+  order-submission response's `orderID` field for a rejected order. Result 2
+  above's `order-id-verify-2-2026-09-01` run (2026-09-01, same day)
+  additionally proved it for a **matched** fill: `expected_order_id` again
+  matched `order_id` exactly, this time with `status: Matched, success:
+  true`. That closes the practical question of whether this project's
+  offline computation identifies a real order regardless of whether it
+  matches or is killed.
+  What remains technically unobserved is narrower: neither run called the
+  authenticated `GET /data/trades` endpoint itself, so the equivalence of
+  its specific `taker_order_id` field (rather than the order-submission
+  response's `order_id` field) to this same value has not been directly
+  witnessed — only inferred, since both fields should identify the same
+  order. `reconcile.rs`'s `recover_fak_taker_order_from_trades` reads that
+  endpoint, not the submission response, so a fully rigorous close of this
+  gap would query it once for a known-matched order and confirm the field
+  name and value both match.
 
 ## Gate decision
 
@@ -197,27 +243,33 @@ fingerprint, or contradictory duplicate data opens `needs_reconcile`; no path
 resubmits an uncertain order.
 
 Result 4 above live-proved that the precomputed identifier equals the
-venue's own assigned order ID, for the order-submission response. It remains
-**not proven** for the specific field `recover_fak_taker_order_from_trades`
-actually reads (`GET /data/trades`'s `taker_order_id`, for a matched fill) —
-that narrower equivalence still needs a live run that matches.
+venue's own assigned order ID, for the order-submission response, for both a
+rejected and a matched order. What remains **not directly observed** is the
+specific field `recover_fak_taker_order_from_trades` actually reads
+(`GET /data/trades`'s `taker_order_id`) — inferred to carry the same value,
+but not yet queried and checked in a live run.
 
 - [ ] Lookup is deterministic from persisted envelope data. **Not proven —
       and now partially disproven, partially strengthened.** By-ID lookup
       works, but only after an unmeasured indexing delay (confirmed clear by
-      ~6 hours; confirmed absent immediately after matching). The
-      field-based fallback for a truly lost order ID (asset_id-filtered
-      listing) does **not** find a matched order at all — it only lists open
-      orders. A crash before the order ID is durably recorded is not
-      currently recoverable by either lookup path alone. On the other hand,
-      Result 4 now proves the order ID itself *can* be computed
-      deterministically offline, before any submission — the remaining gap
-      is specifically the trade-history endpoint's `taker_order_id` field
-      for a matched fill, not the ID computation itself.
-- [ ] Byte-identical duplicate behavior is safe for the intended retry policy.
-      **Not tested live yet** (the 2026-09-01 run that would have tested it
-      was rejected for an unrelated reason — a moved market price — before
-      reaching the duplicate-submission step).
+      ~6 hours; confirmed absent immediately after matching, and reconfirmed
+      on 2026-09-01). The field-based fallback for a truly lost order ID
+      (asset_id-filtered listing) does **not** find a matched order at all —
+      it only lists open orders. A crash before the order ID is durably
+      recorded is not currently recoverable by either lookup path alone. On
+      the other hand, Result 4 now proves the order ID itself *can* be
+      computed deterministically offline, before any submission, for both a
+      rejected and a matched order — the remaining gap is specifically
+      whether `GET /data/trades`'s `taker_order_id` field carries the same
+      value, not the ID computation itself.
+- [x] Byte-identical duplicate behavior is safe for the intended retry
+      policy. **Tested live on 2026-09-01** (Result 2, "Live result"):
+      resubmitting the identical signed bytes for an already-matched order
+      was rejected outright (`400`, `"invalid. Duplicated."`) — a
+      deterministic rejection, never a second fill and never a silent
+      idempotent echo. This specific test covered only a full resubmission
+      of an already-fully-matched order; it does not by itself cover a
+      resubmission while an order is still open/partially filled.
 - [x] Receipt fields are sufficient for idempotent fill-delta accounting —
       `making_amount`/`taking_amount` are precise and matched the observed
       balance change exactly, **provided `filled_qty` is read from
@@ -236,14 +288,18 @@ that narrower equivalence still needs a live run that matches.
       be injectable for tests, which is not yet built. That remains open.
 
 Decision: **not passed until every box is checked and independently reviewed.**
-One question is now answered in the negative rather than merely open: the
-field-based fallback lookup does not recover a matched order, so a lost order
-ID before durable persistence is currently an unrecoverable gap, not just an
-untested one — later phases must close it with a different mechanism before
-relying on automatic recovery. One question is now answered in the
-positive: Result 4 proves this project's offline order-ID computation
-matches the venue's own assigned ID, at least for the order-submission
-response. The duplicate-submission question, and the narrower matched-fill
-trade-history equivalence, both remain open and require a further live order
-that actually matches to resolve; that is a decision for the account owner,
-not something this project runs automatically.
+Three of the four boxes now have a live-tested answer; two of those three are
+positive. Confirmed in the negative: the field-based fallback lookup does not
+recover a matched order, so a lost order ID before durable persistence is
+currently an unrecoverable gap, not just an untested one — later phases must
+close it with a different mechanism before relying on automatic recovery.
+Confirmed in the positive: Result 4 proves this project's offline order-ID
+computation matches the venue's own assigned ID, for both a rejected and a
+matched order, and Result 2's live result proves a byte-identical duplicate
+submission is rejected deterministically, never silently double-filled. What
+remains open is narrower than before: whether `GET /data/trades`'s
+`taker_order_id` field specifically (not just the submission response's
+`order_id`) carries the same value, and the regression-test-against-a-mock
+item, which was already only partial. Those, and independent review of the
+two now-positive results, are what this gate still needs before it can be
+marked passed.
