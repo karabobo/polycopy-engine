@@ -241,8 +241,27 @@ async fn main() {
 
     if let Err(error) = result {
         eprintln!("canary probe failed: {error}");
+        if looks_like_a_platform_outage(&error) {
+            eprintln!(
+                "This looks like a platform-wide issue, not something specific to this account \
+                 or market (confirmed live on 2026-08-31: the identical rejection happened on \
+                 two unrelated markets during a real Polymarket CLOB outage). Before retrying, \
+                 check https://status.polymarket.com for an open incident, and wait until it is \
+                 marked resolved -- retrying during its cancel-only window will just fail again."
+            );
+        }
         std::process::exit(3);
     }
+}
+
+/// A conservative heuristic, not a venue-documented error code: matches the
+/// exact rejection text observed live on 2026-08-31 during a confirmed
+/// platform-wide CLOB outage (see docs/PHASE_0_5_CANARY_REPORT.md, Result 2).
+/// A false negative here just means a plainer error message; it never
+/// changes retry behavior, since this project does not auto-retry regardless.
+#[cfg(feature = "intl_clob")]
+fn looks_like_a_platform_outage(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("trading is disabled")
 }
 
 #[cfg(feature = "intl_clob")]
@@ -273,4 +292,28 @@ fn now_utc() -> String {
 fn main() {
     eprintln!("canary_probe requires the intl_clob feature");
     std::process::exit(2);
+}
+
+#[cfg(all(test, feature = "intl_clob"))]
+mod tests {
+    use super::looks_like_a_platform_outage;
+
+    #[test]
+    fn recognizes_the_exact_rejection_seen_live_during_the_2026_08_31_outage() {
+        let error = r#"unable to submit the canary order: Status: error(503 Service Unavailable) making POST call to /order with {"error":"trading is disabled"}"#;
+        assert!(looks_like_a_platform_outage(error));
+    }
+
+    #[test]
+    fn is_case_insensitive() {
+        assert!(looks_like_a_platform_outage("TRADING IS DISABLED"));
+    }
+
+    #[test]
+    fn does_not_flag_unrelated_errors() {
+        assert!(!looks_like_a_platform_outage("invalid CLOB signing key"));
+        assert!(!looks_like_a_platform_outage(
+            "missing required POLYCOPY_CANARY_TOKEN_ID"
+        ));
+    }
 }
