@@ -2923,9 +2923,12 @@ name = "polycopy-engine"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "fs2",
  "polymarket_client_sdk_v2",
  "rust_decimal",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

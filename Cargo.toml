@@ -9,13 +9,19 @@ publish = false
 default = []
 intl_clob = [
     "dep:async-trait",
+    "dep:chrono",
     "dep:polymarket_client_sdk_v2",
+    "dep:serde",
+    "dep:serde_json",
     "dep:tokio",
 ]
 
 [dependencies]
 async-trait = { version = "0.1", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
 fs2 = "0.4.3"
 polymarket_client_sdk_v2 = { version = "=0.7.0", default-features = false, features = ["clob"], optional = true }
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 tokio = { version = "1", default-features = false, features = ["macros", "rt"], optional = true }

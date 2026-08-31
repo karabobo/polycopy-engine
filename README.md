@@ -11,7 +11,9 @@ The exact audit reference and this independent-implementation decision are
 recorded in [`docs/DRADIS_REFERENCE_BASELINE.md`](docs/DRADIS_REFERENCE_BASELINE.md).
 
 No automated trading code is included yet. The implementation starts only after
-the Phase 0 and Phase 0.5 gates in the blueprint are completed.
+the Phase 0 and Phase 0.5 gates in the blueprint are completed. The only
+order-writing code that exists is the narrowly scoped Phase 0.5 canary probe
+below, which is a dry run unless the operator explicitly opts in.
 
 ## Current development status
 
@@ -28,9 +30,11 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo build --release --all-features --locked
 ```
 
-The project contains no CLOB write client and no live-order path. See
-[`docs/PHASE_0_STATUS.md`](docs/PHASE_0_STATUS.md) for the remaining Phase 0
-gates and [`docs/PHASE_0_5_CANARY_REPORT.md`](docs/PHASE_0_5_CANARY_REPORT.md)
+The project's only live-order path is the `canary_probe` command below,
+gated behind an explicit operator-set environment variable and used solely to
+produce the evidence required by the Phase 0.5 gate. See
+[`docs/PHASE_0_STATUS.md`](docs/PHASE_0_STATUS.md) for Phase 0's closed
+status and [`docs/PHASE_0_5_CANARY_REPORT.md`](docs/PHASE_0_5_CANARY_REPORT.md)
 for the required real-order safety evidence template.
 
 The optional `intl_clob` feature enables a **read-only**, strict per-outcome
@@ -76,3 +80,39 @@ command prints only redacted per-row status, returns exit code `3` for a
 mismatch or query failure, and never treats a clean result as trading approval.
 Record the result using
 [`docs/PHASE_0_GHOST_REPORT.md`](docs/PHASE_0_GHOST_REPORT.md).
+
+## Phase 0.5 canary probe (dry run by default)
+
+`canary_probe` builds and signs one FAK order and, by default, stops there —
+it never calls the venue's order-writing endpoint unless the operator
+explicitly sets `POLYCOPY_CANARY_CONFIRM_SUBMIT=yes` in their own shell. No
+other mechanism, and no automated tool, can set that variable. A dry run still
+authenticates, builds, and signs the order twice against the live venue, which
+is enough to confirm the whole pipeline works and that two independent
+signatures over the same built order are byte-identical (they are: EIP-712
+signing is deterministic for a fixed key and message).
+
+It reuses the same `POLYCOPY_CLOB_*` credential variables as `ghost_verify`,
+plus:
+
+```text
+POLYCOPY_CANARY_LABEL=[short stable label, used under canary-artifacts/<label>/]
+POLYCOPY_CANARY_TOKEN_ID=[decimal outcome token ID]
+POLYCOPY_CANARY_SIDE=BUY|SELL
+POLYCOPY_CANARY_PRICE=[decimal, strictly between 0 and 1]
+POLYCOPY_CANARY_SIZE=[decimal, positive]
+POLYCOPY_CANARY_CONFIRM_SUBMIT=yes      # only this exact value submits the first order
+POLYCOPY_CANARY_CONFIRM_DUPLICATE=yes   # only this exact value also submits a second, independently-signed copy
+```
+
+Choose `POLYCOPY_CANARY_PRICE` away from the current market and
+`POLYCOPY_CANARY_SIZE` at the venue's minimum: the order is always
+Fill-And-Kill (this project has no cancel-order client, so a resting GTC
+canary could be filled later with nothing able to close it), and a price far
+from the market keeps an accidental match astronomically unlikely.
+
+Run `cargo run --locked --features intl_clob --bin canary_probe`. Every
+persisted record lands under the gitignored `canary-artifacts/<label>/`
+directory (spec, submission, and lookup records only — never a private key,
+full envelope, or raw response body). Record the redacted result using
+[`docs/PHASE_0_5_CANARY_REPORT.md`](docs/PHASE_0_5_CANARY_REPORT.md).

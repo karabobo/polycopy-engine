@@ -1,10 +1,16 @@
 //! Core local-safety primitives for the copy-execution engine.
 //!
-//! This crate intentionally has no venue client or order-submission surface
-//! until the Phase 0.5 and Phase 7 financial-correctness gates are satisfied.
+//! `venue` has no order-submission surface (see that module's own doc
+//! comment). The only order-writing code in this crate is the narrowly
+//! scoped Phase 0.5 canary in `canary_run`, gated behind an explicit
+//! operator-set environment variable — see `src/bin/canary_probe.rs`.
 
+pub mod canary;
 pub mod engine_lock;
 pub mod venue;
+
+#[cfg(feature = "intl_clob")]
+pub mod canary_run;
 
 #[cfg(feature = "intl_clob")]
 pub mod ghost;

@@ -11,6 +11,14 @@ bodies, or unredacted wallet addresses here. Put any raw operational material
 under the ignored `canary-artifacts/` directory and retain it only according to
 the operational security policy.
 
+The command is `cargo run --locked --features intl_clob --bin canary_probe`;
+see `README.md`'s "Phase 0.5 canary probe" section for its full environment
+variable list. It is a dry run — it builds and signs but never submits —
+unless `POLYCOPY_CANARY_CONFIRM_SUBMIT=yes` is set by the operator in their
+own shell. Nothing else can set that variable. Set
+`POLYCOPY_CANARY_CONFIRM_DUPLICATE=yes` in the same run to also submit a
+second, independently-signed copy of the identical order for Result 2 below.
+
 ## Authorization and bounds
 
 - Date and operator:
