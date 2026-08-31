@@ -175,6 +175,12 @@ pub struct CanarySubmissionRecord {
 
 /// A redacted-safe summary of one order lookup, persisted for the Phase 0.5
 /// "deterministic lookup" question.
+///
+/// A lookup failure is itself a finding (Phase 0.5 confirmed the venue
+/// returns 404 for an order the moment after it matches), never a reason to
+/// abort the remaining probe steps. [`Self::query_failed`] is the only path
+/// that may produce a record from an `Err`, and it always leaves
+/// `found_order_id`/`size_matched` as `None` rather than guessing.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CanaryLookupRecord {
     pub label: String,
@@ -183,6 +189,64 @@ pub struct CanaryLookupRecord {
     pub found_order_id: Option<String>,
     pub status: Option<String>,
     pub size_matched: Option<String>,
+}
+
+impl CanaryLookupRecord {
+    pub fn found(
+        label: &str,
+        looked_up_at_utc: &str,
+        method: &str,
+        order_id: String,
+        status: String,
+        size_matched: String,
+    ) -> Self {
+        Self {
+            label: label.to_owned(),
+            looked_up_at_utc: looked_up_at_utc.to_owned(),
+            method: method.to_owned(),
+            found_order_id: Some(order_id),
+            status: Some(status),
+            size_matched: Some(size_matched),
+        }
+    }
+
+    /// A lookup that completed but did not find the order (e.g. absent from
+    /// a listing page), as distinct from a query that failed outright.
+    pub fn not_found(label: &str, looked_up_at_utc: &str, method: &str) -> Self {
+        Self {
+            label: label.to_owned(),
+            looked_up_at_utc: looked_up_at_utc.to_owned(),
+            method: method.to_owned(),
+            found_order_id: None,
+            status: None,
+            size_matched: None,
+        }
+    }
+
+    /// A lookup call that itself failed (network error, non-2xx status,
+    /// etc). Never a zero/absent result: the failure reason is preserved in
+    /// `status` and the record is still safe to persist and continue past.
+    pub fn query_failed(
+        label: &str,
+        looked_up_at_utc: &str,
+        method: &str,
+        error: impl fmt::Display,
+    ) -> Self {
+        Self {
+            label: label.to_owned(),
+            looked_up_at_utc: looked_up_at_utc.to_owned(),
+            method: method.to_owned(),
+            found_order_id: None,
+            status: Some(format!("query_failed: {error}")),
+            size_matched: None,
+        }
+    }
+
+    /// `true` only for a lookup that failed outright, as opposed to one that
+    /// completed and simply found nothing.
+    pub fn is_query_failure(&self) -> bool {
+        matches!(&self.status, Some(status) if status.starts_with("query_failed: "))
+    }
 }
 
 /// Writes `contents` to `path`, failing if `path` already exists.
@@ -367,5 +431,62 @@ mod tests {
         assert_eq!(read_record(&path).expect("record must be readable"), "first");
 
         fs::remove_file(path).expect("test artifact must be removable");
+    }
+
+    // Phase 0.5 confirmed live that a fully matched order can 404 from
+    // `GET /data/order/{id}` immediately afterward, and that the field-based
+    // fallback listing does not find a matched order at all. Neither is
+    // grounds to abort the probe; both must turn into a persistable,
+    // non-panicking record. These tests pin that behavior so a future change
+    // cannot silently reintroduce a crash-on-lookup-failure regression.
+
+    #[test]
+    fn a_lookup_query_failure_is_recorded_not_a_reason_to_abort() {
+        let record = CanaryLookupRecord::query_failed(
+            "regression-test",
+            "2026-08-31T00:00:00Z",
+            "order_id",
+            "Status: error(404 Not Found)",
+        );
+
+        assert!(record.is_query_failure());
+        assert_eq!(record.found_order_id, None);
+        assert_eq!(record.size_matched, None);
+        assert!(record
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains("404")));
+
+        // The record itself must still serialize: a lookup failure has to be
+        // writable to canary-artifacts/, not just printed and discarded.
+        serde_json::to_string(&record).expect("a query-failed record must still serialize");
+    }
+
+    #[test]
+    fn a_lookup_that_completes_but_finds_nothing_is_distinct_from_a_query_failure() {
+        let empty_listing = CanaryLookupRecord::not_found(
+            "regression-test",
+            "2026-08-31T00:00:00Z",
+            "asset_id_field_match",
+        );
+
+        assert!(!empty_listing.is_query_failure());
+        assert_eq!(empty_listing.found_order_id, None);
+        assert_eq!(empty_listing.status, None);
+    }
+
+    #[test]
+    fn a_successful_lookup_is_never_classified_as_a_query_failure() {
+        let found = CanaryLookupRecord::found(
+            "regression-test",
+            "2026-08-31T00:00:00Z",
+            "order_id",
+            "0xabc".to_owned(),
+            "Matched".to_owned(),
+            "5.28846".to_owned(),
+        );
+
+        assert!(!found.is_query_failure());
+        assert_eq!(found.found_order_id.as_deref(), Some("0xabc"));
     }
 }

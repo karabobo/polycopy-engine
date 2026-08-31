@@ -127,25 +127,18 @@ async fn main() {
         let by_id_record = match lookup_by_id(&client, &response.order_id).await {
             Ok(looked_up) => {
                 println!("lookup by order_id: found={}", looked_up.id == response.order_id);
-                CanaryLookupRecord {
-                    label: config.label.clone(),
-                    looked_up_at_utc: now_utc(),
-                    method: "order_id".to_owned(),
-                    found_order_id: Some(looked_up.id.clone()),
-                    status: Some(format!("{:?}", looked_up.status)),
-                    size_matched: Some(looked_up.size_matched.to_string()),
-                }
+                CanaryLookupRecord::found(
+                    &config.label,
+                    &now_utc(),
+                    "order_id",
+                    looked_up.id.clone(),
+                    format!("{:?}", looked_up.status),
+                    looked_up.size_matched.to_string(),
+                )
             }
             Err(error) => {
                 println!("lookup by order_id: FAILED: {error}");
-                CanaryLookupRecord {
-                    label: config.label.clone(),
-                    looked_up_at_utc: now_utc(),
-                    method: "order_id".to_owned(),
-                    found_order_id: None,
-                    status: Some(format!("query_failed: {error}")),
-                    size_matched: None,
-                }
+                CanaryLookupRecord::query_failed(&config.label, &now_utc(), "order_id", error)
             }
         };
         let by_id_json = serde_json::to_string_pretty(&by_id_record)
@@ -154,14 +147,12 @@ async fn main() {
 
         let lookup_by_fields_path = artifacts_dir.join("lookup_by_fields.json");
         let by_fields_record = match U256::from_str(config.spec.token_id()) {
-            Err(_) => CanaryLookupRecord {
-                label: config.label.clone(),
-                looked_up_at_utc: now_utc(),
-                method: "asset_id_field_match".to_owned(),
-                found_order_id: None,
-                status: Some("canary token ID became invalid after submission".to_owned()),
-                size_matched: None,
-            },
+            Err(_) => CanaryLookupRecord::query_failed(
+                &config.label,
+                &now_utc(),
+                "asset_id_field_match",
+                "canary token ID became invalid after submission",
+            ),
             Ok(token_id) => {
                 let filter = OrdersRequest::builder().asset_id(token_id).build();
                 match client.orders(&filter, None).await {
@@ -173,25 +164,30 @@ async fn main() {
                             page.data.len(),
                             blind_match.is_some()
                         );
-                        CanaryLookupRecord {
-                            label: config.label.clone(),
-                            looked_up_at_utc: now_utc(),
-                            method: "asset_id_field_match".to_owned(),
-                            found_order_id: blind_match.map(|order| order.id.clone()),
-                            status: blind_match.map(|order| format!("{:?}", order.status)),
-                            size_matched: blind_match.map(|order| order.size_matched.to_string()),
+                        match blind_match {
+                            Some(order) => CanaryLookupRecord::found(
+                                &config.label,
+                                &now_utc(),
+                                "asset_id_field_match",
+                                order.id.clone(),
+                                format!("{:?}", order.status),
+                                order.size_matched.to_string(),
+                            ),
+                            None => CanaryLookupRecord::not_found(
+                                &config.label,
+                                &now_utc(),
+                                "asset_id_field_match",
+                            ),
                         }
                     }
                     Err(error) => {
                         println!("blind field-based lookup: FAILED: {error}");
-                        CanaryLookupRecord {
-                            label: config.label.clone(),
-                            looked_up_at_utc: now_utc(),
-                            method: "asset_id_field_match".to_owned(),
-                            found_order_id: None,
-                            status: Some(format!("query_failed: {error}")),
-                            size_matched: None,
-                        }
+                        CanaryLookupRecord::query_failed(
+                            &config.label,
+                            &now_utc(),
+                            "asset_id_field_match",
+                            error,
+                        )
                     }
                 }
             }

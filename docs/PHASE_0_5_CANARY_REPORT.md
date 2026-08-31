@@ -45,33 +45,67 @@ second, independently-signed copy of the identical order for Result 2 below.
 - Persisted envelope fields used for deterministic lookup: `token_id`,
   `side`, `price`, `size` were persisted to `canary-artifacts/<label>/spec.json`
   before signing or submission, per the "never rebuild an attempt" rule.
-- Lookup endpoint / filters: `GET /data/order/{order_id}` (by known ID); the
-  asset_id-filtered `GET /data/orders` blind-match lookup exists in the tool
-  but was not exercised on this live attempt — the run ended (see below)
-  before reaching that step, and it has not yet been re-run live since the
-  fix.
+- Lookup endpoint / filters: `GET /data/order/{order_id}` (by known ID),
+  re-queried both immediately after submission and again roughly six hours
+  later; `GET /data/orders?asset_id=...` (blind field-based listing),
+  queried at the same later time.
 - Result and returned order identifier: order id
   `0xc6190561e9d5908ce5c1c3a0fc11e8f6bd140329dd41a33413fc1409204f6be5` is
-  known from the original successful submission response. The follow-up
-  `GET /data/order/{id}` call for that same id returned
-  `404 Not Found — Unable to find requested resource`.
-- Is the lookup deterministic? **no, not by order ID** — a fully matched
-  order was not findable by `GET /data/order/{id}` immediately after
-  matching. Balance confirms the fill happened and settled instantly (see
-  Result 3); the order simply is not visible through this specific
-  lookup endpoint once matched. Whether the asset_id-filtered listing
-  endpoint would have found it is still unknown and remains open.
+  known from the original successful submission response.
+  - Immediately after submission: `GET /data/order/{id}` returned
+    `404 Not Found — Unable to find requested resource`.
+  - ~6 hours later: the **same** `GET /data/order/{id}` call **succeeded**,
+    returning the full matched order (`status: Matched`,
+    `size_matched: 5.28846`, `price: 0.55`, `original_size: 5`, ...) — i.e.
+    this is an **indexing/consistency delay**, not a permanent gap. The
+    order became findable by ID some time after it matched.
+  - At that same later time, `GET /data/orders?asset_id=<token>` (no
+    `order_id` filter — the "I don't know the order_id" case) returned
+    **zero orders**, even though the order above unambiguously exists and
+    is matched. This endpoint appears scoped to currently-open/resting
+    orders only, not historical/matched ones, regardless of how long has
+    passed.
+- Is the lookup deterministic? **Only if the order ID is already known, and
+  only after waiting out an unknown indexing delay (confirmed to clear
+  within ~6 hours; the actual minimum delay is unmeasured).** The blind,
+  field-based path this project would need if the order ID itself were lost
+  (e.g. a crash before the submission response was ever read) **does not
+  recover a matched order** through this endpoint — it only lists open
+  orders. Practical implication for later phases: persisting the order ID
+  the moment it is known (before any further processing) is load-bearing,
+  because the asset_id-filtered listing is not a viable fallback for a
+  truly lost order ID once the order has matched. An `uncertain` attempt
+  whose response was genuinely never received cannot currently be resolved
+  by polling either lookup endpoint with only the persisted pre-submission
+  envelope fields; a different recovery mechanism (e.g. a trade-history
+  endpoint or on-chain confirmation) would need to be identified before
+  that gap can be closed.
 
 ## Result 2: byte-identical duplicate submission
 
-**Not tested live.** `POLYCOPY_CANARY_CONFIRM_DUPLICATE` was not set on this
-run. The necessary precondition — that two independent `sign()` calls over
-one built `SignableOrder` (same salt, cloned before signing) produce
-byte-identical `SignedOrder` JSON — was confirmed in multiple dry runs, both
-locally and on the remote host, before this live attempt. The actual
-venue-side behavior when the same signed bytes are submitted twice (409/idempotent
-response, deterministic rejection, or two independent fills) has not yet been
-observed.
+**Not tested live.** The necessary precondition — that two independent
+`sign()` calls over one built `SignableOrder` (same salt, cloned before
+signing) produce byte-identical `SignedOrder` JSON — was confirmed in
+multiple dry runs, both locally and on the remote host, before any live
+attempt. The actual venue-side behavior when the same signed bytes are
+submitted twice (idempotent response, deterministic rejection, or two
+independent fills) has not yet been observed.
+
+A second live attempt (label `fed-25bps-dup-test-2026-08-31`, same
+account/market/size/price, `POLYCOPY_CANARY_CONFIRM_DUPLICATE=yes` also set)
+was made specifically to test this, but the *first* submission of that
+attempt was rejected before an order was created at all:
+`503 Service Unavailable, {"error":"trading is disabled"}`. No `order_id`
+was returned, so this is a clean, unambiguous rejection — not an `uncertain`
+case per invariant #6 — and the tool correctly did not proceed to the
+duplicate-submission step. The account itself was independently confirmed
+not to be in `closed_only` mode (`BanStatusResponse { closed_only: false }`)
+and the venue's public market metadata still showed `acceptingOrders: true`
+for this market at the same time, so the 503 is most consistent with a
+transient, market- or venue-level condition (possibly related to elevated
+volatility in this market around that time) rather than an account
+restriction or a permanently closed market. This question remains open and
+requires a further live attempt, which is the account owner's decision.
 
 ## Result 3: receipt fields
 
@@ -97,22 +131,38 @@ observed.
 
 ## Gate decision
 
-- [ ] Lookup is deterministic from persisted envelope data. **Not proven** —
-      by-ID lookup fails for an already-matched order; the alternative
-      field-based lookup has not yet been exercised live.
+- [ ] Lookup is deterministic from persisted envelope data. **Not proven —
+      and now partially disproven.** By-ID lookup works, but only after an
+      unmeasured indexing delay (confirmed clear by ~6 hours; confirmed
+      absent immediately after matching). The field-based fallback for a
+      truly lost order ID (asset_id-filtered listing) does **not** find a
+      matched order at all — it only lists open orders. A crash before the
+      order ID is durably recorded is not currently recoverable by either
+      lookup path alone.
 - [ ] Byte-identical duplicate behavior is safe for the intended retry policy.
       **Not tested live yet.**
 - [x] Receipt fields are sufficient for idempotent fill-delta accounting —
       `making_amount`/`taking_amount` are precise and matched the observed
       balance change exactly, **provided `filled_qty` is read from
       `taking_amount`, not from the requested `size`** (see Result 3).
-- [ ] The exact lookup and recovery rule has a regression test. **Not yet** —
-      this was a live, manually observed investigation; it is not yet encoded
-      as an automated regression test.
+- [~] The exact lookup and recovery rule has a regression test. **Partial.**
+      `CanaryLookupRecord::{found, not_found, query_failed}` in `canary.rs`
+      now encode the three outcomes discovered live (found; completed but
+      empty; the call itself failed), with unit tests
+      (`canary::tests::a_lookup_query_failure_is_recorded_not_a_reason_to_abort`
+      and its siblings) pinning that a lookup failure always produces a
+      persistable record instead of aborting the probe. This locks in the
+      *safety property* (never crash-and-lose-the-report on a failed lookup).
+      It does **not** replay the actual discovered venue sequence
+      (404-then-succeeds-later, empty-listing-for-a-matched-order) against a
+      mock server — doing that would need the CLOB host and authentication to
+      be injectable for tests, which is not yet built. That remains open.
 
 Decision: **not passed until every box is checked and independently reviewed.**
-Two questions remain open: whether an asset_id-filtered listing lookup can
-recover an order the by-ID lookup cannot, and how the venue handles a
-byte-identical duplicate submission. Both require a further live order to
-resolve and are a decision for the account owner, not something to run
-automatically.
+One question is now answered in the negative rather than merely open: the
+field-based fallback lookup does not recover a matched order, so a lost order
+ID before durable persistence is currently an unrecoverable gap, not just an
+untested one — later phases must close it with a different mechanism before
+relying on automatic recovery. The duplicate-submission question remains
+fully open and requires a further live order to resolve; that is a decision
+for the account owner, not something this project runs automatically.
