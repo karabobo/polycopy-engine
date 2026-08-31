@@ -111,39 +111,62 @@ mod tests {
         ))
     }
 
+    /// A migrated pool at a unique temp path, whose backing files (including
+    /// WAL/SHM siblings) are removed when the guard drops -- so a test that
+    /// panics mid-assertion still cleans up instead of leaking a file.
+    struct TestDb {
+        pool: SqlitePool,
+        path: std::path::PathBuf,
+    }
+
+    impl TestDb {
+        async fn new() -> Self {
+            let path = unique_temp_db_path();
+            let pool = open_and_migrate(&path)
+                .await
+                .expect("migrations must apply to a fresh database");
+            Self { pool, path }
+        }
+    }
+
+    impl std::ops::Deref for TestDb {
+        type Target = SqlitePool;
+
+        fn deref(&self) -> &SqlitePool {
+            &self.pool
+        }
+    }
+
+    impl Drop for TestDb {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(format!("{}-shm", self.path.display()));
+            let _ = fs::remove_file(format!("{}-wal", self.path.display()));
+        }
+    }
+
     #[tokio::test]
     async fn a_fresh_pool_enforces_foreign_keys_and_wal_mode() {
-        let path = unique_temp_db_path();
-        let pool = open_and_migrate(&path)
-            .await
-            .expect("migrations must apply to a fresh database");
+        let db = TestDb::new().await;
 
         let foreign_keys: i64 = sqlx::query("PRAGMA foreign_keys")
-            .fetch_one(&pool)
+            .fetch_one(&*db)
             .await
             .expect("PRAGMA foreign_keys must be queryable")
             .get(0);
         assert_eq!(foreign_keys, 1);
 
         let journal_mode: String = sqlx::query("PRAGMA journal_mode")
-            .fetch_one(&pool)
+            .fetch_one(&*db)
             .await
             .expect("PRAGMA journal_mode must be queryable")
             .get(0);
         assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
-
-        pool.close().await;
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(format!("{}-shm", path.display()));
-        let _ = fs::remove_file(format!("{}-wal", path.display()));
     }
 
     #[tokio::test]
     async fn foreign_keys_are_actually_enforced_not_just_reported_on() {
-        let path = unique_temp_db_path();
-        let pool = open_and_migrate(&path)
-            .await
-            .expect("migrations must apply to a fresh database");
+        let db = TestDb::new().await;
 
         // leader_wallet_aliases.leader_id references leader_config(id); a
         // row pointing at a nonexistent leader must be rejected, not
@@ -151,49 +174,87 @@ mod tests {
         let result = sqlx::query(
             "INSERT INTO leader_wallet_aliases (leader_id, address) VALUES (999, '0xabc')",
         )
-        .execute(&pool)
+        .execute(&*db)
         .await;
         assert!(result.is_err(), "a dangling foreign key must be rejected");
+    }
 
-        pool.close().await;
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(format!("{}-shm", path.display()));
-        let _ = fs::remove_file(format!("{}-wal", path.display()));
+    #[tokio::test]
+    async fn one_account_can_follow_many_leaders_at_once() {
+        // v1's whole scope is "one account, multiple leaders" (see
+        // COPY_ENGINE_BLUEPRINT.md section 1): the uniqueness constraint
+        // below only stops the *same leader address* from being claimed
+        // twice, never how many distinct leaders one account follows.
+        let db = TestDb::new().await;
+
+        sqlx::query(
+            "INSERT INTO accounts (id, label, signing_address, signature_type) \
+             VALUES (1, 'primary', '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'eoa')",
+        )
+        .execute(&*db)
+        .await
+        .expect("the single v1 account must insert");
+
+        sqlx::query(
+            "INSERT INTO leader_config (id, label) VALUES \
+             (1, 'leader-alpha'), (2, 'leader-beta'), (3, 'leader-gamma')",
+        )
+        .execute(&*db)
+        .await
+        .expect("multiple leaders must insert");
+
+        for (leader_id, address) in [
+            (1, "0x1111111111111111111111111111111111111111"),
+            (2, "0x2222222222222222222222222222222222222222"),
+            (3, "0x3333333333333333333333333333333333333333"),
+        ] {
+            sqlx::query("INSERT INTO leader_wallet_aliases (leader_id, address) VALUES (?, ?)")
+                .bind(leader_id)
+                .bind(address)
+                .execute(&*db)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("leader {leader_id}'s distinct address must enable cleanly: {error}")
+                });
+        }
+
+        let enabled_leader_count: i64 =
+            sqlx::query("SELECT COUNT(*) FROM leader_config WHERE enabled = 1")
+                .fetch_one(&*db)
+                .await
+                .expect("leader count must be queryable")
+                .get(0);
+        assert_eq!(
+            enabled_leader_count, 3,
+            "the one v1 account has three simultaneously enabled leaders"
+        );
     }
 
     #[tokio::test]
     async fn an_address_cannot_be_enabled_under_two_leaders_at_once() {
-        let path = unique_temp_db_path();
-        let pool = open_and_migrate(&path)
-            .await
-            .expect("migrations must apply to a fresh database");
+        let db = TestDb::new().await;
 
         sqlx::query("INSERT INTO leader_config (id, label) VALUES (1, 'leader-one'), (2, 'leader-two')")
-            .execute(&pool)
+            .execute(&*db)
             .await
             .expect("both leaders must insert");
 
         sqlx::query(
             "INSERT INTO leader_wallet_aliases (leader_id, address) VALUES (1, '0x1111111111111111111111111111111111111111')",
         )
-        .execute(&pool)
+        .execute(&*db)
         .await
         .expect("the first enabled alias must insert");
 
         let duplicate = sqlx::query(
             "INSERT INTO leader_wallet_aliases (leader_id, address) VALUES (2, '0x1111111111111111111111111111111111111111')",
         )
-        .execute(&pool)
+        .execute(&*db)
         .await;
         assert!(
             duplicate.is_err(),
             "the same address must not be enabled under a second leader"
         );
-
-        pool.close().await;
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(format!("{}-shm", path.display()));
-        let _ = fs::remove_file(format!("{}-wal", path.display()));
     }
 
     #[tokio::test]
@@ -208,5 +269,132 @@ mod tests {
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{}-shm", path.display()));
         let _ = fs::remove_file(format!("{}-wal", path.display()));
+    }
+
+    async fn insert_leader(db: &TestDb, id: i64, label: &str) {
+        sqlx::query("INSERT INTO leader_config (id, label) VALUES (?, ?)")
+            .bind(id)
+            .bind(label)
+            .execute(&**db)
+            .await
+            .expect("leader must insert");
+    }
+
+    #[tokio::test]
+    async fn replaying_the_same_activity_trade_creates_no_second_canonical_event() {
+        let db = TestDb::new().await;
+        insert_leader(&db, 1, "leader-one").await;
+
+        let insert_once = "INSERT OR IGNORE INTO leader_events \
+            (canonical_event_key, leader_id, condition_id, token_id, outcome_index, side, size, \
+             price, occurred_at, observed_at) \
+            VALUES ('activity:trade-1', 1, '0xcond', '123', 0, 'BUY', '5', '0.5', \
+            '2026-08-31T00:00:00Z', '2026-08-31T00:00:01Z')";
+
+        sqlx::query(insert_once)
+            .execute(&*db)
+            .await
+            .expect("first observation of this trade must insert");
+        // Simulates Activity WS and Activity REST backfill both delivering
+        // the same trade: the canonical_event_key is the same, so a second
+        // INSERT OR IGNORE must be a no-op, not a duplicate row.
+        sqlx::query(insert_once)
+            .execute(&*db)
+            .await
+            .expect("a replayed observation of the same trade must not error");
+
+        let event_count: i64 = sqlx::query("SELECT COUNT(*) FROM leader_events")
+            .fetch_one(&*db)
+            .await
+            .expect("event count must be queryable")
+            .get(0);
+        assert_eq!(event_count, 1, "replay must not create a second canonical event");
+    }
+
+    #[tokio::test]
+    async fn an_onchain_observation_can_stay_unlinked_from_any_canonical_event() {
+        let db = TestDb::new().await;
+
+        // "An on-chain observation may stay unlinked if it cannot be related
+        // by an explicit source identifier" -- leader_event_id is nullable
+        // precisely so a confirmation-only observation is never forced into
+        // fuzzy-matching its way onto some canonical event.
+        sqlx::query(
+            "INSERT INTO leader_event_observations (leader_event_id, source, payload) \
+             VALUES (NULL, 'onchain_ws', '{\"raw\":\"unrelated-log\"}')",
+        )
+        .execute(&*db)
+        .await
+        .expect("an unlinked on-chain observation must insert");
+    }
+
+    #[tokio::test]
+    async fn activity_ws_and_backfill_can_both_observe_one_canonical_event() {
+        let db = TestDb::new().await;
+        insert_leader(&db, 1, "leader-one").await;
+
+        sqlx::query(
+            "INSERT INTO leader_events \
+             (canonical_event_key, leader_id, condition_id, token_id, outcome_index, side, size, \
+              price, occurred_at, observed_at) \
+             VALUES ('activity:trade-1', 1, '0xcond', '123', 0, 'BUY', '5', '0.5', \
+             '2026-08-31T00:00:00Z', '2026-08-31T00:00:01Z')",
+        )
+        .execute(&*db)
+        .await
+        .expect("the canonical event must insert");
+
+        for source in ["activity_ws", "activity_backfill"] {
+            sqlx::query(
+                "INSERT INTO leader_event_observations (leader_event_id, source, source_identifier, payload) \
+                 VALUES (1, ?, 'trade-1', '{}')",
+            )
+            .bind(source)
+            .execute(&*db)
+            .await
+            .unwrap_or_else(|error| panic!("{source}'s observation must insert: {error}"));
+        }
+
+        let observation_count: i64 =
+            sqlx::query("SELECT COUNT(*) FROM leader_event_observations WHERE leader_event_id = 1")
+                .fetch_one(&*db)
+                .await
+                .expect("observation count must be queryable")
+                .get(0);
+        assert_eq!(
+            observation_count, 2,
+            "both sources' observations of the same event must be retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_source_cannot_record_the_identical_trade_twice() {
+        let db = TestDb::new().await;
+        insert_leader(&db, 1, "leader-one").await;
+        sqlx::query(
+            "INSERT INTO leader_events \
+             (canonical_event_key, leader_id, condition_id, token_id, outcome_index, side, size, \
+              price, occurred_at, observed_at) \
+             VALUES ('activity:trade-1', 1, '0xcond', '123', 0, 'BUY', '5', '0.5', \
+             '2026-08-31T00:00:00Z', '2026-08-31T00:00:01Z')",
+        )
+        .execute(&*db)
+        .await
+        .expect("the canonical event must insert");
+
+        let insert_observation = "INSERT INTO leader_event_observations \
+            (leader_event_id, source, source_identifier, payload) \
+            VALUES (1, 'activity_ws', 'trade-1', '{}')";
+        sqlx::query(insert_observation)
+            .execute(&*db)
+            .await
+            .expect("the first observation must insert");
+
+        // e.g. a WS reconnect replaying its recent message buffer.
+        let replay = sqlx::query(insert_observation).execute(&*db).await;
+        assert!(
+            replay.is_err(),
+            "the same source recording the same trade twice must be rejected"
+        );
     }
 }

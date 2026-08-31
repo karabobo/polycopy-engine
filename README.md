@@ -145,13 +145,26 @@ hand-rolled equivalent.
 let pool = polycopy_engine::copytrading::open_and_migrate("./copy.sqlite").await?;
 ```
 
-Schema so far covers only `accounts`, `leader_config`, and
-`leader_wallet_aliases`: one copied account and its enabled leader address
-aliases. Addresses are stored lowercase and a partial unique index enforces
-that the same address can never be enabled under two leaders at once (or
-twice under one). The database file must live on local block storage, not
-NFS/SMB — this is a single-host, single-writer deployment; see
-[`EngineLock`](src/engine_lock.rs) for the process-level enforcement of
-"single writer". The event ledger, intent planner, fixed-lane executor, and
-reconciliation tables described later in blueprint section 6 do not exist
-yet.
+Schema so far covers:
+
+- `accounts`, `leader_config`, `leader_wallet_aliases` — one copied account
+  and its enabled leader address aliases. Addresses are stored lowercase and
+  a partial unique index enforces that the same address can never be enabled
+  under two leaders at once (or twice under one). This does **not** limit how
+  many leaders one account follows — v1's whole scope is "one account,
+  multiple leaders" (blueprint section 1), and multiple simultaneously
+  enabled leaders is a directly tested case.
+- `leader_events`, `leader_event_observations` — the canonical, immutable
+  leader-trade ledger and its raw source observations. `canonical_event_key`
+  (`'activity:' || activity_trade_id`) is the sole dedup key: replaying the
+  same Activity WS message or re-running backfill over an overlapping window
+  is safe by construction (`INSERT OR IGNORE`), never creates a second event.
+  An on-chain observation may stay unlinked (`leader_event_id = NULL`) rather
+  than being fuzzy-matched onto a canonical event it can't be explicitly
+  related to.
+
+The database file must live on local block storage, not NFS/SMB — this is a
+single-host, single-writer deployment; see [`EngineLock`](src/engine_lock.rs)
+for the process-level enforcement of "single writer". The intent planner,
+fixed-lane executor, and reconciliation tables described later in blueprint
+section 6 do not exist yet.
