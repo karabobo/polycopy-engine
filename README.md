@@ -208,11 +208,20 @@ trades correctly parsed from one 15-second connection): `wss://ws-live-data.poly
 This is a global, unfiltered firehose of every trade on the platform — there
 is no server-side per-wallet filter, so [`address_resolver`](src/copytrading/ingest/address_resolver.rs)
 filters client-side. Both `trades` and `orders_matched` are subscribed
-because the same trade can arrive under either or both; there is no
-dedicated trade-ID field in the payload, so `transaction_hash` is used as the
-de-facto trade identity (an assumption inherited from the reference
-implementation — see `normalize.rs`'s module doc for the residual risk if a
-single transaction ever contains more than one of a leader's trades).
+because the same trade can arrive under either or both.
+
+There is no dedicated trade-ID field in either this payload or the REST
+backfill response below. The reference implementation uses
+`transaction_hash` alone as the trade identity; **this project does not**,
+because a single settlement transaction was confirmed live (2026-08-31,
+against real Data API results) to sometimes contain more than one of a
+leader's trades — two distinct fills, same token/side/price/timestamp,
+different sizes, one shared transaction hash. `transaction_hash` alone
+silently dropped the second fill. [`apply.rs`](src/copytrading/ingest/apply.rs)'s
+`canonical_event_key` instead composes transaction hash with token, side,
+price, and size — the most specific disambiguator either payload exposes;
+two fills sharing all four of those too would still collide, and no
+available field rules that out entirely.
 
 - [`normalize.rs`](src/copytrading/ingest/normalize.rs) — pure, fully
   unit-tested parsing of one raw WebSocket frame into a trade or a reason it
@@ -221,18 +230,29 @@ single transaction ever contains more than one of a leader's trades).
   blueprint's `ArcSwap<HashMap<normalized_address, leader_id>>`: a reload
   builds the full replacement map before publishing it, so a concurrent
   reader never observes a temporary empty map.
+- [`apply.rs`](src/copytrading/ingest/apply.rs) — `apply_trade`: resolve,
+  check `leader_config.activation_at` (a leader with no `activation_at` yet
+  rejects every event, never treated as "no lower bound"), then durably
+  record. The one function both `activity_ws` and `backfill` funnel every
+  decision through, so the activation rule and the insert path can't drift
+  between sources; testable against a real (temp-file) database without a
+  live WebSocket or REST call.
 - [`activity_ws.rs`](src/copytrading/ingest/activity_ws.rs) — connects,
   subscribes, sends an application-level `"ping"` every 10s (the venue's
-  convention, not a WebSocket protocol ping), reconnects with exponential
-  backoff (3s → 6s → ... → 60s) on any error or on 30 seconds without an
-  activity-topic message, and rejects any event before a leader's
-  `leader_config.activation_at` (a leader with no `activation_at` yet
-  rejects every event, never treated as "no lower bound"). `process_message`
-  — parse, resolve, check activation, then durably record — is the one
-  function the connection loop delegates every decision to, so it's testable
-  against a real (temp-file) database without a live WebSocket; the
-  connection loop itself isn't unit-tested, matching this project's existing
-  precedent for network-touching code.
+  convention, not a WebSocket protocol ping), and reconnects with
+  exponential backoff (3s → 6s → ... → 60s) on any error or on 30 seconds
+  without an activity-topic message. The connection loop itself isn't
+  unit-tested, matching this project's existing precedent for
+  network-touching code.
+- [`backfill.rs`](src/copytrading/ingest/backfill.rs) — `backfill_leader`:
+  catches up a watched leader via the *documented, typed*
+  `polymarket_client_sdk_v2::data::Client` (`data-api.polymarket.com`,
+  public, unauthenticated), using each leader's latest recorded
+  `occurred_at` as a high-water mark (minus a 30s overlap; canonical-event
+  uniqueness absorbs the overlap). Verified live: correctly ingested 499
+  distinct events from 500 fetched real activity rows for a real address
+  (the 500th was the duplicate-transaction-hash fill described above,
+  ingested as its own event once the fix above landed).
 
 One easy-to-miss setup requirement: `rustls` 0.23+ does not select a default
 crypto backend on its own, and without installing one every TLS connect

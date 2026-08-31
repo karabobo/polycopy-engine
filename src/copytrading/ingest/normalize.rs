@@ -14,13 +14,19 @@
 //! (see `address_resolver`).
 //!
 //! There is no dedicated trade-ID field in the payload. The reference
-//! implementation uses `transactionHash` as the de-facto trade identity and
-//! de-duplicates on it (both "trades" and "orders_matched" can push the same
-//! trade). This assumes one transaction hash corresponds to one trade; if a
-//! single settlement transaction can ever contain more than one of a
-//! leader's trades, this would under-count them. That assumption is
-//! inherited from the reference implementation, not independently verified
-//! here, and should be revisited if evidence of the collision appears.
+//! implementation uses `transactionHash` alone as the de-facto trade
+//! identity; **this project does not**, because a single settlement
+//! transaction confirmed live (2026-08-31, via the REST backfill path
+//! against real Data API results) can contain more than one of a leader's
+//! trades -- two distinct fills, same token/side/price/timestamp, different
+//! sizes, sharing one transaction hash. Using the hash alone silently
+//! dropped the second fill under `INSERT OR IGNORE`. See
+//! `apply.rs::apply_trade`'s `canonical_event_key`, which instead composes
+//! transaction hash with token, side, price, and size -- the most specific
+//! disambiguator available from either the REST or WS payload (neither
+//! exposes a per-trade sequence/log-index field). Two fills in one
+//! transaction that also happen to share all four of those fields would
+//! still collide; no available field rules that out entirely.
 
 use serde::Deserialize;
 use serde_json::Value;

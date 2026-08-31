@@ -9,8 +9,12 @@
 
 pub mod activity_ws;
 pub mod address_resolver;
+pub mod apply;
+pub mod backfill;
 pub mod normalize;
 
-pub use activity_ws::{process_message, run, ActivityWsError, ProcessOutcome, RTDS_URL};
+pub use activity_ws::{process_message, run, ActivityWsError, RTDS_URL};
 pub use address_resolver::AddressResolver;
+pub use apply::{apply_trade, ProcessOutcome};
+pub use backfill::{backfill_leader, BackfillError, BackfillSummary};
 pub use normalize::{NormalizedTrade, ParseResult, TradeSide};

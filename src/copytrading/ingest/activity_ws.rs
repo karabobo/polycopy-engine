@@ -11,7 +11,8 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use sqlx::SqlitePool;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{address_resolver::AddressResolver, normalize, normalize::ParseResult, TradeSide};
+use super::{address_resolver::AddressResolver, apply::apply_trade, normalize, normalize::ParseResult};
+pub use super::apply::ProcessOutcome;
 
 pub const RTDS_URL: &str = "wss://ws-live-data.polymarket.com";
 const SUBSCRIBE_MESSAGE: &str = r#"{"action":"subscribe","subscriptions":[{"topic":"activity","type":"trades"},{"topic":"activity","type":"orders_matched"}]}"#;
@@ -28,51 +29,11 @@ fn ensure_crypto_provider_installed() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-/// What happened to one raw WebSocket text frame. Every variant is a
-/// terminal, correct outcome -- there is no "error" variant for a message
-/// that simply isn't relevant or isn't well-formed; see
-/// [`normalize::ParseResult`] for why `Skip` and `Rejected` are distinct.
-#[derive(Debug, PartialEq)]
-pub enum ProcessOutcome {
-    /// Written to `leader_events`/`leader_event_observations` (or already
-    /// present from a prior observation of the same canonical event).
-    Ingested { leader_id: i64, canonical_event_key: String },
-    /// Not a trade message at all (ping/pong, unrelated topic).
-    Skip,
-    /// A recognized activity message missing a required field.
-    Rejected(&'static str),
-    /// A real trade, but not from any currently watched leader address.
-    NotWatched,
-    /// The trader address resolves to a leader, but that leader has never
-    /// been activated (`activation_at IS NULL`) -- never treated as "no
-    /// lower bound".
-    LeaderNotActivated,
-    /// The trade occurred before the leader's activation_at.
-    BeforeActivation,
-    DatabaseError(String),
-}
-
-impl fmt::Display for ProcessOutcome {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Ingested { leader_id, canonical_event_key } => {
-                write!(formatter, "ingested leader_id={leader_id} key={canonical_event_key}")
-            }
-            Self::Skip => write!(formatter, "skip"),
-            Self::Rejected(reason) => write!(formatter, "rejected: {reason}"),
-            Self::NotWatched => write!(formatter, "not watched"),
-            Self::LeaderNotActivated => write!(formatter, "leader not activated"),
-            Self::BeforeActivation => write!(formatter, "before activation"),
-            Self::DatabaseError(error) => write!(formatter, "database error: {error}"),
-        }
-    }
-}
-
-/// Parses `raw`, resolves its trader address against `resolver`, checks
-/// activation, and -- only if every check passes -- durably records it.
-/// This is the entire per-message decision the connection loop delegates
-/// to; it does no networking itself, so it is testable against a real
-/// (temp-file) database without a live WebSocket.
+/// Parses `raw`, then delegates to [`apply_trade`] (shared with
+/// `backfill`) for resolution, activation, and the durable write. This is
+/// the entire per-message decision the connection loop makes; it does no
+/// networking itself, so it is testable against a real (temp-file)
+/// database without a live WebSocket.
 pub async fn process_message(
     pool: &SqlitePool,
     resolver: &AddressResolver,
@@ -83,89 +44,8 @@ pub async fn process_message(
         ParseResult::Skip => return ProcessOutcome::Skip,
         ParseResult::Rejected(reason) => return ProcessOutcome::Rejected(reason),
     };
-
-    let Some(leader_id) = resolver.resolve(&trade.trader_address) else {
-        return ProcessOutcome::NotWatched;
-    };
-
-    let activation_at: Option<String> = match sqlx::query_scalar(
-        "SELECT activation_at FROM leader_config WHERE id = ?",
-    )
-    .bind(leader_id)
-    .fetch_optional(pool)
-    .await
-    {
-        Ok(row) => row.flatten(),
-        Err(error) => return ProcessOutcome::DatabaseError(error.to_string()),
-    };
-
-    let Some(activation_at) = activation_at else {
-        return ProcessOutcome::LeaderNotActivated;
-    };
-
-    // Both sides are RFC 3339 with a fixed millisecond width and a literal
-    // 'Z' offset (see normalize.rs), so lexicographic string comparison is
-    // equivalent to chronological comparison here.
-    if trade.occurred_at_utc.as_str() < activation_at.as_str() {
-        return ProcessOutcome::BeforeActivation;
-    }
-
-    let canonical_event_key = format!("activity:{}", trade.transaction_hash);
-    let side = match trade.side {
-        TradeSide::Buy => "BUY",
-        TradeSide::Sell => "SELL",
-    };
-
-    let mut tx = match pool.begin().await {
-        Ok(tx) => tx,
-        Err(error) => return ProcessOutcome::DatabaseError(error.to_string()),
-    };
-
-    let insert_event = sqlx::query(
-        "INSERT OR IGNORE INTO leader_events \
-         (canonical_event_key, leader_id, condition_id, token_id, outcome_index, side, size, \
-          price, tx_hash, occurred_at, observed_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-    )
-    .bind(&canonical_event_key)
-    .bind(leader_id)
-    .bind(&trade.condition_id)
-    .bind(&trade.token_id)
-    .bind(trade.outcome_index)
-    .bind(side)
-    .bind(&trade.size)
-    .bind(&trade.price)
-    .bind(&trade.transaction_hash)
-    .bind(&trade.occurred_at_utc)
-    .execute(&mut *tx)
-    .await;
-    if let Err(error) = insert_event {
-        return ProcessOutcome::DatabaseError(error.to_string());
-    }
-
-    // A sub-select, not a captured last-insert-id: the event row may
-    // already exist from a prior observation (this is exactly the replay
-    // case the canonical_event_key uniqueness absorbs), and this
-    // observation must attach to that existing row either way.
-    let insert_observation = sqlx::query(
-        "INSERT OR IGNORE INTO leader_event_observations \
-         (leader_event_id, source, source_identifier, payload) \
-         SELECT id, 'activity_ws', ?, ? FROM leader_events WHERE canonical_event_key = ?",
-    )
-    .bind(&trade.transaction_hash)
-    .bind(raw)
-    .bind(&canonical_event_key)
-    .execute(&mut *tx)
-    .await;
-    if let Err(error) = insert_observation {
-        return ProcessOutcome::DatabaseError(error.to_string());
-    }
-
-    if let Err(error) = tx.commit().await {
-        return ProcessOutcome::DatabaseError(error.to_string());
-    }
-
-    ProcessOutcome::Ingested { leader_id, canonical_event_key }
+    let transaction_hash = trade.transaction_hash.clone();
+    apply_trade(pool, resolver, &trade, "activity_ws", &transaction_hash, raw).await
 }
 
 /// Runs the activity WebSocket connection forever, reconnecting with
@@ -398,11 +278,11 @@ mod tests {
             outcome,
             ProcessOutcome::Ingested {
                 leader_id: 1,
-                canonical_event_key: "activity:0xh1".to_owned()
+                canonical_event_key: "activity:0xh1:123:BUY:0.5:5".to_owned()
             }
         );
 
-        let event_count: i64 = sqlx::query("SELECT COUNT(*) FROM leader_events WHERE canonical_event_key = 'activity:0xh1'")
+        let event_count: i64 = sqlx::query("SELECT COUNT(*) FROM leader_events WHERE canonical_event_key = 'activity:0xh1:123:BUY:0.5:5'")
             .fetch_one(&*db)
             .await
             .expect("event count must be queryable")
