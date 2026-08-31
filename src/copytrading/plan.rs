@@ -178,8 +178,9 @@ async fn evaluate_event(
         return Ok(reject(shard_id, "leader is disabled"));
     };
 
-    let policy = sqlx::query_as::<_, PolicyRow>(
-        "SELECT max_signal_age_seconds, decision_window_seconds, min_leader_trade_size \
+    let policy = sqlx::query_as::<_, PolicySnapshot>(
+        "SELECT max_signal_age_seconds, decision_window_seconds, price_tolerance_bps, \
+                tick_size, min_price, max_price, max_order_notional, min_leader_trade_size \
          FROM leader_policy WHERE leader_id = ?",
     )
     .bind(event.leader_id)
@@ -212,10 +213,11 @@ async fn evaluate_event(
         return Ok(reject(shard_id, "leader trade size below policy minimum"));
     }
 
-    let config_snapshot_json = format!(
-        "{{\"max_signal_age_seconds\":{},\"decision_window_seconds\":{},\"min_leader_trade_size\":\"{}\"}}",
-        policy.max_signal_age_seconds, policy.decision_window_seconds, policy.min_leader_trade_size
-    );
+    // The complete policy, not a subset: Phase 4 must size and price using
+    // exactly what this decision was made under, immune to a later policy
+    // edit (blueprint section 3's "immutable configuration snapshot").
+    let config_snapshot_json = serde_json::to_string(&policy)
+        .map_err(|_| PlanError::InvalidDecimal("leader_policy snapshot"))?;
     let config_snapshot_hash = format!("{:016x}", hash_str(&config_snapshot_json));
 
     let decision_deadline_at = observed_at + chrono::Duration::seconds(policy.decision_window_seconds);
@@ -239,11 +241,21 @@ fn reject(shard_id: i64, reason: &'static str) -> Decision {
     }
 }
 
-#[derive(Debug, FromRow)]
-struct PolicyRow {
-    max_signal_age_seconds: i64,
-    decision_window_seconds: i64,
-    min_leader_trade_size: String,
+/// The complete policy a planning decision (and later, Phase 4's sizing) is
+/// made under. Serialized verbatim into `copy_intents.config_snapshot_json`
+/// so a later edit to `leader_policy` never retroactively changes an
+/// already-planned intent's behavior; deserialized back out by whatever
+/// reads that snapshot rather than re-querying live policy.
+#[derive(Debug, Clone, FromRow, serde::Serialize, serde::Deserialize)]
+pub struct PolicySnapshot {
+    pub max_signal_age_seconds: i64,
+    pub decision_window_seconds: i64,
+    pub price_tolerance_bps: i64,
+    pub tick_size: String,
+    pub min_price: String,
+    pub max_price: String,
+    pub max_order_notional: String,
+    pub min_leader_trade_size: String,
 }
 
 fn shard_for(account_id: i64, token_id: &str, lane_count: i64) -> i64 {
@@ -494,6 +506,31 @@ mod tests {
                 .expect("intent must exist");
         assert_eq!(status, "pending");
         assert!(deadline.is_some(), "a pending intent must have a decision deadline");
+    }
+
+    #[tokio::test]
+    async fn the_config_snapshot_captures_the_complete_policy_not_a_subset() {
+        // A later leader_policy edit must never retroactively change an
+        // already-planned intent (blueprint section 3): that only holds if
+        // every field Phase 4 needs (tick_size, price_tolerance_bps,
+        // max_order_notional, ...) is actually in the snapshot, not just
+        // the subset the planner itself happens to check.
+        let db = TestDb::new().await;
+        seed_account_and_leader(&db).await;
+        seed_policy(&db, 3600, "1").await;
+        insert_event(&db, "5", &chrono::Utc::now().to_rfc3339()).await;
+        plan_next_batch(&db, 1).await.expect("planning must succeed");
+
+        let snapshot_json: String =
+            sqlx::query_scalar("SELECT config_snapshot_json FROM copy_intents LIMIT 1")
+                .fetch_one(&*db)
+                .await
+                .expect("intent must exist");
+        let snapshot: PolicySnapshot =
+            serde_json::from_str(&snapshot_json).expect("snapshot must deserialize");
+        assert_eq!(snapshot.tick_size, "0.01");
+        assert_eq!(snapshot.price_tolerance_bps, 100);
+        assert_eq!(snapshot.max_order_notional, "1000");
     }
 
     #[tokio::test]

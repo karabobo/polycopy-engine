@@ -29,6 +29,10 @@ ingest = [
     "tokio/time",
     "tokio/net",
 ]
+execute = [
+    "db",
+    "intl_clob",
+]
 
 [dependencies]
 arc-swap = { version = "1", optional = true }

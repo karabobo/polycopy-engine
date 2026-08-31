@@ -24,18 +24,20 @@ first implemented primitive is a cross-process database ownership lock: a
 second engine instance fails instead of sharing a database and sending
 concurrently for the same account/token.
 
-Phase 1 (durable schema, blueprint section 6), Phase 2 (activity ingestion,
-section 7), and Phase 3 (transactional intent planning, section 8) have
-also started, ahead of Phase 0.5's gate formally closing, at the account
-owner's explicit direction while Phase 0.5's remaining live tests wait on a
-Polymarket-side CLOB outage to clear. Phase 1's schema is complete (every
-table section 6 lists). Phase 2 has a working, live-verified connection to
-the leader-trade firehose plus REST backfill, both writing into that
-schema. Phase 3 turns a recorded event into a durably accepted or
-explicitly rejected `copy_intent` — it does not size or price an order
-(that is Phase 4). The fixed-lane executor and prepared-submission layer
-(Phases 4–5) are not built. See "Database (Phase 1)", "Activity ingestion
-(Phase 2)", and "Intent planning (Phase 3)" below.
+Phase 1 (durable schema, blueprint section 6) through Phase 4 (fixed-lane
+executor, section 9) have started, ahead of Phase 0.5's gate formally
+closing, at the account owner's explicit direction while Phase 0.5's
+remaining live tests wait on a Polymarket-side CLOB outage to clear. Phase
+1's schema is complete (every table section 6 lists). Phase 2 has a
+working, live-verified connection to the leader-trade firehose plus REST
+backfill, both writing into that schema. Phase 3 turns a recorded event
+into a durably accepted or explicitly rejected `copy_intent`. Phase 4
+claims an intent, sizes and reserves it, and finalizes an idempotent
+receipt into `position_lots` — but it does **not** submit an order itself:
+that is Phase 5, which does not exist, and this project's assistant will
+never write or run that code. See "Database (Phase 1)", "Activity
+ingestion (Phase 2)", "Intent planning (Phase 3)", and "Fixed-lane executor
+(Phase 4)" below.
 
 Run the complete local checks with:
 
@@ -296,3 +298,46 @@ exists yet, rather than guessing a lane count.
 currently-enabled leader alias of an enabled leader and reloads the
 resolver from it in one call — the piece that was previously only
 exercised with hand-built test data, not a real query, is now wired up.
+
+## Fixed-lane executor (Phase 4)
+
+The optional `execute` feature (`polycopy_engine::copytrading::execute`,
+implies `db` and `intl_clob`) is `execute_intent`: claim a pending intent
+(compare-and-set to `in_progress` — the single-in-flight guarantee two
+lanes racing the same intent rely on), size and reserve it, submit via a
+generic [`OrderSubmitter`](src/copytrading/execute.rs), then finalize the
+receipt into `position_lots`. **`OrderSubmitter` has no real implementation
+anywhere in this crate.** Phase 5 (prepared submission against the live
+venue) does not exist, and per this project's own operating rule the
+assistant that has been building it will never write or run the code that
+places a live order — that boundary is why this trait exists as a seam:
+it lets Phase 4's own logic be built and fully tested now, against a fake
+submitter, without touching anything that could trade.
+
+Sizing follows blueprint section 9's `sell_all_on_exit` algorithm exactly
+for `SELL`: `sell_qty = max(0, min(leader_virtual_lot, strict_actual_available
+- reservations_of_other_active_intents))`, with the intent's own reservation
+excluded from that subtraction so a recovery doesn't shrink its original
+sale. A strict balance-query failure or a non-positive result is always
+`needs_reconcile`, never treated as a zero balance or a silent no-op.
+`BUY` sizing (not specified by the blueprint in the same detail) mirrors
+the leader's traded size, capped by `leader_policy.max_order_notional /
+limit_price`; both sides price at the leader's trade price plus/minus
+`leader_policy.price_tolerance_bps` and round to `leader_policy.tick_size`
+(ceiling for a BUY's ceiling, floor for a SELL's floor) — implementation
+choices, not blueprint mandates, since the blueprint leaves the exact price
+formula to the implementation.
+
+The executor never holds an SQLite write transaction across network I/O:
+the strict balance read happens before the reservation transaction begins.
+Resuming an already-`in_progress` intent (a crash-recovery case) reuses its
+already-persisted `planned_qty`/`planned_price` rather than recomputing a
+second, possibly-different decision. `finalize_receipt` applies only the
+newly confirmed fill delta (computed against `order_attempts.accounted_filled_qty`,
+not applied blindly), so replaying the identical receipt — including after
+a simulated crash between the venue response and the commit — leaves the
+lot unchanged on the second pass. Seven tests cover blueprint's four stated
+Phase 4 acceptance criteria directly: distinct lots for two leaders buying
+one token, no overselling while a first SELL is still uncertain, idempotent
+receipt replay, and single-in-flight claiming — plus the needs_reconcile
+paths for a failed balance query and a non-positive sell result.
