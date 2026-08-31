@@ -11,8 +11,10 @@ intl_clob = [
     "dep:async-trait",
     "dep:chrono",
     "dep:polymarket_client_sdk_v2",
-    "dep:serde",
-    "dep:serde_json",
+    "dep:tokio",
+]
+db = [
+    "dep:sqlx",
     "dep:tokio",
 ]
 
@@ -22,6 +24,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock"], opti
 fs2 = "0.4.3"
 polymarket_client_sdk_v2 = { version = "=0.7.0", default-features = false, features = ["clob"], optional = true }
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
-serde = { version = "1", features = ["derive"], optional = true }
-serde_json = { version = "1", optional = true }
+# canary.rs (unconditionally compiled) needs these regardless of which
+# venue/storage feature is enabled, so they are not optional.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "migrate"], optional = true }
 tokio = { version = "1", default-features = false, features = ["macros", "rt"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread"] }

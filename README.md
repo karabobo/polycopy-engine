@@ -20,10 +20,17 @@ below, which is a dry run unless the operator explicitly opts in.
 Phase 0 is closed (2026-08-30); Phase 0.5 is in progress (one real canary
 order placed and observed on 2026-08-31; not every gate box is checked yet —
 see [`docs/PHASE_0_5_CANARY_REPORT.md`](docs/PHASE_0_5_CANARY_REPORT.md)). The
-first
-implemented primitive is a cross-process database ownership lock: a second
-engine instance fails instead of sharing a database and sending concurrently
-for the same account/token.
+first implemented primitive is a cross-process database ownership lock: a
+second engine instance fails instead of sharing a database and sending
+concurrently for the same account/token.
+
+Phase 1 groundwork (the durable account/leader schema from blueprint section
+6) has also started, ahead of Phase 0.5's gate formally closing, at the
+account owner's explicit direction while Phase 0.5's remaining live tests
+wait on a Polymarket-side CLOB outage to clear. So far this covers only
+connection setup and the `accounts`/`leader_config`/`leader_wallet_aliases`
+tables (see "Database (Phase 1)" below); the event ledger, intent planner,
+and executor are not built.
 
 Run the complete local checks with:
 
@@ -119,3 +126,32 @@ persisted record lands under the gitignored `canary-artifacts/<label>/`
 directory (spec, submission, and lookup records only — never a private key,
 full envelope, or raw response body). Record the redacted result using
 [`docs/PHASE_0_5_CANARY_REPORT.md`](docs/PHASE_0_5_CANARY_REPORT.md).
+
+## Database (Phase 1)
+
+The optional `db` feature (`polycopy_engine::copytrading`) opens a pooled
+SQLite connection and applies every migration under `migrations/`. Every
+connection is configured exactly as blueprint section 6 requires: foreign
+keys on, WAL journal mode, a 5 second busy timeout, and `synchronous=FULL`.
+Migrations run through sqlx's built-in migrator, which keeps its own
+checksum-protected ledger (an `_sqlx_migrations` table) and refuses to run if
+an already-applied migration's file content no longer matches what was
+recorded — the same protection the blueprint's own
+`copy_schema_migrations(version, name, checksum, applied_at)` ledger
+describes, provided here by sqlx's existing implementation rather than a
+hand-rolled equivalent.
+
+```rust
+let pool = polycopy_engine::copytrading::open_and_migrate("./copy.sqlite").await?;
+```
+
+Schema so far covers only `accounts`, `leader_config`, and
+`leader_wallet_aliases`: one copied account and its enabled leader address
+aliases. Addresses are stored lowercase and a partial unique index enforces
+that the same address can never be enabled under two leaders at once (or
+twice under one). The database file must live on local block storage, not
+NFS/SMB — this is a single-host, single-writer deployment; see
+[`EngineLock`](src/engine_lock.rs) for the process-level enforcement of
+"single writer". The event ledger, intent planner, fixed-lane executor, and
+reconciliation tables described later in blueprint section 6 do not exist
+yet.

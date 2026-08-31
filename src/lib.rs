@@ -9,6 +9,9 @@ pub mod canary;
 pub mod engine_lock;
 pub mod venue;
 
+#[cfg(feature = "db")]
+pub mod copytrading;
+
 #[cfg(feature = "intl_clob")]
 pub mod canary_run;
 
