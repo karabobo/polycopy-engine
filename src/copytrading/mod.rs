@@ -1,17 +1,21 @@
-//! Phase 1 (durable account/leader state, section 6), Phase 2 (activity
-//! ingestion, section 7), Phase 3 (transactional intent planning, section
-//! 8), and Phase 4 (fixed-lane executor, section 9) of
+//! Phase 1 (durable account/leader state, section 6) through Phase 5
+//! (prepared submission and reconciliation, section 10) of
 //! `docs/COPY_ENGINE_BLUEPRINT.md`.
 //!
-//! Schema covers every table blueprint section 6 lists. The
-//! prepared-submission/reconciliation layer (Phase 5) is not built yet --
-//! `execute::OrderSubmitter` is Phase 4's seam for it.
+//! Schema covers every table blueprint section 6 lists.
+//! `reconcile::CopyExecution` (Phase 5) and `execute::OrderSubmitter`
+//! (Phase 4) both have no implementation anywhere in this crate outside
+//! test code: neither this project nor its assistant ever submits a live
+//! order.
 
 pub mod db;
 pub mod plan;
 
 #[cfg(feature = "execute")]
 pub mod execute;
+
+#[cfg(feature = "execute")]
+pub mod reconcile;
 
 #[cfg(feature = "ingest")]
 pub mod ingest;
@@ -21,3 +25,10 @@ pub use plan::{plan_next_batch, plan_next_batch_with_limit, PlanError, PlanSumma
 
 #[cfg(feature = "execute")]
 pub use execute::{execute_intent, finalize_receipt, ExecuteError, ExecutionOutcome, OrderSubmitter, Side, SizedDecision};
+
+#[cfg(feature = "execute")]
+pub use reconcile::{
+    attempts_in_window, load_or_prepare_attempt, open_reconciliation_case, permitted_recovery_action,
+    CopyExecution, OrderId, PreparedOrderEnvelope, ReconcileError, RecoveryAction, VenueOrderState,
+    MAX_ATTEMPTS_PER_WINDOW, RETRY_WINDOW_SECONDS,
+};

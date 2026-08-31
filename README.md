@@ -24,20 +24,23 @@ first implemented primitive is a cross-process database ownership lock: a
 second engine instance fails instead of sharing a database and sending
 concurrently for the same account/token.
 
-Phase 1 (durable schema, blueprint section 6) through Phase 4 (fixed-lane
-executor, section 9) have started, ahead of Phase 0.5's gate formally
-closing, at the account owner's explicit direction while Phase 0.5's
-remaining live tests wait on a Polymarket-side CLOB outage to clear. Phase
-1's schema is complete (every table section 6 lists). Phase 2 has a
-working, live-verified connection to the leader-trade firehose plus REST
-backfill, both writing into that schema. Phase 3 turns a recorded event
-into a durably accepted or explicitly rejected `copy_intent`. Phase 4
-claims an intent, sizes and reserves it, and finalizes an idempotent
-receipt into `position_lots` — but it does **not** submit an order itself:
-that is Phase 5, which does not exist, and this project's assistant will
-never write or run that code. See "Database (Phase 1)", "Activity
-ingestion (Phase 2)", "Intent planning (Phase 3)", and "Fixed-lane executor
-(Phase 4)" below.
+Phase 1 (durable schema, blueprint section 6) through Phase 5 (prepared
+submission and reconciliation, section 10) have started, ahead of Phase
+0.5's gate formally closing, at the account owner's explicit direction
+while Phase 0.5's remaining live tests wait on a Polymarket-side CLOB
+outage to clear. Phase 1's schema is complete (every table section 6
+lists). Phase 2 has a working, live-verified connection to the
+leader-trade firehose plus REST backfill, both writing into that schema.
+Phase 3 turns a recorded event into a durably accepted or explicitly
+rejected `copy_intent`. Phase 4 claims an intent, sizes and reserves it,
+and finalizes an idempotent receipt into `position_lots`. Phase 5 adds the
+durably persisted order envelope, the submission recovery matrix, and the
+retry budget that govern how a claimed intent is actually submitted — but
+`submit_exact_envelope`, the one call that would write a live order, has
+**no implementation anywhere in this crate**, and this project's assistant
+will never write or run that code. See "Database (Phase 1)", "Activity
+ingestion (Phase 2)", "Intent planning (Phase 3)", "Fixed-lane executor
+(Phase 4)", and "Prepared submission and reconciliation (Phase 5)" below.
 
 Run the complete local checks with:
 
@@ -307,12 +310,12 @@ implies `db` and `intl_clob`) is `execute_intent`: claim a pending intent
 lanes racing the same intent rely on), size and reserve it, submit via a
 generic [`OrderSubmitter`](src/copytrading/execute.rs), then finalize the
 receipt into `position_lots`. **`OrderSubmitter` has no real implementation
-anywhere in this crate.** Phase 5 (prepared submission against the live
-venue) does not exist, and per this project's own operating rule the
+anywhere in this crate.** Per this project's own operating rule, the
 assistant that has been building it will never write or run the code that
 places a live order — that boundary is why this trait exists as a seam:
 it lets Phase 4's own logic be built and fully tested now, against a fake
-submitter, without touching anything that could trade.
+submitter, without touching anything that could trade. Phase 5 (below)
+extends this same seam to the actual submission and reconciliation layer.
 
 Sizing follows blueprint section 9's `sell_all_on_exit` algorithm exactly
 for `SELL`: `sell_qty = max(0, min(leader_virtual_lot, strict_actual_available
@@ -341,3 +344,49 @@ Phase 4 acceptance criteria directly: distinct lots for two leaders buying
 one token, no overselling while a first SELL is still uncertain, idempotent
 receipt replay, and single-in-flight claiming — plus the needs_reconcile
 paths for a failed balance query and a non-positive sell result.
+
+## Prepared submission and reconciliation (Phase 5)
+
+The `execute` feature also gates `polycopy_engine::copytrading::reconcile`
+(blueprint section 10): the layer between a sized, reserved intent and the
+venue. It defines a generic `CopyExecution` trait —
+`position_for_token_strict`, `order_for_receipt`,
+`query_prepared_envelope`, and `submit_exact_envelope` — and, exactly like
+Phase 4's `OrderSubmitter`, **`CopyExecution` has no implementation
+anywhere in this crate outside test code.** `submit_exact_envelope` is the
+one call that would write a live order; this project's assistant will
+never write or run it.
+
+What Phase 5 does implement, and test without ever calling a real venue,
+is the logic around that seam:
+
+- `load_or_prepare_attempt` persists exactly one envelope per
+  `(intent_id, attempt_number)` inside a `BEGIN IMMEDIATE` critical
+  section, so two concurrent callers racing to prepare the same attempt
+  both observe the single envelope that actually won, never two different
+  signed payloads for the same attempt.
+- `permitted_recovery_action` is the blueprint's submission recovery
+  matrix as pure code: `prepared` may submit; `submitting`/`uncertain`
+  (a crash after the request may have crossed the network boundary) must
+  query the venue first and can never be resubmitted directly; `accepted`/
+  `finalized` route to reconciliation or finalization; `rejected` may
+  prepare a new attempt only if the rejection was definitive *and* the
+  retry budget below still allows it; every other status, including an
+  indefinite rejection or one the matrix doesn't recognize, is `Blocked`.
+- `attempts_in_window` and the `MAX_ATTEMPTS_PER_WINDOW` /
+  `RETRY_WINDOW_SECONDS` constants (5 attempts per 600 seconds) cap how
+  many attempts one intent may accumulate, closing off unbounded retry
+  loops.
+- `open_reconciliation_case` moves an intent to `needs_reconcile` and
+  records a `reconciliation_cases` row in one transaction, so a strict
+  venue-query failure or an unresolved submission always produces a
+  visible, blocking case rather than silently stalling.
+
+Eleven tests cover this module directly: concurrent envelope preparation
+collapsing to one persisted row, every documented recovery-matrix state
+(including that a crash mid-submission never permits direct
+resubmission, and that an exhausted retry budget blocks even a definitive
+rejection), the retry-window count, case creation on a strict query
+failure, and — reusing Phase 4's own `finalize_receipt` — that a FAK
+partial fill applies only the matched quantity to `position_lots`, never
+the requested one.
