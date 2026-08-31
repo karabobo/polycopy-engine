@@ -9,7 +9,6 @@ publish = false
 default = []
 intl_clob = [
     "dep:async-trait",
-    "dep:chrono",
     "dep:polymarket_client_sdk_v2",
     "dep:tokio",
 ]
@@ -17,19 +16,41 @@ db = [
     "dep:sqlx",
     "dep:tokio",
 ]
+ingest = [
+    "db",
+    "dep:arc-swap",
+    "dep:tokio-tungstenite",
+    "dep:futures-util",
+    "dep:rustls",
+    "tokio/rt-multi-thread",
+    "tokio/time",
+    "tokio/net",
+]
 
 [dependencies]
+arc-swap = { version = "1", optional = true }
 async-trait = { version = "0.1", optional = true }
-chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
+# Needed by both intl_clob (canary_probe's timestamps) and ingest
+# (normalize.rs's occurred_at formatting), so not optional -- see the same
+# reasoning already applied to serde below.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 fs2 = "0.4.3"
+futures-util = { version = "0.3", default-features = false, optional = true }
 polymarket_client_sdk_v2 = { version = "=0.7.0", default-features = false, features = ["clob"], optional = true }
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
+# Only needed to call CryptoProvider::install_default() once at startup:
+# rustls 0.23+ no longer picks a default crypto backend on its own, and
+# without this every TLS connect (including tokio-tungstenite's) blocks/panics.
+# Version and backend (aws-lc-rs) pinned to match what tokio-tungstenite
+# already resolves transitively, so this doesn't pull in a second backend.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "logging", "std", "tls12"], optional = true }
 # canary.rs (unconditionally compiled) needs these regardless of which
 # venue/storage feature is enabled, so they are not optional.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "migrate"], optional = true }
 tokio = { version = "1", default-features = false, features = ["macros", "rt"], optional = true }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread"] }

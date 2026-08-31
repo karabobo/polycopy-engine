@@ -24,13 +24,14 @@ first implemented primitive is a cross-process database ownership lock: a
 second engine instance fails instead of sharing a database and sending
 concurrently for the same account/token.
 
-Phase 1 groundwork (the durable account/leader schema from blueprint section
-6) has also started, ahead of Phase 0.5's gate formally closing, at the
-account owner's explicit direction while Phase 0.5's remaining live tests
-wait on a Polymarket-side CLOB outage to clear. So far this covers only
-connection setup and the `accounts`/`leader_config`/`leader_wallet_aliases`
-tables (see "Database (Phase 1)" below); the event ledger, intent planner,
-and executor are not built.
+Phase 1 (durable schema, blueprint section 6) and the first slice of Phase 2
+(activity ingestion, section 7) have also started, ahead of Phase 0.5's gate
+formally closing, at the account owner's explicit direction while Phase
+0.5's remaining live tests wait on a Polymarket-side CLOB outage to clear.
+Phase 1's schema is complete (every table section 6 lists). Phase 2 has a
+working, live-verified connection to the leader-trade firehose that writes
+into that schema; the intent planner and executor (Phases 3–5) are not
+built. See "Database (Phase 1)" and "Activity ingestion (Phase 2)" below.
 
 Run the complete local checks with:
 
@@ -182,7 +183,60 @@ Schema so far covers:
 The database file must live on local block storage, not NFS/SMB — this is a
 single-host, single-writer deployment; see [`EngineLock`](src/engine_lock.rs)
 for the process-level enforcement of "single writer". This covers every
-table blueprint section 6 lists, but only the schema: the ingestion pipeline,
-intent planner, fixed-lane executor, and the startup check that refuses a
-lane-count change while non-terminal intents exist (Phases 2–5) are not
-built yet.
+table blueprint section 6 lists, but only the schema: the intent planner,
+fixed-lane executor, and the startup check that refuses a lane-count change
+while non-terminal intents exist (Phases 3–5) are not built yet.
+
+## Activity ingestion (Phase 2)
+
+The optional `ingest` feature (`polycopy_engine::copytrading::ingest`, implies
+`db`) is the first slice of blueprint section 7: a live connection to
+Polymarket's real-time activity firehose, filtered to watched leader
+addresses and written into `leader_events`/`leader_event_observations`.
+
+**This is not documented by Polymarket and not in the official Rust SDK.**
+`docs.polymarket.com`'s WebSocket page and `polymarket_client_sdk_v2` both
+only expose a `Market` channel (subscribed by token ID, not by wallet) and an
+authenticated `User` channel (your own account only) — neither can watch an
+arbitrary leader's trades. The mechanism this project actually uses was
+confirmed by reading a working reference implementation
+(`PolymarketWebSocketClient`/`PolymarketActivityWsService` in this project's
+predecessor, PolyHermes) and verified live against production data (934 real
+trades correctly parsed from one 15-second connection): `wss://ws-live-data.polymarket.com`
+(Polymarket's RTDS), subscribed with
+`{"action":"subscribe","subscriptions":[{"topic":"activity","type":"trades"},{"topic":"activity","type":"orders_matched"}]}`.
+This is a global, unfiltered firehose of every trade on the platform — there
+is no server-side per-wallet filter, so [`address_resolver`](src/copytrading/ingest/address_resolver.rs)
+filters client-side. Both `trades` and `orders_matched` are subscribed
+because the same trade can arrive under either or both; there is no
+dedicated trade-ID field in the payload, so `transaction_hash` is used as the
+de-facto trade identity (an assumption inherited from the reference
+implementation — see `normalize.rs`'s module doc for the residual risk if a
+single transaction ever contains more than one of a leader's trades).
+
+- [`normalize.rs`](src/copytrading/ingest/normalize.rs) — pure, fully
+  unit-tested parsing of one raw WebSocket frame into a trade or a reason it
+  isn't one. No networking, no database.
+- [`address_resolver.rs`](src/copytrading/ingest/address_resolver.rs) — the
+  blueprint's `ArcSwap<HashMap<normalized_address, leader_id>>`: a reload
+  builds the full replacement map before publishing it, so a concurrent
+  reader never observes a temporary empty map.
+- [`activity_ws.rs`](src/copytrading/ingest/activity_ws.rs) — connects,
+  subscribes, sends an application-level `"ping"` every 10s (the venue's
+  convention, not a WebSocket protocol ping), reconnects with exponential
+  backoff (3s → 6s → ... → 60s) on any error or on 30 seconds without an
+  activity-topic message, and rejects any event before a leader's
+  `leader_config.activation_at` (a leader with no `activation_at` yet
+  rejects every event, never treated as "no lower bound"). `process_message`
+  — parse, resolve, check activation, then durably record — is the one
+  function the connection loop delegates every decision to, so it's testable
+  against a real (temp-file) database without a live WebSocket; the
+  connection loop itself isn't unit-tested, matching this project's existing
+  precedent for network-touching code.
+
+One easy-to-miss setup requirement: `rustls` 0.23+ does not select a default
+crypto backend on its own, and without installing one every TLS connect
+(including this WebSocket client's) hangs or panics depending on where the
+missing-provider error surfaces. `activity_ws.rs` calls
+`rustls::crypto::aws_lc_rs::default_provider().install_default()` before its
+first connection attempt (idempotent on every reconnect).
