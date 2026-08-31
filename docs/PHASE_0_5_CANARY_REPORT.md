@@ -91,21 +91,34 @@ attempt. The actual venue-side behavior when the same signed bytes are
 submitted twice (idempotent response, deterministic rejection, or two
 independent fills) has not yet been observed.
 
-A second live attempt (label `fed-25bps-dup-test-2026-08-31`, same
-account/market/size/price, `POLYCOPY_CANARY_CONFIRM_DUPLICATE=yes` also set)
-was made specifically to test this, but the *first* submission of that
-attempt was rejected before an order was created at all:
+Three further live attempts were made specifically to test this (labels
+`fed-25bps-dup-test-2026-08-31`, `fed-25bps-dup-test-2-2026-08-31`, and
+`mancity-win-diagnostic-2026-08-31` — the last on a completely unrelated
+market: an EPL soccer moneyline, different neg-risk group, ~250x lower 24h
+volume than the Fed market). All three had their *first* submission rejected
+before any order was created:
 `503 Service Unavailable, {"error":"trading is disabled"}`. No `order_id`
-was returned, so this is a clean, unambiguous rejection — not an `uncertain`
-case per invariant #6 — and the tool correctly did not proceed to the
-duplicate-submission step. The account itself was independently confirmed
-not to be in `closed_only` mode (`BanStatusResponse { closed_only: false }`)
-and the venue's public market metadata still showed `acceptingOrders: true`
-for this market at the same time, so the 503 is most consistent with a
-transient, market- or venue-level condition (possibly related to elevated
-volatility in this market around that time) rather than an account
-restriction or a permanently closed market. This question remains open and
-requires a further live attempt, which is the account owner's decision.
+was ever returned in any of them, so each is a clean, unambiguous rejection —
+not an `uncertain` case per invariant #6 — and the tool correctly did not
+proceed to the duplicate-submission step in any of the three.
+
+Root cause, confirmed via Polymarket's own public status page
+(status.polymarket.com): a **platform-wide CLOB trading outage**, unrelated
+to this account or either market. Incident timeline (times as posted, UTC):
+14:23 investigating, 14:30 trading paused platform-wide pending fix (with a
+cancel-only period before any resumption), 16:29 ETA revised to ~10:00 next
+resumption target, 17:40 ETA revised again to 11:00 for full resumption with
+"at least 15 minutes" of cancel-only immediately before that. All three
+canary attempts fall inside this window. This supersedes an earlier, incorrect
+working theory in this report (that the rejection might reflect a
+post-first-trade account review or a market-specific hold) — the account
+was independently confirmed not to be in `closed_only` mode
+(`BanStatusResponse { closed_only: false }`) and a second, unrelated market
+also failed identically, which is only consistent with a venue-wide cause.
+This question remains open and requires a further live attempt made after
+Polymarket confirms the incident is resolved (not merely during its
+cancel-only window) — a decision for the account owner, not something to
+retry automatically or on a timer.
 
 ## Result 3: receipt fields
 
