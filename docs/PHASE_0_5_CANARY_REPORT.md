@@ -144,6 +144,23 @@ retry automatically or on a timer.
 
 ## Gate decision
 
+### Local recovery implementation (not live proof)
+
+The engine now persists a precomputed expected `taker_order_id`, the exact
+signed-order JSON, and the durable instant an attempt enters `submitting`. For
+a response lost after the HTTP boundary, it performs a paginated authenticated
+`GET /data/trades` read for the bounded token/time window. It accepts only an
+exact `taker_order_id` match from a successful taker-side trade, records that
+ID, and still requires the normal strict by-ID receipt query before lot
+accounting. An empty or delayed history, error, unknown status, malformed
+fingerprint, or contradictory duplicate data opens `needs_reconcile`; no path
+resubmits an uncertain order.
+
+This is intentionally **not** a completed canary result: the live endpoint has
+not yet been observed returning a `taker_order_id` for this project's FAK that
+equals the precomputed identifier. It is a safer recovery implementation, not
+evidence that the venue's identifier mapping or indexing delay is proven.
+
 - [ ] Lookup is deterministic from persisted envelope data. **Not proven —
       and now partially disproven.** By-ID lookup works, but only after an
       unmeasured indexing delay (confirmed clear by ~6 hours; confirmed

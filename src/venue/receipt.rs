@@ -4,10 +4,13 @@ use rust_decimal::Decimal;
 
 /// A venue receipt whose quantity fields intentionally remain distinct.
 ///
-/// `requested_qty` is the original logical order size. `accepted_qty` is the
-/// size acknowledged by the venue. `filled_qty` is the actual matched size and
-/// is the only quantity that a later lot-accounting layer may apply. For a FAK
-/// result, `remaining_qty` is always zero because unmatched quantity expires.
+/// `requested_qty` and `accepted_qty` use the order's request unit. For a SELL
+/// that unit is outcome shares; for a BUY it is the CLOB's notional/budget
+/// unit. `filled_qty` and `remaining_qty` use outcome shares. They therefore
+/// cannot be compared generically: a better-priced BUY can fill more shares
+/// than its requested budget value. `filled_qty` is the only quantity that a
+/// later lot-accounting layer may apply. For a FAK result, `remaining_qty` is
+/// always zero because unmatched quantity expires.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OrderReceipt {
     requested_qty: Decimal,
@@ -17,7 +20,13 @@ pub struct OrderReceipt {
 }
 
 impl OrderReceipt {
-    /// Builds a final-or-open venue receipt after checking basic quantity bounds.
+    /// Builds a final-or-open venue receipt after checking that all quantities
+    /// are non-negative.
+    ///
+    /// This constructor deliberately does not compare requested and filled
+    /// quantities. Use [`Self::from_fak_buy_budget`] or
+    /// [`Self::from_fak_sell_shares`] for a FAK, where the order side provides
+    /// the unit needed for a meaningful bound.
     pub fn new(
         requested_qty: Decimal,
         accepted_qty: Decimal,
@@ -28,10 +37,6 @@ impl OrderReceipt {
         validate_nonnegative("accepted_qty", accepted_qty)?;
         validate_nonnegative("filled_qty", filled_qty)?;
         validate_nonnegative("remaining_qty", remaining_qty)?;
-        validate_not_greater_than_requested("accepted_qty", accepted_qty, requested_qty)?;
-        validate_not_greater_than_requested("filled_qty", filled_qty, requested_qty)?;
-        validate_not_greater_than_requested("remaining_qty", remaining_qty, requested_qty)?;
-
         Ok(Self {
             requested_qty,
             accepted_qty,
@@ -40,17 +45,55 @@ impl OrderReceipt {
         })
     }
 
-    /// Creates a final FAK receipt from the venue's actual matched shares.
+    /// Creates a final BUY FAK receipt from the CLOB's actual matched shares.
     ///
-    /// This deliberately accepts `matched_shares` separately from
-    /// `requested_qty`: returning the requested size here would create a
-    /// phantom fill for a zero-fill or partial-fill FAK order.
-    pub fn from_fak_match(
-        requested_qty: Decimal,
-        accepted_qty: Decimal,
+    /// `requested_budget` and `accepted_budget` must not be exceeded by one
+    /// another, but `matched_shares` intentionally has no such bound: a BUY
+    /// filled below its limit can receive more outcome shares than the budget
+    /// value in the request. Returning the budget as filled shares would
+    /// create a phantom lot for a zero or partial FAK fill.
+    pub fn from_fak_buy_budget(
+        requested_budget: Decimal,
+        accepted_budget: Decimal,
         matched_shares: Decimal,
     ) -> Result<Self, ReceiptError> {
-        Self::new(requested_qty, accepted_qty, matched_shares, Decimal::ZERO)
+        validate_not_greater_than_requested(
+            "accepted_qty",
+            accepted_budget,
+            requested_budget,
+        )?;
+        Self::new(
+            requested_budget,
+            accepted_budget,
+            matched_shares,
+            Decimal::ZERO,
+        )
+    }
+
+    /// Creates a final SELL FAK receipt, for which every quantity is outcome
+    /// shares and therefore an actual fill must not exceed the requested sell
+    /// quantity.
+    pub fn from_fak_sell_shares(
+        requested_shares: Decimal,
+        accepted_shares: Decimal,
+        matched_shares: Decimal,
+    ) -> Result<Self, ReceiptError> {
+        validate_not_greater_than_requested(
+            "accepted_qty",
+            accepted_shares,
+            requested_shares,
+        )?;
+        validate_not_greater_than_requested(
+            "filled_qty",
+            matched_shares,
+            requested_shares,
+        )?;
+        Self::new(
+            requested_shares,
+            accepted_shares,
+            matched_shares,
+            Decimal::ZERO,
+        )
     }
 
     pub fn requested_qty(&self) -> Decimal {

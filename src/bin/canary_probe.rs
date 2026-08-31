@@ -37,8 +37,9 @@ async fn main() {
         write_new_record, CanaryLookupRecord, CanarySubmissionRecord,
     };
     use polycopy_engine::canary_run::{
-        build_signable_order, lookup_by_id, sign_twice, submit, CanaryRunConfig,
+        build_signable_order, expected_order_id, lookup_by_id, sign_twice, submit, CanaryRunConfig,
     };
+    use polycopy_engine::venue::order_hash::format_order_id;
     use polymarket_client_sdk_v2::{clob::types::request::OrdersRequest, types::U256};
     use std::str::FromStr as _;
 
@@ -81,6 +82,23 @@ async fn main() {
             "two independent signatures over the same built order are byte-identical: {signatures_match}"
         );
 
+        // Read-only (one `neg_risk` GET): safe to compute on every run,
+        // dry or live. A failure here is not fatal to the probe -- it just
+        // means this run cannot contribute evidence to the still-open
+        // `docs/PHASE_0_5_CANARY_REPORT.md` question of whether this value
+        // equals the venue's real order_id.
+        let expected_id = match expected_order_id(&client, &first.payload).await {
+            Ok(hash) => {
+                let formatted = format_order_id(hash);
+                println!("expected_order_id (this project's offline prediction): {formatted}");
+                Some(formatted)
+            }
+            Err(error) => {
+                println!("expected_order_id: FAILED to compute: {error}");
+                None
+            }
+        };
+
         if !config.confirm_submit() {
             println!();
             println!("DRY RUN: no order was submitted to Polymarket.");
@@ -111,6 +129,7 @@ async fn main() {
             taking_amount: response.taking_amount.to_string(),
             transaction_hash_count: response.transaction_hashes.len(),
             trade_id_count: response.trade_ids.len(),
+            expected_order_id: expected_id.clone(),
         };
         let submission_json = serde_json::to_string_pretty(&submission_record)
             .map_err(|error| format!("unable to serialize the submission record: {error}"))?;
@@ -119,6 +138,20 @@ async fn main() {
             "SUBMITTED order_id={} status={:?} success={}",
             response.order_id, response.status, response.success
         );
+        match &expected_id {
+            Some(expected) if expected == &response.order_id => println!(
+                "expected_order_id MATCHES the venue's real order_id -- live proof for \
+                 docs/PHASE_0_5_CANARY_REPORT.md."
+            ),
+            Some(expected) => println!(
+                "expected_order_id ({expected}) DOES NOT MATCH the venue's real order_id \
+                 ({}) -- this project's order-ID hypothesis is disproven for this run.",
+                response.order_id
+            ),
+            None => println!(
+                "expected_order_id was not computed this run; no comparison available."
+            ),
+        }
 
         // A lookup failure is itself a Phase 0.5 finding (e.g. the venue may
         // not surface a fully matched order via this endpoint), not a reason
@@ -221,6 +254,10 @@ async fn main() {
             taking_amount: duplicate_response.taking_amount.to_string(),
             transaction_hash_count: duplicate_response.transaction_hashes.len(),
             trade_id_count: duplicate_response.trade_ids.len(),
+            // `second` shares `first`'s exact payload (only the signature
+            // differs between two independent `sign()` calls), so the same
+            // offline prediction applies to both submissions.
+            expected_order_id: expected_id.clone(),
         };
         let duplicate_json = serde_json::to_string_pretty(&duplicate_record)
             .map_err(|error| format!("unable to serialize the duplicate submission record: {error}"))?;

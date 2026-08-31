@@ -32,6 +32,8 @@ pub use ghost::{
 
 #[cfg(feature = "intl_clob")]
 pub use venue::intl_clob::{
-    IntlClobReadAdapter, OutcomeTokenId, OutcomeTokenIdError, StrictAccountBalanceReader,
-    StrictCollateralError, StrictPositionError, StrictTokenBalanceReader,
+    AccountTrade, AccountTradeRole, AccountTradeSide, AccountTradeStatus, IntlClobReadAdapter,
+    OutcomeTokenId, OutcomeTokenIdError, StrictAccountBalanceReader, StrictCollateralError,
+    StrictPositionError, StrictTokenBalanceReader, StrictTradeHistoryError,
+    StrictTradeHistoryReader,
 };

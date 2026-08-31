@@ -10,10 +10,10 @@ does not vendor DRADIS source code or preserve DRADIS commit history.
 The exact audit reference and this independent-implementation decision are
 recorded in [`docs/DRADIS_REFERENCE_BASELINE.md`](docs/DRADIS_REFERENCE_BASELINE.md).
 
-No automated trading code is included yet. The implementation starts only after
-the Phase 0 and Phase 0.5 gates in the blueprint are completed. The only
-order-writing code that exists is the narrowly scoped Phase 0.5 canary probe
-below, which is a dry run unless the operator explicitly opts in.
+No automated copy-trading client is enabled. The only order-writing code is
+the narrowly scoped Phase 0.5 canary probe below, which is a dry run unless
+the operator explicitly opts in. The broader copy-execution path remains
+blocked until the Phase 0.5 and Phase 7 gates in the blueprint are completed.
 
 ## Current development status
 
@@ -57,8 +57,9 @@ produce the evidence required by the Phase 0.5 gate. See
 status and [`docs/PHASE_0_5_CANARY_REPORT.md`](docs/PHASE_0_5_CANARY_REPORT.md)
 for the required real-order safety evidence template.
 
-The optional `intl_clob` feature enables a **read-only**, strict per-outcome
-token balance adapter. It has no order-writing API; see
+The optional `intl_clob` feature enables **read-only**, strict per-outcome
+token balances and authenticated account-trade-history reads. It has no
+order-writing API; see
 [`docs/INTL_CLOB_SDK_BOUNDARY.md`](docs/INTL_CLOB_SDK_BOUNDARY.md).
 
 ## Authenticated GHOST verification
@@ -184,17 +185,20 @@ Schema so far covers:
   read from the venue's actual matched-quantity field, and that same finding
   (order-by-id lookup 404s immediately after a match, with no working
   field-based fallback yet) is why `order_attempts.status` has an `uncertain`
-  state that can only be queried and parked, never auto-resubmitted.
+  state that can only be queried and parked, never auto-resubmitted. The
+  current recovery code can additionally query authenticated trade history,
+  but accepts only an exact precomputed `taker_order_id` match from the stored
+  signed envelope; this still needs the Phase 0.5 live canary to prove that
+  the precomputed ID and the venue's field are identical for a real FAK.
   All decimal quantities are stored as exact text, never `REAL`, to avoid
   reintroducing the rounding-error class [`OrderReceipt`](src/venue/receipt.rs)
   exists to prevent.
 
 The database file must live on local block storage, not NFS/SMB — this is a
 single-host, single-writer deployment; see [`EngineLock`](src/engine_lock.rs)
-for the process-level enforcement of "single writer". This covers every
-table blueprint section 6 lists, but only the schema: the intent planner,
-fixed-lane executor, and the startup check that refuses a lane-count change
-while non-terminal intents exist (Phases 3–5) are not built yet.
+for the process-level enforcement of "single writer". This covers every table
+blueprint section 6 lists. The Phase 3–5 logic described below has since been
+implemented, but its real order-writing seam remains intentionally unimplemented.
 
 ## Activity ingestion (Phase 2)
 
@@ -381,12 +385,16 @@ is the logic around that seam:
   records a `reconciliation_cases` row in one transaction, so a strict
   venue-query failure or an unresolved submission always produces a
   visible, blocking case rather than silently stalling.
+- Before a future order writer can cross the HTTP boundary, it must call
+  `mark_attempt_submitting`, which durably stores the submission timestamp.
+  `recover_lost_submission_response` then issues only authenticated
+  trade-history reads, accepts an exact persisted `taker_order_id` match, and
+  stores that ID while leaving the attempt `uncertain` for the normal strict
+  by-ID receipt lookup. Empty/delayed history, malformed fingerprints,
+  conflicting observations, and query errors open an idempotent visible case
+  and freeze the account/token; none permits a resubmit.
 
-Eleven tests cover this module directly: concurrent envelope preparation
-collapsing to one persisted row, every documented recovery-matrix state
-(including that a crash mid-submission never permits direct
-resubmission, and that an exhausted retry budget blocks even a definitive
-rejection), the retry-window count, case creation on a strict query
-failure, and — reusing Phase 4's own `finalize_receipt` — that a FAK
-partial fill applies only the matched quantity to `position_lots`, never
-the requested one.
+The reconciliation tests cover concurrent envelope preparation, every
+documented recovery-matrix state and its anti-resubmit property, finite retry
+accounting, strict-query case opening, exact ID recovery, delayed/empty
+history, and exact partial-fill lot accounting.

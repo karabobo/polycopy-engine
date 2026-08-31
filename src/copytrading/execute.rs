@@ -692,7 +692,19 @@ mod tests {
 
     impl OrderSubmitter for FullFillSubmitter {
         async fn submit(&self, decision: &SizedDecision) -> Result<OrderReceipt, String> {
-            OrderReceipt::from_fak_match(decision.qty, decision.qty, decision.qty).map_err(|error| error.to_string())
+            match decision.side {
+                Side::Buy => OrderReceipt::from_fak_buy_budget(
+                    decision.qty,
+                    decision.qty,
+                    decision.qty,
+                ),
+                Side::Sell => OrderReceipt::from_fak_sell_shares(
+                    decision.qty,
+                    decision.qty,
+                    decision.qty,
+                ),
+            }
+            .map_err(|error| error.to_string())
         }
     }
 
@@ -897,7 +909,7 @@ mod tests {
         let SizingOutcome::Decision(decision) = size_and_reserve(&db, &balance_reader, &claimed).await.unwrap() else {
             panic!("must size successfully");
         };
-        let receipt = OrderReceipt::from_fak_match(decision.qty, decision.qty, decision.qty).unwrap();
+        let receipt = OrderReceipt::from_fak_buy_budget(decision.qty, decision.qty, decision.qty).unwrap();
         let attempt_id = record_attempt(&db, &decision, 1, &receipt).await.unwrap();
 
         // First pass: applies the fill.

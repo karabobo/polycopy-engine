@@ -8,4 +8,7 @@ mod receipt;
 #[cfg(feature = "intl_clob")]
 pub mod intl_clob;
 
+#[cfg(feature = "intl_clob")]
+pub mod order_hash;
+
 pub use receipt::{OrderReceipt, ReceiptError};

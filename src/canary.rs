@@ -171,6 +171,13 @@ pub struct CanarySubmissionRecord {
     pub taking_amount: String,
     pub transaction_hash_count: usize,
     pub trade_id_count: usize,
+    /// This project's own offline prediction of `order_id`, computed from
+    /// the signed order before submission (see `crate::venue::order_hash`).
+    /// `None` only if that computation itself failed (e.g. a neg-risk query
+    /// error) -- never a stand-in for "not equal". Comparing this against
+    /// `order_id` is exactly the live proof
+    /// `docs/PHASE_0_5_CANARY_REPORT.md` still needs.
+    pub expected_order_id: Option<String>,
 }
 
 /// A redacted-safe summary of one order lookup, persisted for the Phase 0.5

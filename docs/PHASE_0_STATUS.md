@@ -46,5 +46,7 @@ lock test, or a healthy connection is not permission to place an order.
 
 ## Hard stop
 
-No order-submission client exists in this project. The Phase 0.5 canary report
-must be complete before any automatic retry or live-order path is introduced.
+No automated copy-execution client exists in this project. The sole
+order-writing surface is the explicitly operator-confirmed Phase 0.5
+`canary_probe`; its report must be complete before any automatic retry or
+live-order path is introduced.

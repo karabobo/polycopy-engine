@@ -8,7 +8,9 @@ publish = false
 [features]
 default = []
 intl_clob = [
+    "dep:alloy",
     "dep:async-trait",
+    "dep:futures-util",
     "dep:polymarket_client_sdk_v2",
     "polymarket_client_sdk_v2/clob",
     "dep:tokio",
@@ -35,6 +37,14 @@ execute = [
 ]
 
 [dependencies]
+# Version pinned to the same requirement polymarket_client_sdk_v2 itself
+# uses, so Cargo unifies on the one already-resolved copy instead of a
+# second, possibly-incompatible one. Only `dyn-abi` and `sol-types` are
+# needed: `Eip712Domain` and `SolStruct::eip712_signing_hash` are what
+# `order_hash.rs` uses to compute an order ID offline, mirroring the exact
+# digest the SDK's own (private) `sign()` method already computes for
+# signing but never returns to the caller.
+alloy = { version = "1.6.3", default-features = false, features = ["dyn-abi", "sol-types"], optional = true }
 arc-swap = { version = "1", optional = true }
 async-trait = { version = "0.1", optional = true }
 # Needed by both intl_clob (canary_probe's timestamps) and ingest

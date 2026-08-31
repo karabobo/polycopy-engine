@@ -21,16 +21,18 @@ use polymarket_client_sdk_v2::{
     clob::{
         types::{
             response::{OpenOrderResponse, PostOrderResponse},
-            OrderType, SignableOrder, SignatureType, SignedOrder, Side,
+            OrderPayload, OrderType, SignableOrder, SignatureType, SignedOrder, Side,
         },
         Client, Config,
     },
+    contract_config,
     error::Error as SdkError,
-    types::{Address, Decimal, U256},
+    types::{Address, Decimal, B256, U256},
     POLYGON,
 };
 
 use crate::canary::{CanaryOrderSpec, CanarySide};
+use crate::venue::order_hash::{self, ExchangeAddresses, OrderHashError};
 
 type AuthenticatedClient = Client<Authenticated<Normal>>;
 
@@ -239,6 +241,38 @@ pub async fn lookup_by_id(
     client.order(order_id).await.map_err(CanaryRunError::Lookup)
 }
 
+/// Computes the order ID this project's own offline hash (see
+/// `crate::venue::order_hash`) predicts for `payload`, by resolving the
+/// token's neg-risk status and its matching exchange contract address. This
+/// is a read-only call (one authenticated `neg_risk` GET) -- it never
+/// writes anything to the venue, so it is safe to run on every dry run, not
+/// only a confirmed live submission. Whether the result actually equals the
+/// venue's real `order_id`/`taker_order_id` is exactly the open question
+/// `docs/PHASE_0_5_CANARY_REPORT.md` still needs a live comparison to close.
+pub async fn expected_order_id(
+    client: &AuthenticatedClient,
+    payload: &OrderPayload,
+) -> Result<B256, CanaryRunError> {
+    let token_id = match payload {
+        OrderPayload::V1(p) => p.order.tokenId,
+        OrderPayload::V2(p) => p.order.tokenId,
+        _ => return Err(CanaryRunError::OrderHash(OrderHashError::UnsupportedPayloadVersion)),
+    };
+    let neg_risk = client
+        .neg_risk(token_id)
+        .await
+        .map_err(CanaryRunError::NegRiskQuery)?
+        .neg_risk;
+    let config =
+        contract_config(POLYGON, neg_risk).ok_or(CanaryRunError::MissingContractConfig)?;
+    let exchanges = ExchangeAddresses {
+        v1: config.exchange,
+        v2: config.exchange_v2,
+    };
+
+    order_hash::expected_order_id(payload, &exchanges, POLYGON).map_err(CanaryRunError::OrderHash)
+}
+
 enum CredentialSource {
     Existing {
         api_key: String,
@@ -411,6 +445,9 @@ pub enum CanaryRunError {
     Signing(SdkError),
     Submission(SdkError),
     Lookup(SdkError),
+    NegRiskQuery(SdkError),
+    MissingContractConfig,
+    OrderHash(OrderHashError),
 }
 
 impl fmt::Display for CanaryRunError {
@@ -436,6 +473,15 @@ impl fmt::Display for CanaryRunError {
                 write!(formatter, "unable to submit the canary order: {source}")
             }
             Self::Lookup(source) => write!(formatter, "unable to look up the canary order: {source}"),
+            Self::NegRiskQuery(source) => write!(
+                formatter,
+                "unable to resolve the canary token's neg-risk status: {source}"
+            ),
+            Self::MissingContractConfig => write!(
+                formatter,
+                "no exchange contract configuration for this chain/neg-risk combination"
+            ),
+            Self::OrderHash(source) => write!(formatter, "unable to compute the expected order ID: {source}"),
         }
     }
 }
@@ -443,14 +489,19 @@ impl fmt::Display for CanaryRunError {
 impl Error for CanaryRunError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::InvalidPrivateKey | Self::InvalidApiKey | Self::InvalidCanaryTokenId => None,
+            Self::InvalidPrivateKey
+            | Self::InvalidApiKey
+            | Self::InvalidCanaryTokenId
+            | Self::MissingContractConfig => None,
             Self::ClientInitialization(source)
             | Self::CredentialDerivation(source)
             | Self::Authentication(source)
             | Self::Building(source)
             | Self::Signing(source)
             | Self::Submission(source)
-            | Self::Lookup(source) => Some(source),
+            | Self::Lookup(source)
+            | Self::NegRiskQuery(source) => Some(source),
+            Self::OrderHash(source) => Some(source),
         }
     }
 }

@@ -28,7 +28,11 @@ pub use execute::{execute_intent, finalize_receipt, ExecuteError, ExecutionOutco
 
 #[cfg(feature = "execute")]
 pub use reconcile::{
-    attempts_in_window, load_or_prepare_attempt, open_reconciliation_case, permitted_recovery_action,
-    CopyExecution, OrderId, PreparedOrderEnvelope, ReconcileError, RecoveryAction, VenueOrderState,
+    attempts_in_window, load_or_prepare_attempt, mark_attempt_submitting,
+    mark_attempt_uncertain_after_submission_error, open_reconciliation_case,
+    permitted_recovery_action, recover_fak_taker_order_from_trades,
+    recover_lost_submission_response, CopyExecution, LostSubmissionRecoveryOutcome, OrderId,
+    PreparedOrderEnvelope, ReconcileError, RecoveryAction, TradeHistoryLookup,
+    TradeHistoryRecoveryError, TradeHistoryWindow, VenueOrderState,
     MAX_ATTEMPTS_PER_WINDOW, RETRY_WINDOW_SECONDS,
 };

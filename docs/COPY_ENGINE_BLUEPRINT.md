@@ -99,7 +99,10 @@ It must never be treated as a proven non-submission.
 ### 3.2 Receipt and reservation rules
 
 `OrderReceipt` has `requested_qty`, `accepted_qty`, `filled_qty`,
-`remaining_qty`, and `venue_status`. Only a positive, newly accounted
+`remaining_qty`, and `venue_status`. For a SELL, all quantities are outcome
+shares. For a BUY, requested/accepted quantities are the CLOB budget unit while
+filled/remaining quantities are outcome shares, so a better-priced fill can
+exceed the numeric requested budget value. Only a positive, newly accounted
 `filled_qty` delta changes `position_lots`.
 
 `copy_intents.reserved_qty` is a durable reservation, not a display field:
@@ -220,6 +223,9 @@ event.
 
 - intent and attempt number
 - exact serialized `envelope_json`
+- precomputed expected venue order ID plus the full signed-order wire payload
+  inside that envelope; the values are generated before the HTTP boundary and
+  are never rebuilt
 - attempt state, `receipt_json`, venue order ID/status
 - requested, accepted, filled, remaining, and `accounted_filled_qty`
 - timestamps and failure detail
@@ -379,13 +385,25 @@ pub trait CopyExecution {
 `load_or_prepare_attempt` serializes envelope creation with a short
 `BEGIN IMMEDIATE` critical section. It reads an existing serialized envelope or
 inserts exactly one new one. It must roll back reliably on every error and must
-not hold the write lock across order HTTP calls.
+not hold the write lock across order HTTP calls. Immediately before the sole
+future submit request, `mark_attempt_submitting` must durably store the
+attempt's `submission_started_at`; an order write may never precede that state
+transition.
+
+For a response lost before its venue ID is durable, recovery may read the
+authenticated trade-history endpoint for the token and bounded submission
+window. It may attach an ID only when a successful taker-side trade's
+`taker_order_id` exactly equals the precomputed ID in the immutable envelope.
+It must then stay `uncertain` until a strict by-ID receipt lookup confirms the
+fill. A missing/late record, query failure, malformed fingerprint, unknown
+trade state, or contradiction opens `needs_reconcile`; it never authorizes a
+repeat submission.
 
 ### Submission recovery matrix
 
 | Persisted attempt state | Permitted recovery action |
 | --- | --- |
-| `prepared` | Mark `submitting`, then submit once. |
+| `prepared` | Persist `submitting` plus `submission_started_at`, then submit once. |
 | `submitting` after restart | Treat as `uncertain`; query first. |
 | `uncertain` | Query first. Resubmit only when the Phase 0.5 canary has proven this safe. |
 | `accepted` / `finalized` | Reconcile or finalize the receipt delta; never submit again. |
@@ -406,6 +424,9 @@ it never becomes an empty balance.
 - FAK zero-fill and partial-fill produce the correct receipt and no phantom lot.
 - A crash after the request may have crossed the network boundary never causes a
   direct resubmission on restart.
+- A lost response can recover only the exact precomputed ID through read-only
+  trade history; an empty, delayed, or failed lookup creates one visible case
+  and leaves the attempt non-resubmittable.
 - Receipt finalization is idempotent under duplicate API reads and crash recovery.
 - A token query error blocks the key and produces a visible case.
 
