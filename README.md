@@ -162,9 +162,27 @@ Schema so far covers:
   An on-chain observation may stay unlinked (`leader_event_id = NULL`) rather
   than being fuzzy-matched onto a canonical event it can't be explicitly
   related to.
+- `copy_intents`, `order_attempts`, `position_lots`, `reconciliation_cases`,
+  `execution_schedule` — the planning/execution state machine, virtual lots,
+  and reconciliation history. `copy_intents` is unique on `(event_id,
+  account_id)` (replaying an event creates no second intent);
+  `order_attempts` is unique on `(intent_id, attempt_number)`; `position_lots`
+  is keyed by `(account_id, leader_id, token_id)` so two leaders holding the
+  same token keep distinct lots. `order_attempts.accounted_filled_qty` exists
+  because Phase 0.5's canary confirmed a BUY's requested `size` behaves as a
+  notional cap, not a literal share count — filled quantity must always be
+  read from the venue's actual matched-quantity field, and that same finding
+  (order-by-id lookup 404s immediately after a match, with no working
+  field-based fallback yet) is why `order_attempts.status` has an `uncertain`
+  state that can only be queried and parked, never auto-resubmitted.
+  All decimal quantities are stored as exact text, never `REAL`, to avoid
+  reintroducing the rounding-error class [`OrderReceipt`](src/venue/receipt.rs)
+  exists to prevent.
 
 The database file must live on local block storage, not NFS/SMB — this is a
 single-host, single-writer deployment; see [`EngineLock`](src/engine_lock.rs)
-for the process-level enforcement of "single writer". The intent planner,
-fixed-lane executor, and reconciliation tables described later in blueprint
-section 6 do not exist yet.
+for the process-level enforcement of "single writer". This covers every
+table blueprint section 6 lists, but only the schema: the ingestion pipeline,
+intent planner, fixed-lane executor, and the startup check that refuses a
+lane-count change while non-terminal intents exist (Phases 2–5) are not
+built yet.

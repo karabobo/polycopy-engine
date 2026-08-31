@@ -397,4 +397,196 @@ mod tests {
             "the same source recording the same trade twice must be rejected"
         );
     }
+
+    /// Seeds one account, one leader, and one leader_event, returning the
+    /// event id -- the minimum fixture every copy_intents test needs.
+    async fn seed_account_leader_event(db: &TestDb) -> i64 {
+        sqlx::query(
+            "INSERT INTO accounts (id, label, signing_address, signature_type) \
+             VALUES (1, 'primary', '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'eoa')",
+        )
+        .execute(&**db)
+        .await
+        .expect("account must insert");
+        insert_leader(db, 1, "leader-one").await;
+        sqlx::query(
+            "INSERT INTO leader_events \
+             (id, canonical_event_key, leader_id, condition_id, token_id, outcome_index, side, \
+              size, price, occurred_at, observed_at) \
+             VALUES (1, 'activity:trade-1', 1, '0xcond', '123', 0, 'BUY', '5', '0.5', \
+             '2026-08-31T00:00:00Z', '2026-08-31T00:00:01Z')",
+        )
+        .execute(&**db)
+        .await
+        .expect("event must insert");
+        1
+    }
+
+    async fn seed_intent(db: &TestDb) -> i64 {
+        let event_id = seed_account_leader_event(db).await;
+        sqlx::query(
+            "INSERT INTO copy_intents \
+             (event_id, account_id, leader_id, token_id, side, config_snapshot_json, \
+              config_snapshot_hash, shard_scheme_version, lane_count, shard_id) \
+             VALUES (?, 1, 1, '123', 'BUY', '{}', 'hash-1', 1, 4, 0)",
+        )
+        .bind(event_id)
+        .execute(&**db)
+        .await
+        .expect("intent must insert");
+        1
+    }
+
+    #[tokio::test]
+    async fn replaying_an_event_for_the_same_account_creates_no_second_intent() {
+        let db = TestDb::new().await;
+        let event_id = seed_account_leader_event(&db).await;
+
+        let insert_intent = "INSERT OR IGNORE INTO copy_intents \
+            (event_id, account_id, leader_id, token_id, side, config_snapshot_json, \
+             config_snapshot_hash, shard_scheme_version, lane_count, shard_id) \
+             VALUES (?, 1, 1, '123', 'BUY', '{}', 'hash-1', 1, 4, 0)";
+
+        sqlx::query(insert_intent)
+            .bind(event_id)
+            .execute(&*db)
+            .await
+            .expect("first planning of this event must insert");
+        // A planner replay (e.g. after a crash between insert and cursor
+        // update, per blueprint section 8's acceptance) must not create a
+        // second intent for the same (event, account).
+        sqlx::query(insert_intent)
+            .bind(event_id)
+            .execute(&*db)
+            .await
+            .expect("replaying the same event must not error");
+
+        let intent_count: i64 = sqlx::query("SELECT COUNT(*) FROM copy_intents")
+            .fetch_one(&*db)
+            .await
+            .expect("intent count must be queryable")
+            .get(0);
+        assert_eq!(intent_count, 1, "replay must not create a second intent");
+    }
+
+    #[tokio::test]
+    async fn concurrent_attempt_numbers_for_one_intent_persist_only_once_each() {
+        let db = TestDb::new().await;
+        let intent_id = seed_intent(&db).await;
+
+        sqlx::query(
+            "INSERT INTO order_attempts (intent_id, attempt_number, envelope_json, requested_qty) \
+             VALUES (?, 1, '{}', '5')",
+        )
+        .bind(intent_id)
+        .execute(&*db)
+        .await
+        .expect("the first attempt must insert");
+
+        // "Concurrent calls for one (intent_id, attempt_number) persist one
+        // identical envelope" (blueprint Phase 5 acceptance) -- modeled here
+        // as a second writer racing to prepare the same attempt number.
+        let racing_writer = sqlx::query(
+            "INSERT INTO order_attempts (intent_id, attempt_number, envelope_json, requested_qty) \
+             VALUES (?, 1, '{}', '5')",
+        )
+        .bind(intent_id)
+        .execute(&*db)
+        .await;
+        assert!(
+            racing_writer.is_err(),
+            "a second writer must not persist a second row for the same attempt number"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_leaders_buying_one_token_retain_distinct_virtual_lots() {
+        // Direct check of the blueprint Phase 4 acceptance criterion by the
+        // same name: one account, two leaders, one token -- two lot rows,
+        // not one shared balance.
+        let db = TestDb::new().await;
+        sqlx::query(
+            "INSERT INTO accounts (id, label, signing_address, signature_type) \
+             VALUES (1, 'primary', '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'eoa')",
+        )
+        .execute(&*db)
+        .await
+        .expect("account must insert");
+        insert_leader(&db, 1, "leader-one").await;
+        insert_leader(&db, 2, "leader-two").await;
+
+        for leader_id in [1, 2] {
+            sqlx::query(
+                "INSERT INTO position_lots (account_id, leader_id, token_id, qty) \
+                 VALUES (1, ?, '123', '5')",
+            )
+            .bind(leader_id)
+            .execute(&*db)
+            .await
+            .unwrap_or_else(|error| panic!("leader {leader_id}'s lot must insert: {error}"));
+        }
+
+        let lot_count: i64 =
+            sqlx::query("SELECT COUNT(*) FROM position_lots WHERE account_id = 1 AND token_id = '123'")
+                .fetch_one(&*db)
+                .await
+                .expect("lot count must be queryable")
+                .get(0);
+        assert_eq!(lot_count, 2, "each leader must keep its own lot for the same token");
+    }
+
+    #[tokio::test]
+    async fn a_reconciliation_case_can_reference_the_attempt_that_opened_it() {
+        let db = TestDb::new().await;
+        let intent_id = seed_intent(&db).await;
+        sqlx::query(
+            "INSERT INTO order_attempts (id, intent_id, attempt_number, envelope_json, requested_qty, status) \
+             VALUES (1, ?, 1, '{}', '5', 'uncertain')",
+        )
+        .bind(intent_id)
+        .execute(&*db)
+        .await
+        .expect("attempt must insert");
+
+        sqlx::query(
+            "INSERT INTO reconciliation_cases (account_id, token_id, intent_id, order_attempt_id, case_type, detail) \
+             VALUES (1, '123', ?, 1, 'unknown_submission', 'response lost after HTTP request left the host')",
+        )
+        .bind(intent_id)
+        .execute(&*db)
+        .await
+        .expect("the case must insert");
+
+        let open_case_count: i64 = sqlx::query(
+            "SELECT COUNT(*) FROM reconciliation_cases WHERE account_id = 1 AND token_id = '123' AND resolved_at IS NULL",
+        )
+        .fetch_one(&*db)
+        .await
+        .expect("open case count must be queryable")
+        .get(0);
+        assert_eq!(open_case_count, 1, "the case must be visible as open until resolved");
+    }
+
+    #[tokio::test]
+    async fn execution_schedule_is_a_singleton() {
+        let db = TestDb::new().await;
+        sqlx::query(
+            "INSERT INTO execution_schedule (id, shard_scheme_version, shard_algorithm, lane_count) \
+             VALUES (1, 1, 'mod_lane_count', 4)",
+        )
+        .execute(&*db)
+        .await
+        .expect("the one schedule row must insert");
+
+        let second_row = sqlx::query(
+            "INSERT INTO execution_schedule (id, shard_scheme_version, shard_algorithm, lane_count) \
+             VALUES (2, 1, 'mod_lane_count', 4)",
+        )
+        .execute(&*db)
+        .await;
+        assert!(
+            second_row.is_err(),
+            "execution_schedule must never hold more than its one singleton row"
+        );
+    }
 }
