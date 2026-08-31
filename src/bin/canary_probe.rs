@@ -120,52 +120,86 @@ async fn main() {
             response.order_id, response.status, response.success
         );
 
+        // A lookup failure is itself a Phase 0.5 finding (e.g. the venue may
+        // not surface a fully matched order via this endpoint), not a reason
+        // to abort the remaining checks — record it and continue.
         let lookup_by_id_path = artifacts_dir.join("lookup_by_id.json");
-        let looked_up = lookup_by_id(&client, &response.order_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let by_id_record = CanaryLookupRecord {
-            label: config.label.clone(),
-            looked_up_at_utc: now_utc(),
-            method: "order_id".to_owned(),
-            found_order_id: Some(looked_up.id.clone()),
-            status: Some(format!("{:?}", looked_up.status)),
-            size_matched: Some(looked_up.size_matched.to_string()),
+        let by_id_record = match lookup_by_id(&client, &response.order_id).await {
+            Ok(looked_up) => {
+                println!("lookup by order_id: found={}", looked_up.id == response.order_id);
+                CanaryLookupRecord {
+                    label: config.label.clone(),
+                    looked_up_at_utc: now_utc(),
+                    method: "order_id".to_owned(),
+                    found_order_id: Some(looked_up.id.clone()),
+                    status: Some(format!("{:?}", looked_up.status)),
+                    size_matched: Some(looked_up.size_matched.to_string()),
+                }
+            }
+            Err(error) => {
+                println!("lookup by order_id: FAILED: {error}");
+                CanaryLookupRecord {
+                    label: config.label.clone(),
+                    looked_up_at_utc: now_utc(),
+                    method: "order_id".to_owned(),
+                    found_order_id: None,
+                    status: Some(format!("query_failed: {error}")),
+                    size_matched: None,
+                }
+            }
         };
         let by_id_json = serde_json::to_string_pretty(&by_id_record)
             .map_err(|error| format!("unable to serialize the lookup record: {error}"))?;
         write_new_record(&lookup_by_id_path, &by_id_json).map_err(|error| error.to_string())?;
-        println!("lookup by order_id: found={}", looked_up.id == response.order_id);
 
         let lookup_by_fields_path = artifacts_dir.join("lookup_by_fields.json");
-        let token_id = U256::from_str(config.spec.token_id())
-            .map_err(|_| "canary token ID became invalid after submission".to_owned())?;
-        let filter = OrdersRequest::builder().asset_id(token_id).build();
-        let page = client
-            .orders(&filter, None)
-            .await
-            .map_err(|error| error.to_string())?;
-        let blind_match = page
-            .data
-            .iter()
-            .find(|order| order.id == response.order_id);
-        let by_fields_record = CanaryLookupRecord {
-            label: config.label.clone(),
-            looked_up_at_utc: now_utc(),
-            method: "asset_id_field_match".to_owned(),
-            found_order_id: blind_match.map(|order| order.id.clone()),
-            status: blind_match.map(|order| format!("{:?}", order.status)),
-            size_matched: blind_match.map(|order| order.size_matched.to_string()),
+        let by_fields_record = match U256::from_str(config.spec.token_id()) {
+            Err(_) => CanaryLookupRecord {
+                label: config.label.clone(),
+                looked_up_at_utc: now_utc(),
+                method: "asset_id_field_match".to_owned(),
+                found_order_id: None,
+                status: Some("canary token ID became invalid after submission".to_owned()),
+                size_matched: None,
+            },
+            Ok(token_id) => {
+                let filter = OrdersRequest::builder().asset_id(token_id).build();
+                match client.orders(&filter, None).await {
+                    Ok(page) => {
+                        let blind_match =
+                            page.data.iter().find(|order| order.id == response.order_id);
+                        println!(
+                            "blind field-based lookup among {} order(s) for this token: found={}",
+                            page.data.len(),
+                            blind_match.is_some()
+                        );
+                        CanaryLookupRecord {
+                            label: config.label.clone(),
+                            looked_up_at_utc: now_utc(),
+                            method: "asset_id_field_match".to_owned(),
+                            found_order_id: blind_match.map(|order| order.id.clone()),
+                            status: blind_match.map(|order| format!("{:?}", order.status)),
+                            size_matched: blind_match.map(|order| order.size_matched.to_string()),
+                        }
+                    }
+                    Err(error) => {
+                        println!("blind field-based lookup: FAILED: {error}");
+                        CanaryLookupRecord {
+                            label: config.label.clone(),
+                            looked_up_at_utc: now_utc(),
+                            method: "asset_id_field_match".to_owned(),
+                            found_order_id: None,
+                            status: Some(format!("query_failed: {error}")),
+                            size_matched: None,
+                        }
+                    }
+                }
+            }
         };
         let by_fields_json = serde_json::to_string_pretty(&by_fields_record)
             .map_err(|error| format!("unable to serialize the lookup record: {error}"))?;
         write_new_record(&lookup_by_fields_path, &by_fields_json)
             .map_err(|error| error.to_string())?;
-        println!(
-            "blind field-based lookup among {} order(s) for this token: found={}",
-            page.data.len(),
-            blind_match.is_some()
-        );
 
         if !config.confirm_duplicate() {
             println!();
