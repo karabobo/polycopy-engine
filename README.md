@@ -24,14 +24,18 @@ first implemented primitive is a cross-process database ownership lock: a
 second engine instance fails instead of sharing a database and sending
 concurrently for the same account/token.
 
-Phase 1 (durable schema, blueprint section 6) and the first slice of Phase 2
-(activity ingestion, section 7) have also started, ahead of Phase 0.5's gate
-formally closing, at the account owner's explicit direction while Phase
-0.5's remaining live tests wait on a Polymarket-side CLOB outage to clear.
-Phase 1's schema is complete (every table section 6 lists). Phase 2 has a
-working, live-verified connection to the leader-trade firehose that writes
-into that schema; the intent planner and executor (Phases 3–5) are not
-built. See "Database (Phase 1)" and "Activity ingestion (Phase 2)" below.
+Phase 1 (durable schema, blueprint section 6), Phase 2 (activity ingestion,
+section 7), and Phase 3 (transactional intent planning, section 8) have
+also started, ahead of Phase 0.5's gate formally closing, at the account
+owner's explicit direction while Phase 0.5's remaining live tests wait on a
+Polymarket-side CLOB outage to clear. Phase 1's schema is complete (every
+table section 6 lists). Phase 2 has a working, live-verified connection to
+the leader-trade firehose plus REST backfill, both writing into that
+schema. Phase 3 turns a recorded event into a durably accepted or
+explicitly rejected `copy_intent` — it does not size or price an order
+(that is Phase 4). The fixed-lane executor and prepared-submission layer
+(Phases 4–5) are not built. See "Database (Phase 1)", "Activity ingestion
+(Phase 2)", and "Intent planning (Phase 3)" below.
 
 Run the complete local checks with:
 
@@ -260,3 +264,35 @@ crypto backend on its own, and without installing one every TLS connect
 missing-provider error surfaces. `activity_ws.rs` calls
 `rustls::crypto::aws_lc_rs::default_provider().install_default()` before its
 first connection attempt (idempotent on every reconnect).
+
+## Intent planning (Phase 3)
+
+[`plan.rs`](src/copytrading/plan.rs)'s `plan_next_batch` reads
+`leader_events` past a durable per-account cursor (`planner_cursor`) and,
+for each event, either records a `copy_intents` row with `status='pending'`
+or one with `status='rejected'` and a specific reason — it never silently
+skips an event, and it never mutates `position_lots` or sends an order.
+Per blueprint section 8, it deliberately does **not** compute
+`planned_qty`/`planned_price`/tick-rounded limit price/TIF: those depend on
+live account state and market data at execution time, so they are the
+lane's job (Phase 4, not built).
+
+For one event, insert-or-ignore into `copy_intents` and advancing
+`planner_cursor` happen in a single transaction, so a crash between the two
+rolls back both — replaying the same event afterward creates no second
+intent (`copy_intents` is unique on `(event_id, account_id)`). A rejection
+records why: no `leader_policy` configured for the leader, the leader
+disabled, the trade below `leader_policy.min_leader_trade_size`, or the
+event older than `leader_policy.max_signal_age_seconds` — a delayed
+WebSocket or backfill event past its signal age becomes a durable
+rejection, never a current-market order. An accepted intent's
+`decision_deadline_at` is `observed_at + leader_policy.decision_window_seconds`,
+and its `config_snapshot_json`/`config_snapshot_hash` freeze the policy
+values the decision was made under, immune to a later policy change.
+`plan_next_batch` refuses to run at all if no `execution_schedule` row
+exists yet, rather than guessing a lane count.
+
+`AddressResolver::reload_from_db` (added alongside this) queries every
+currently-enabled leader alias of an enabled leader and reloads the
+resolver from it in one call — the piece that was previously only
+exercised with hand-built test data, not a real query, is now wired up.

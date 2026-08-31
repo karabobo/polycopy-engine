@@ -50,6 +50,22 @@ impl AddressResolver {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Queries every currently-enabled leader alias and reloads from it in
+    /// one call. The natural way to (re)build the resolver at startup or
+    /// whenever leader configuration changes.
+    pub async fn reload_from_db(&self, pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT lwa.address, lwa.leader_id \
+             FROM leader_wallet_aliases lwa \
+             JOIN leader_config lc ON lc.id = lwa.leader_id \
+             WHERE lwa.enabled = 1 AND lc.enabled = 1",
+        )
+        .fetch_all(pool)
+        .await?;
+        self.reload(rows);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -131,5 +147,51 @@ mod tests {
             !saw_undersized_map,
             "a reader must only ever see one complete generation's length, never a partial one"
         );
+    }
+
+    #[tokio::test]
+    async fn reload_from_db_loads_only_enabled_aliases_of_enabled_leaders() {
+        use crate::copytrading::db::open_and_migrate;
+
+        let path = std::env::temp_dir().join(format!(
+            "polycopy-engine-address-resolver-test-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = open_and_migrate(&path).await.expect("migrations must apply");
+
+        sqlx::query(
+            "INSERT INTO leader_config (id, label, enabled) VALUES (1, 'enabled-leader', 1), (2, 'disabled-leader', 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("leaders must insert");
+        sqlx::query(
+            "INSERT INTO leader_wallet_aliases (leader_id, address, enabled) VALUES \
+             (1, '0xenabledalias', 1), (1, '0xdisabledalias', 0), (2, '0xleaderdisabled', 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("aliases must insert");
+
+        let resolver = AddressResolver::new();
+        resolver.reload_from_db(&pool).await.expect("reload must succeed");
+
+        assert_eq!(resolver.resolve("0xenabledalias"), Some(1));
+        assert_eq!(resolver.resolve("0xdisabledalias"), None, "a disabled alias must not resolve");
+        assert_eq!(
+            resolver.resolve("0xleaderdisabled"),
+            None,
+            "an alias of a disabled leader must not resolve even if the alias row itself is enabled"
+        );
+        assert_eq!(resolver.len(), 1);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
     }
 }
