@@ -14,15 +14,18 @@
 //! `OrderV1`/`OrderV2` struct the SDK signs), so a caller can have it before
 //! ever sending the order, not only after reading a response.
 //!
-//! **This is not yet proven to equal the venue's real `order_id`/
-//! `taker_order_id` field.** No official Polymarket documentation states
-//! that the CLOB API's returned order ID is this same on-chain hash, and no
-//! live comparison has been made yet. It is a strongly reasoned hypothesis
-//! (the exact formula the on-chain exchange contract itself defines for
-//! order identity, and the same digest the SDK already signs over), not a
-//! proven fact -- see `docs/PHASE_0_5_CANARY_REPORT.md` for the live
-//! comparison this still needs before `reconcile.rs`'s trade-history
-//! recovery can be trusted to find a real order.
+//! **Live-proven against the order-submission response's `orderID` field,
+//! not yet against the trade-history endpoint's `taker_order_id` field.**
+//! `docs/PHASE_0_5_CANARY_REPORT.md`'s Result 4 (2026-09-01) submitted a real
+//! order that the venue rejected (a moved market price, unrelated to this
+//! hash), and the venue's own `400` response echoed back an `orderID` that
+//! was byte-identical to this module's precomputed value. That confirms the
+//! formula against the field the venue assigns at submission time. It does
+//! **not** yet confirm the narrower thing `reconcile.rs`'s
+//! `recover_fak_taker_order_from_trades` actually depends on: that
+//! `GET /data/trades`'s `taker_order_id` field, for an order that actually
+//! matches, is the same value. A further live run that matches (not just
+//! gets accepted-and-rejected) is still needed to close that gap.
 
 use alloy::{dyn_abi::Eip712Domain, sol_types::SolStruct};
 use polymarket_client_sdk_v2::{

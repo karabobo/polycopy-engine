@@ -142,9 +142,49 @@ retry automatically or on a timer.
   (`taking_amount` for a BUY) and must never assume it equals the requested
   `size`.
 
+## Result 4: offline order-ID hash equivalence
+
+- Date and operator: 2026-09-01, account owner, run from the same remote host
+  as the original canary.
+- Label: `order-id-verify-2026-09-01`. Same market/token, side, price, and
+  size as the original successful run (`fed-25bps-live-2026-08-31`): BUY,
+  `price=0.55`, `size=5`, FAK, token_id
+  `63842529068710005716169325380315470359047749786610778647370693404952498013178`.
+- What was compared: this project's own offline prediction
+  (`src/venue/order_hash.rs`'s `expected_order_id`, computed from the signed
+  order before any network call, by mirroring the SDK's internal EIP-712
+  signing digest and the on-chain CTF Exchange contract's public `hashOrder`
+  formula) against the ID the venue itself assigned to the order.
+- Result: the market had moved since 2026-08-31 (best bid `$0.57` / best ask
+  `$0.99` at time of check — a much wider spread than the original run), so
+  the identical `price=0.55` no longer matched. The venue rejected the
+  submission with `400 Bad Request`:
+  `{"error":"no orders found to match with FAK order. FAK orders are
+  partially filled or killed if no match is found.","orderID":
+  "0x76480b8e5a6d653f7b7b15aa51504eb959c64ddcc1ea6f3f1bb6bfdd539afad7"}`.
+  This project's `expected_order_id`, printed **before** submission, was:
+  `0x76480b8e5a6d653f7b7b15aa51504eb959c64ddcc1ea6f3f1bb6bfdd539afad7`.
+  **These are byte-identical.**
+- Significance: this is the first live confirmation that this project's
+  precomputed order-ID formula equals the venue's own assigned ID for a real
+  order — and it held even for a rejected, zero-fill FAK (the venue clearly
+  computes/assigns the ID before or independent of matching, not only after a
+  fill). This directly answers, in the positive, the open question in
+  `docs/INTL_CLOB_SDK_BOUNDARY.md` about whether a locally computed
+  signed-envelope identifier matches the venue's own field.
+- What remains open: this proves equivalence against the order-submission
+  response's `orderID` field for a rejected order. It does **not** yet prove
+  the same equivalence against the authenticated `GET /data/trades`
+  endpoint's `taker_order_id` field for a **matched** fill — which is
+  specifically what `reconcile.rs`'s `recover_fak_taker_order_from_trades`
+  depends on for lost-response recovery. A further live run that actually
+  matches (not just gets accepted-and-rejected) is still needed to close that
+  narrower gap. Result 2 (duplicate submission) was also not tested this run:
+  the first submission itself was rejected before reaching that step.
+
 ## Gate decision
 
-### Local recovery implementation (not live proof)
+### Local recovery implementation (partially live-proven)
 
 The engine now persists a precomputed expected `taker_order_id`, the exact
 signed-order JSON, and the durable instant an attempt enters `submitting`. For
@@ -156,21 +196,28 @@ accounting. An empty or delayed history, error, unknown status, malformed
 fingerprint, or contradictory duplicate data opens `needs_reconcile`; no path
 resubmits an uncertain order.
 
-This is intentionally **not** a completed canary result: the live endpoint has
-not yet been observed returning a `taker_order_id` for this project's FAK that
-equals the precomputed identifier. It is a safer recovery implementation, not
-evidence that the venue's identifier mapping or indexing delay is proven.
+Result 4 above live-proved that the precomputed identifier equals the
+venue's own assigned order ID, for the order-submission response. It remains
+**not proven** for the specific field `recover_fak_taker_order_from_trades`
+actually reads (`GET /data/trades`'s `taker_order_id`, for a matched fill) —
+that narrower equivalence still needs a live run that matches.
 
 - [ ] Lookup is deterministic from persisted envelope data. **Not proven —
-      and now partially disproven.** By-ID lookup works, but only after an
-      unmeasured indexing delay (confirmed clear by ~6 hours; confirmed
-      absent immediately after matching). The field-based fallback for a
-      truly lost order ID (asset_id-filtered listing) does **not** find a
-      matched order at all — it only lists open orders. A crash before the
-      order ID is durably recorded is not currently recoverable by either
-      lookup path alone.
+      and now partially disproven, partially strengthened.** By-ID lookup
+      works, but only after an unmeasured indexing delay (confirmed clear by
+      ~6 hours; confirmed absent immediately after matching). The
+      field-based fallback for a truly lost order ID (asset_id-filtered
+      listing) does **not** find a matched order at all — it only lists open
+      orders. A crash before the order ID is durably recorded is not
+      currently recoverable by either lookup path alone. On the other hand,
+      Result 4 now proves the order ID itself *can* be computed
+      deterministically offline, before any submission — the remaining gap
+      is specifically the trade-history endpoint's `taker_order_id` field
+      for a matched fill, not the ID computation itself.
 - [ ] Byte-identical duplicate behavior is safe for the intended retry policy.
-      **Not tested live yet.**
+      **Not tested live yet** (the 2026-09-01 run that would have tested it
+      was rejected for an unrelated reason — a moved market price — before
+      reaching the duplicate-submission step).
 - [x] Receipt fields are sufficient for idempotent fill-delta accounting —
       `making_amount`/`taking_amount` are precise and matched the observed
       balance change exactly, **provided `filled_qty` is read from
@@ -193,6 +240,10 @@ One question is now answered in the negative rather than merely open: the
 field-based fallback lookup does not recover a matched order, so a lost order
 ID before durable persistence is currently an unrecoverable gap, not just an
 untested one — later phases must close it with a different mechanism before
-relying on automatic recovery. The duplicate-submission question remains
-fully open and requires a further live order to resolve; that is a decision
-for the account owner, not something this project runs automatically.
+relying on automatic recovery. One question is now answered in the
+positive: Result 4 proves this project's offline order-ID computation
+matches the venue's own assigned ID, at least for the order-submission
+response. The duplicate-submission question, and the narrower matched-fill
+trade-history equivalence, both remain open and require a further live order
+that actually matches to resolve; that is a decision for the account owner,
+not something this project runs automatically.
