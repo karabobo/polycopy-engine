@@ -36,7 +36,9 @@ The execution server needs an isolated Rust stable toolchain once, before its
 first source build. On Ubuntu 24.04, the distribution owns `/usr/bin/rustup`
 and its proxy launchers; the script verifies that the resolved Cargo binary is
 under the project-owned toolchain and keeps its build cache there rather than
-under root's home directory:
+under root's home directory. It also forces Cargo and every build script to use
+that same resolved `rustc`, rather than an unrelated compiler that may appear
+earlier in root's `PATH`:
 
 ```sh
 deploy/bootstrap-rust-toolchain.sh

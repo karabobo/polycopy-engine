@@ -74,10 +74,19 @@ git archive --format=tar "$commit" | "${ssh_args[@]}" "tar -x -C '$release_dir'"
         exit 20
     }
     cargo_bin=\$(/usr/bin/rustup which cargo)
+    rustc_bin=\$(/usr/bin/rustup which rustc)
     case \"\$cargo_bin\" in
         '$remote_root'/toolchain/rustup/toolchains/*/bin/cargo) ;;
         *) echo \"unexpected cargo toolchain path: \$cargo_bin\" >&2; exit 21 ;;
     esac
+    case \"\$rustc_bin\" in
+        '$remote_root'/toolchain/rustup/toolchains/*/bin/rustc) ;;
+        *) echo \"unexpected rustc toolchain path: \$rustc_bin\" >&2; exit 22 ;;
+    esac
+    # Do not inherit a root user's unrelated ~/.cargo/bin/rustc. Cargo and
+    # build scripts must resolve the same project-owned compiler as cargo.
+    export RUSTC=\"\$rustc_bin\"
+    export PATH=\"\$(dirname \"\$cargo_bin\"):\$PATH\"
     \"\$cargo_bin\" build --release --all-features --locked
     test -x target/release/ghost_verify
     test -x target/release/canary_probe
