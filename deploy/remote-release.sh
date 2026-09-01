@@ -10,10 +10,11 @@ set -Eeuo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: POLYCOPY_DEPLOY_HOST=<ssh-host> deploy/remote-release.sh [git-commit]
+Usage: deploy/remote-release.sh [git-commit]
 
 Requires a clean local worktree. The selected commit is archived locally and
 streamed to /opt/polycopy-engine/releases/<full-commit> on the remote host.
+The SSH target is hard-locked to the designated execution-server alias.
 EOF
 }
 
@@ -27,7 +28,12 @@ if [[ -n "$(git status --porcelain)" ]]; then
     exit 2
 fi
 
-host="${POLYCOPY_DEPLOY_HOST:?set POLYCOPY_DEPLOY_HOST to the dedicated execution host}"
+readonly approved_host="aliyun-8-220-180-39"
+host="${POLYCOPY_DEPLOY_HOST:-$approved_host}"
+if [[ "$host" != "$approved_host" ]]; then
+    echo "POLYCOPY_DEPLOY_HOST must remain $approved_host" >&2
+    exit 2
+fi
 remote_root="${POLYCOPY_REMOTE_ROOT:-/opt/polycopy-engine}"
 if [[ "$remote_root" != "/opt/polycopy-engine" ]]; then
     echo "POLYCOPY_REMOTE_ROOT must remain /opt/polycopy-engine" >&2
@@ -38,7 +44,17 @@ commit="${1:-$(git rev-parse HEAD)}"
 commit="$(git rev-parse --verify "${commit}^{commit}")"
 release_dir="$remote_root/releases/$commit"
 
-ssh "$host" "set -eu
+ssh_args=(
+    ssh
+    -o BatchMode=yes
+    -o PasswordAuthentication=no
+    -o KbdInteractiveAuthentication=no
+    -o StrictHostKeyChecking=yes
+    -o ConnectTimeout=15
+    "$host"
+)
+
+"${ssh_args[@]}" "set -eu
     umask 077
     install -d -m 0755 '$remote_root/releases'
     if test -e '$release_dir'; then
@@ -47,18 +63,22 @@ ssh "$host" "set -eu
     fi
     install -d -m 0755 '$release_dir'"
 
-git archive --format=tar "$commit" | ssh "$host" "tar -x -C '$release_dir'"
+git archive --format=tar "$commit" | "${ssh_args[@]}" "tar -x -C '$release_dir'"
 
-ssh "$host" "set -eu
+"${ssh_args[@]}" "set -eu
     cd '$release_dir'
     export CARGO_HOME='$remote_root/toolchain/cargo'
     export RUSTUP_HOME='$remote_root/toolchain/rustup'
-    export PATH=\"\$CARGO_HOME/bin:\$PATH\"
-    command -v cargo >/dev/null || {
+    test -x /usr/bin/rustup || {
         echo 'Rust toolchain missing; run deploy/bootstrap-rust-toolchain.sh first' >&2
         exit 20
     }
-    cargo build --release --all-features --locked
+    cargo_bin=\$(/usr/bin/rustup which cargo)
+    case \"\$cargo_bin\" in
+        '$remote_root'/toolchain/rustup/toolchains/*/bin/cargo) ;;
+        *) echo \"unexpected cargo toolchain path: \$cargo_bin\" >&2; exit 21 ;;
+    esac
+    \"\$cargo_bin\" build --release --all-features --locked
     test -x target/release/ghost_verify
     test -x target/release/canary_probe
     test -x target/release/lock_probe"
@@ -66,7 +86,7 @@ ssh "$host" "set -eu
 # A symlink replacement is atomic on the same filesystem. No running process
 # is restarted here, so making a release current cannot itself change venue
 # state.
-ssh "$host" "set -eu
+"${ssh_args[@]}" "set -eu
     ln -s '$release_dir' '$remote_root/current.new'
     mv -Tf '$remote_root/current.new' '$remote_root/current'
     readlink -f '$remote_root/current'"

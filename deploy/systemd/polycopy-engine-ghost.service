@@ -3,7 +3,8 @@ Description=polycopy-engine authenticated GHOST verification (read-only)
 Documentation=file:/opt/polycopy-engine/current/docs/SERVER_DEPLOYMENT.md
 Wants=network-online.target
 After=network-online.target
-ConditionPathExists=/etc/polycopy-engine/ghost.env
+ConditionPathExists=/etc/polycopy-engine/ghost-public.env
+ConditionPathExists=/etc/polycopy-engine/credentials/ghost-secrets.env
 ConditionPathExists=/opt/polycopy-engine/current/target/release/ghost_verify
 
 [Service]
@@ -12,7 +13,8 @@ User=root
 Group=root
 UMask=0077
 WorkingDirectory=/opt/polycopy-engine/current
-EnvironmentFile=/etc/polycopy-engine/ghost.env
+EnvironmentFile=/etc/polycopy-engine/ghost-public.env
+LoadCredential=polycopy-ghost-secrets:/etc/polycopy-engine/credentials/ghost-secrets.env
 ExecStart=/opt/polycopy-engine/current/target/release/ghost_verify
 NoNewPrivileges=yes
 PrivateTmp=yes

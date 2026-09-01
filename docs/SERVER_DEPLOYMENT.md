@@ -33,12 +33,13 @@ is an additional guard, not a substitute for one systemd owner.
 ## Release procedure
 
 The execution server needs an isolated Rust stable toolchain once, before its
-first source build. On Ubuntu 24.04 the bootstrap script uses the distribution
-`rustup` launcher and stores the actual toolchain and Cargo cache under the
-project root rather than root's home directory:
+first source build. On Ubuntu 24.04, the distribution owns `/usr/bin/rustup`
+and its proxy launchers; the script verifies that the resolved Cargo binary is
+under the project-owned toolchain and keeps its build cache there rather than
+under root's home directory:
 
 ```sh
-POLYCOPY_DEPLOY_HOST=[server SSH alias] deploy/bootstrap-rust-toolchain.sh
+deploy/bootstrap-rust-toolchain.sh
 ```
 
 It installs no service and does not receive source code, credentials, database
@@ -49,7 +50,7 @@ From a clean local Git worktree, set the SSH host alias only in the invoking
 shell and run:
 
 ```sh
-POLYCOPY_DEPLOY_HOST=[server SSH alias] deploy/remote-release.sh
+deploy/remote-release.sh
 ```
 
 The release script refuses a dirty worktree, exports exactly one committed
@@ -69,20 +70,30 @@ After one remote release has built successfully, install the intentionally
 disabled unit:
 
 ```sh
-POLYCOPY_DEPLOY_HOST=[server SSH alias] deploy/install-ghost-unit.sh
+deploy/install-ghost-unit.sh
 ```
 
 This only installs `polycopy-engine-ghost.service`, reloads systemd metadata,
 and creates root-only empty configuration/state directories. It refuses to
-overwrite a pre-existing unit. It never creates `/etc/polycopy-engine/ghost.env`
-and never starts or enables the unit.
+overwrite a pre-existing unit. It never creates a configuration or credential
+file and never starts or enables the unit.
 
-Before a manual GHOST run, the account owner creates the root-only environment
-file directly on the server (mode `0600`) and enters a **new, non-exposed**
-signing credential there. It must contain a newly captured timestamped manual
-balance snapshot and the normal `POLYCOPY_GHOST_*` values. Do not paste any
-private key, L2 secret, passphrase, signed order, or full wallet address into
-chat, Git, shell history, or deployment logs.
+Before a manual GHOST run, the account owner creates two root-only files
+directly on the server (each mode `0600`). Do not paste any private key, L2
+secret, passphrase, signed order, or full wallet address into chat, Git, shell
+history, or deployment logs.
+
+`/etc/polycopy-engine/ghost-public.env` contains only non-secret runtime
+settings: signature type, optional funder address, timestamp, collateral, and
+expected token balances. It is loaded with `EnvironmentFile`.
+
+`/etc/polycopy-engine/credentials/ghost-secrets.env` contains only the signing
+key plus an optional complete set of existing L2 fields. It is supplied via
+systemd `LoadCredential`, so the process reads the service-private credential
+file through `CREDENTIALS_DIRECTORY`; none of its values become systemd
+environment variables. The GHOST process rejects snapshot or other runtime
+values in this credential file. Leaving the three L2 values out keeps the
+derive-only existing-credential path.
 
 Run GHOST manually only after the snapshot is ready:
 
@@ -95,6 +106,10 @@ journalctl -u polycopy-engine-ghost.service --since '-10 min' --no-pager
 The unit has no `[Install]` section and therefore cannot be enabled for
 automatic execution. A passing GHOST check is evidence only of a matching
 read-only snapshot; it never authorizes trading.
+
+All deployment scripts are hard-locked to the SSH alias
+`aliyun-8-220-180-39` and use key-only, strict-host-key SSH options. Supplying
+a different `POLYCOPY_DEPLOY_HOST` is rejected.
 
 ## Evidence, backups, and production promotion
 

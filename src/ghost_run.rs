@@ -4,14 +4,14 @@
 //! is not supplied. It deliberately never invokes the SDK path that can create
 //! an API credential, because creation is outside Phase 0's read-only scope.
 
-use std::{error::Error, fmt, str::FromStr};
+use std::{collections::HashMap, env, error::Error, fmt, fs, path::PathBuf, str::FromStr};
 
 use polymarket_client_sdk_v2::{
+    POLYGON,
     auth::{Credentials, LocalSigner, Signer as _},
-    clob::{types::SignatureType, Client, Config},
+    clob::{Client, Config, types::SignatureType},
     error::Error as SdkError,
     types::{Address, DateTime, Decimal},
-    POLYGON,
 };
 
 use crate::{
@@ -31,6 +31,8 @@ const FUNDER_ENV: &str = "POLYCOPY_CLOB_FUNDER";
 const SNAPSHOT_AT_ENV: &str = "POLYCOPY_GHOST_SNAPSHOT_AT_UTC";
 const COLLATERAL_ENV: &str = "POLYCOPY_GHOST_EXPECTED_COLLATERAL";
 const TOKEN_BALANCES_ENV: &str = "POLYCOPY_GHOST_EXPECTED_TOKEN_BALANCES";
+const SYSTEMD_CREDENTIALS_DIRECTORY_ENV: &str = "CREDENTIALS_DIRECTORY";
+const SYSTEMD_SECRET_CREDENTIAL_NAME: &str = "polycopy-ghost-secrets";
 
 /// All input necessary for one intentionally read-only GHOST verification.
 ///
@@ -48,7 +50,14 @@ pub struct GhostRunConfig {
 impl GhostRunConfig {
     /// Loads and validates a run configuration without contacting Polymarket.
     pub fn from_env() -> Result<Self, GhostRunConfigError> {
-        Self::from_lookup(|name| std::env::var(name).ok())
+        let systemd_secrets = load_systemd_secret_credential()?;
+        Self::from_lookup(|name| match &systemd_secrets {
+            // A systemd invocation has an explicit credential directory. In
+            // that mode, signing/L2 material is accepted only from the
+            // credential file, never from the process environment.
+            Some(secrets) if secret_environment_name(name).is_some() => secrets.get(name).cloned(),
+            _ => env::var(name).ok(),
+        })
     }
 
     fn from_lookup<F>(lookup: F) -> Result<Self, GhostRunConfigError>
@@ -202,13 +211,33 @@ impl FromStr for GhostSignatureType {
 
 #[derive(Debug)]
 pub enum GhostRunConfigError {
-    MissingEnvironment { name: &'static str },
+    MissingEnvironment {
+        name: &'static str,
+    },
+    EmptySystemdCredentialsDirectory,
+    SystemdCredentialRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    InvalidSystemdCredentialEntry {
+        line: usize,
+    },
+    UnexpectedSystemdCredentialName {
+        line: usize,
+        name: String,
+    },
+    DuplicateSystemdCredentialName {
+        line: usize,
+        name: &'static str,
+    },
     InvalidFunderAddress,
     UnexpectedFunder,
     MissingFunder,
     InvalidSignatureType,
     InvalidSnapshotTimestamp,
-    InvalidDecimal { name: &'static str },
+    InvalidDecimal {
+        name: &'static str,
+    },
     InvalidTokenBalanceEntry,
     EmptyTokenBalanceList,
     InvalidTokenId,
@@ -222,6 +251,27 @@ impl fmt::Display for GhostRunConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingEnvironment { name } => write!(formatter, "missing required {name}"),
+            Self::EmptySystemdCredentialsDirectory => write!(
+                formatter,
+                "CREDENTIALS_DIRECTORY is set but empty; systemd secret credential cannot be read"
+            ),
+            Self::SystemdCredentialRead { path, source } => write!(
+                formatter,
+                "unable to read systemd secret credential at {}: {source}",
+                path.display()
+            ),
+            Self::InvalidSystemdCredentialEntry { line } => write!(
+                formatter,
+                "systemd secret credential line {line} must use NAME=VALUE"
+            ),
+            Self::UnexpectedSystemdCredentialName { line, name } => write!(
+                formatter,
+                "systemd secret credential line {line} has unsupported name {name}"
+            ),
+            Self::DuplicateSystemdCredentialName { line, name } => write!(
+                formatter,
+                "systemd secret credential line {line} repeats {name}"
+            ),
             Self::InvalidFunderAddress => write!(formatter, "invalid CLOB funder address"),
             Self::UnexpectedFunder => write!(formatter, "EOA GHOST mode must not set a funder"),
             Self::MissingFunder => write!(formatter, "Poly1271 GHOST mode requires a funder"),
@@ -260,6 +310,7 @@ impl fmt::Display for GhostRunConfigError {
 impl Error for GhostRunConfigError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::SystemdCredentialRead { source, .. } => Some(source),
             Self::Snapshot(source) => Some(source),
             _ => None,
         }
@@ -346,6 +397,71 @@ impl Error for GhostRunError {
     }
 }
 
+type SystemdSecretValues = HashMap<&'static str, String>;
+
+/// Reads the one systemd credential file when this process was launched by the
+/// GHOST unit. Returning `None` retains the explicit local CLI environment
+/// workflow documented in `.env.example`.
+fn load_systemd_secret_credential() -> Result<Option<SystemdSecretValues>, GhostRunConfigError> {
+    let Some(directory) = env::var_os(SYSTEMD_CREDENTIALS_DIRECTORY_ENV) else {
+        return Ok(None);
+    };
+    if directory.is_empty() {
+        return Err(GhostRunConfigError::EmptySystemdCredentialsDirectory);
+    }
+
+    let path = PathBuf::from(directory).join(SYSTEMD_SECRET_CREDENTIAL_NAME);
+    let contents =
+        fs::read_to_string(&path).map_err(|source| GhostRunConfigError::SystemdCredentialRead {
+            path: path.clone(),
+            source,
+        })?;
+    parse_systemd_secret_credential(&contents).map(Some)
+}
+
+/// Parses only signing/L2 fields, never snapshot or runtime settings. This
+/// prevents credentials from leaking through a systemd `EnvironmentFile`.
+fn parse_systemd_secret_credential(
+    contents: &str,
+) -> Result<SystemdSecretValues, GhostRunConfigError> {
+    let mut values = SystemdSecretValues::new();
+
+    for (index, raw_line) in contents.lines().enumerate() {
+        let line = index + 1;
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let (raw_name, raw_value) = raw_line
+            .split_once('=')
+            .ok_or(GhostRunConfigError::InvalidSystemdCredentialEntry { line })?;
+        let raw_name = raw_name.trim();
+        let name = secret_environment_name(raw_name).ok_or_else(|| {
+            GhostRunConfigError::UnexpectedSystemdCredentialName {
+                line,
+                name: raw_name.to_owned(),
+            }
+        })?;
+        if values.insert(name, raw_value.to_owned()).is_some() {
+            return Err(GhostRunConfigError::DuplicateSystemdCredentialName { line, name });
+        }
+    }
+
+    Ok(values)
+}
+
+fn secret_environment_name(name: &str) -> Option<&'static str> {
+    match name {
+        PRIVATE_KEY_ENV => Some(PRIVATE_KEY_ENV),
+        API_KEY_ENV => Some(API_KEY_ENV),
+        API_SECRET_ENV => Some(API_SECRET_ENV),
+        API_PASSPHRASE_ENV => Some(API_PASSPHRASE_ENV),
+        API_NONCE_ENV => Some(API_NONCE_ENV),
+        _ => None,
+    }
+}
+
 fn required<F>(lookup: &F, name: &'static str) -> Result<String, GhostRunConfigError>
 where
     F: Fn(&str) -> Option<String>,
@@ -387,8 +503,6 @@ fn parse_token_balances(raw: &str) -> Result<Vec<ExpectedTokenBalance>, GhostRun
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
 
     fn valid_environment() -> HashMap<&'static str, String> {
@@ -482,6 +596,45 @@ mod tests {
         assert!(matches!(
             GhostRunConfig::from_lookup(|name| environment.get(name).cloned()),
             Err(GhostRunConfigError::MissingFunder)
+        ));
+    }
+
+    #[test]
+    fn systemd_secret_credential_accepts_only_signing_and_l2_material() {
+        let values = parse_systemd_secret_credential(
+            "# no snapshot data belongs here\n\
+             POLYCOPY_CLOB_PRIVATE_KEY=0xtest\n\
+             POLYCOPY_CLOB_L2_API_KEY=key\n\
+             POLYCOPY_CLOB_L2_API_SECRET=secret=with=equals\n\
+             POLYCOPY_CLOB_L2_API_PASSPHRASE=passphrase\n",
+        )
+        .expect("recognized secret fields are accepted");
+
+        assert_eq!(
+            values.get(PRIVATE_KEY_ENV).map(String::as_str),
+            Some("0xtest")
+        );
+        assert_eq!(
+            values.get(API_SECRET_ENV).map(String::as_str),
+            Some("secret=with=equals")
+        );
+    }
+
+    #[test]
+    fn systemd_secret_credential_rejects_non_secret_or_ambiguous_entries() {
+        assert!(matches!(
+            parse_systemd_secret_credential("POLYCOPY_GHOST_EXPECTED_COLLATERAL=1\n"),
+            Err(GhostRunConfigError::UnexpectedSystemdCredentialName { .. })
+        ));
+        assert!(matches!(
+            parse_systemd_secret_credential(
+                "POLYCOPY_CLOB_PRIVATE_KEY=first\nPOLYCOPY_CLOB_PRIVATE_KEY=second\n"
+            ),
+            Err(GhostRunConfigError::DuplicateSystemdCredentialName { .. })
+        ));
+        assert!(matches!(
+            parse_systemd_secret_credential("POLYCOPY_CLOB_PRIVATE_KEY\n"),
+            Err(GhostRunConfigError::InvalidSystemdCredentialEntry { line: 1 })
         ));
     }
 }
