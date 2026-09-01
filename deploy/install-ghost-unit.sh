@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the disabled, read-only GHOST systemd unit after a release has been
+# Install the static, read-only GHOST systemd unit after a release has been
 # built remotely. This script deliberately refuses to replace an existing unit
 # or touch any credential file.
 
@@ -53,10 +53,11 @@ ssh_args=(
         echo 'unexpected active ghost unit after installation' >&2
         exit 18
     } || true
-    systemctl is-enabled --quiet polycopy-engine-ghost && {
-        echo 'unexpected enabled ghost unit after installation' >&2
+    unit_file_state=\$(systemctl show polycopy-engine-ghost --property=UnitFileState --value)
+    if test \"\$unit_file_state\" != static; then
+        echo \"unexpected ghost unit file state: \$unit_file_state\" >&2
         exit 19
-    } || true
+    fi
     systemctl show polycopy-engine-ghost --property=LoadState --property=UnitFileState --no-pager"
 
-echo "disabled GHOST unit installed; no credentials were created and no command was started"
+echo "static GHOST unit installed; no credentials were created and no command was started"
