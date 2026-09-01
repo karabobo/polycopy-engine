@@ -1,5 +1,5 @@
-//! Phase 1 (durable account/leader state, section 6) through Phase 5
-//! (prepared submission and reconciliation, section 10) of
+//! Phase 1 (durable account/leader state, section 6) through Phase 6
+//! (Squadron, CAG, and Control Tower, section 11) of
 //! `docs/COPY_ENGINE_BLUEPRINT.md`.
 //!
 //! Schema covers every table blueprint section 6 lists.
@@ -8,6 +8,7 @@
 //! test code: neither this project nor its assistant ever submits a live
 //! order.
 
+pub mod control_tower;
 pub mod db;
 pub mod plan;
 
@@ -20,6 +21,11 @@ pub mod reconcile;
 #[cfg(feature = "ingest")]
 pub mod ingest;
 
+pub use control_tower::{
+    leader_intents, leader_lots, leader_reconciliation_cases, leader_status, trace_attempt,
+    AccountSummary, AttemptTrace, ControlTowerError, CopyStrategyStatusShim, EventSummary,
+    IntentSummary, LeaderStatus, LotSummary, ReconciliationCaseSummary, SignalStatus,
+};
 pub use db::{open, open_and_migrate, DbError};
 pub use plan::{plan_next_batch, plan_next_batch_with_limit, PlanError, PlanSummary, PolicySnapshot};
 

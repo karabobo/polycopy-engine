@@ -25,23 +25,26 @@ first implemented primitive is a cross-process database ownership lock: a
 second engine instance fails instead of sharing a database and sending
 concurrently for the same account/token.
 
-Phase 1 (durable schema, blueprint section 6) through Phase 5 (prepared
-submission and reconciliation, section 10) have started, ahead of Phase
-0.5's gate formally closing, at the account owner's explicit direction
-while Phase 0.5's remaining live tests wait on a Polymarket-side CLOB
-outage to clear. Phase 1's schema is complete (every table section 6
-lists). Phase 2 has a working, live-verified connection to the
-leader-trade firehose plus REST backfill, both writing into that schema.
-Phase 3 turns a recorded event into a durably accepted or explicitly
-rejected `copy_intent`. Phase 4 claims an intent, sizes and reserves it,
-and finalizes an idempotent receipt into `position_lots`. Phase 5 adds the
-durably persisted order envelope, the submission recovery matrix, and the
-retry budget that govern how a claimed intent is actually submitted — but
-`submit_exact_envelope`, the one call that would write a live order, has
-**no implementation anywhere in this crate**, and this project's assistant
-will never write or run that code. See "Database (Phase 1)", "Activity
-ingestion (Phase 2)", "Intent planning (Phase 3)", "Fixed-lane executor
-(Phase 4)", and "Prepared submission and reconciliation (Phase 5)" below.
+Phase 1 (durable schema, blueprint section 6) through Phase 6 (Squadron,
+CAG, and Control Tower, section 11) have started, ahead of Phase 0.5's gate
+formally closing, at the account owner's explicit direction while Phase
+0.5's remaining live tests wait on further live confirmation. Phase 1's
+schema is complete (every table section 6 lists). Phase 2 has a working,
+live-verified connection to the leader-trade firehose plus REST backfill,
+both writing into that schema. Phase 3 turns a recorded event into a
+durably accepted or explicitly rejected `copy_intent`. Phase 4 claims an
+intent, sizes and reserves it, and finalizes an idempotent receipt into
+`position_lots`. Phase 5 adds the durably persisted order envelope, the
+submission recovery matrix, and the retry budget that govern how a claimed
+intent is actually submitted — but `submit_exact_envelope`, the one call
+that would write a live order, has **no implementation anywhere in this
+crate**, and this project's assistant will never write or run that code.
+Phase 6 adds a read-only leader/intent/lot/reconciliation status layer and
+full attempt-to-event-to-account traceability; it writes nothing. See
+"Database (Phase 1)", "Activity ingestion (Phase 2)", "Intent planning
+(Phase 3)", "Fixed-lane executor (Phase 4)", "Prepared submission and
+reconciliation (Phase 5)", and "Squadron, CAG, and Control Tower (Phase 6)"
+below.
 
 Run the complete local checks with:
 
@@ -399,3 +402,41 @@ The reconciliation tests cover concurrent envelope preparation, every
 documented recovery-matrix state and its anti-resubmit property, finite retry
 accounting, strict-query case opening, exact ID recovery, delayed/empty
 history, and exact partial-fill lot accounting.
+
+## Squadron, CAG, and Control Tower (Phase 6)
+
+`polycopy_engine::copytrading::control_tower` (blueprint section 11,
+gated by `db` alone — it needs no venue feature) is a read-only status and
+traceability layer. It writes nothing: enabling/disabling a leader and
+updating its policy remain plain `UPDATE` statements a caller runs
+directly against `leader_config`/`leader_policy`; this module only reads
+back what already happened.
+
+- `CopyStrategyStatusShim` always reports `SignalStatus::NoSignal`. DRADIS's
+  own Squadron/CAG objects are configuration and read-only status consumers
+  that this crate does not link against, vendor, or depend on (see
+  `docs/DRADIS_REFERENCE_BASELINE.md`); this shim is this project's own
+  implementation of that contract, and it is always `NoSignal` because the
+  copy pipeline's ingest/plan/execute/reconcile modules own signal
+  generation and execution end to end.
+- `leader_status`, `leader_intents`, `leader_lots`, and
+  `leader_reconciliation_cases` read one leader's current configuration,
+  every intent it has ever produced, every virtual lot its copied trades
+  hold, and every reconciliation case attributable to it. Disabling a
+  leader stops new intents from being planned for it (Phase 3); it never
+  deletes an intent, erases a lot, or hides a case that already exists.
+- `trace_attempt` joins one `order_attempts` row back through its
+  `copy_intents` row (including the immutable `config_snapshot_json` it was
+  planned under), the `leader_events` row that triggered it, the leader and
+  account, and every `reconciliation_cases` row attributable to that
+  intent — one read that answers the blueprint's Control Tower acceptance
+  criterion ("trace any attempt to event, leader, account, configuration
+  snapshot, reservation, receipt, and reconciliation state") without a
+  caller having to assemble the joins itself.
+
+Tests cover that updating one leader's config/status never touches another
+leader's already-planned intent snapshot or status row, that disabling a
+leader leaves its existing lots fully visible, that a reconciliation case
+with no `intent_id` is correctly excluded from any leader's view rather than
+silently misattributed, and a full `trace_attempt` round trip through every
+linked table.
