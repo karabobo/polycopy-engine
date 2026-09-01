@@ -99,7 +99,11 @@ mod tests {
         resolver.reload([("0xccc".to_owned(), 3)]);
 
         assert_eq!(resolver.len(), 1);
-        assert_eq!(resolver.resolve("0xaaa"), None, "a dropped leader must no longer resolve");
+        assert_eq!(
+            resolver.resolve("0xaaa"),
+            None,
+            "a dropped leader must no longer resolve"
+        );
         assert_eq!(resolver.resolve("0xbbb"), None);
         assert_eq!(resolver.resolve("0xccc"), Some(3));
     }
@@ -161,7 +165,9 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let pool = open_and_migrate(&path).await.expect("migrations must apply");
+        let pool = open_and_migrate(&path)
+            .await
+            .expect("migrations must apply");
 
         sqlx::query(
             "INSERT INTO leader_config (id, label, enabled) VALUES (1, 'enabled-leader', 1), (2, 'disabled-leader', 0)",
@@ -178,10 +184,17 @@ mod tests {
         .expect("aliases must insert");
 
         let resolver = AddressResolver::new();
-        resolver.reload_from_db(&pool).await.expect("reload must succeed");
+        resolver
+            .reload_from_db(&pool)
+            .await
+            .expect("reload must succeed");
 
         assert_eq!(resolver.resolve("0xenabledalias"), Some(1));
-        assert_eq!(resolver.resolve("0xdisabledalias"), None, "a disabled alias must not resolve");
+        assert_eq!(
+            resolver.resolve("0xdisabledalias"),
+            None,
+            "a disabled alias must not resolve"
+        );
         assert_eq!(
             resolver.resolve("0xleaderdisabled"),
             None,

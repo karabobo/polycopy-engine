@@ -57,11 +57,7 @@ impl OrderReceipt {
         accepted_budget: Decimal,
         matched_shares: Decimal,
     ) -> Result<Self, ReceiptError> {
-        validate_not_greater_than_requested(
-            "accepted_qty",
-            accepted_budget,
-            requested_budget,
-        )?;
+        validate_not_greater_than_requested("accepted_qty", accepted_budget, requested_budget)?;
         Self::new(
             requested_budget,
             accepted_budget,
@@ -78,16 +74,8 @@ impl OrderReceipt {
         accepted_shares: Decimal,
         matched_shares: Decimal,
     ) -> Result<Self, ReceiptError> {
-        validate_not_greater_than_requested(
-            "accepted_qty",
-            accepted_shares,
-            requested_shares,
-        )?;
-        validate_not_greater_than_requested(
-            "filled_qty",
-            matched_shares,
-            requested_shares,
-        )?;
+        validate_not_greater_than_requested("accepted_qty", accepted_shares, requested_shares)?;
+        validate_not_greater_than_requested("filled_qty", matched_shares, requested_shares)?;
         Self::new(
             requested_shares,
             accepted_shares,

@@ -1,0 +1,11 @@
+[Unit]
+Description=polycopy-engine GHOST verification timer (read-only)
+Documentation=file:/opt/polycopy-engine/current/docs/LIVE_PROGRESSION_RUNBOOK.md
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=true
+Unit=polycopy-engine-ghost.service
+
+[Install]
+WantedBy=timers.target

@@ -86,6 +86,13 @@ pub trait StrictTokenBalanceReader: Send + Sync {
 #[async_trait]
 pub trait StrictAccountBalanceReader: StrictTokenBalanceReader {
     async fn collateral_balance_strict(&self) -> Result<Decimal, StrictCollateralError>;
+
+    /// Conservative usable collateral allowance.  The venue returns one or
+    /// more exchange allowances; the minimum reported value is used so an
+    /// order is never sent on the assumption that a different exchange
+    /// contract is approved.  Missing or malformed allowance data is a hard
+    /// error, not an implicit unlimited allowance.
+    async fn collateral_allowance_strict(&self) -> Result<Decimal, StrictCollateralError>;
 }
 
 /// Strict authenticated account-trade history. A failure is never an empty
@@ -310,6 +317,30 @@ impl StrictAccountBalanceReader for IntlClobReadAdapter {
             .map(|response| response.balance)
             .map_err(|source| StrictCollateralError::Query { source })
     }
+
+    async fn collateral_allowance_strict(&self) -> Result<Decimal, StrictCollateralError> {
+        let request = BalanceAllowanceRequest::builder()
+            .asset_type(AssetType::Collateral)
+            .build();
+
+        let response = self
+            .client
+            .balance_allowance(request)
+            .await
+            .map_err(|source| StrictCollateralError::Query { source })?;
+
+        response
+            .allowances
+            .into_values()
+            .map(|raw| {
+                raw.parse::<Decimal>()
+                    .map_err(|_| StrictCollateralError::InvalidAllowance { raw })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .min()
+            .ok_or(StrictCollateralError::MissingAllowance)
+    }
 }
 
 #[derive(Debug)]
@@ -343,6 +374,8 @@ impl Error for StrictPositionError {
 #[derive(Debug)]
 pub enum StrictCollateralError {
     Query { source: SdkError },
+    MissingAllowance,
+    InvalidAllowance { raw: String },
 }
 
 impl fmt::Display for StrictCollateralError {
@@ -354,6 +387,14 @@ impl fmt::Display for StrictCollateralError {
                     "strict collateral balance query failed: {source}"
                 )
             }
+            Self::MissingAllowance => write!(
+                formatter,
+                "strict collateral allowance query returned no exchange allowances"
+            ),
+            Self::InvalidAllowance { raw } => write!(
+                formatter,
+                "strict collateral allowance query returned an invalid allowance: {raw}"
+            ),
         }
     }
 }
@@ -362,6 +403,7 @@ impl Error for StrictCollateralError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Query { source } => Some(source),
+            Self::MissingAllowance | Self::InvalidAllowance { .. } => None,
         }
     }
 }

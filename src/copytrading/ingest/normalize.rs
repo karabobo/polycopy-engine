@@ -95,6 +95,8 @@ struct RawActivityPayload {
     trader: Option<RawTrader>,
     #[serde(default, rename = "proxyWallet")]
     proxy_wallet: Option<String>,
+    #[serde(default, rename = "isCombo")]
+    is_combo: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,11 +116,25 @@ pub fn parse(raw: &str) -> ParseResult {
         Err(_) => return ParseResult::Skip,
     };
 
-    if message.topic != "activity" || (message.message_type != "trades" && message.message_type != "orders_matched") {
+    if message.topic != "activity"
+        || (message.message_type != "trades" && message.message_type != "orders_matched")
+    {
         return ParseResult::Skip;
     }
 
     let payload = message.payload;
+
+    // Combination bets remain an explicit v1 exclusion (blueprint section
+    // 12). Grounded in PolyHermes's own source
+    // (`CopyOrderTrackingService.kt`: `if (trade.isCombo == true) { ...
+    // skip, never copy ... }`, fed from `isCombo` on the activity/trade
+    // response -- see `PolymarketClobApi.kt`'s `Activity` model). This
+    // project's Rust SDK does not expose that field on its typed response
+    // structs, so it is read directly from the raw WS payload here, the
+    // same way every other field in this parser already is.
+    if payload.is_combo == Some(true) {
+        return ParseResult::Rejected("combination bet (isCombo) excluded, v1 does not support it");
+    }
 
     if payload.asset.is_empty() || payload.condition_id.is_empty() {
         return ParseResult::Rejected("missing asset or conditionId");
@@ -252,7 +268,10 @@ mod tests {
         let ParseResult::Trade(trade) = result else {
             panic!("expected a parsed trade, got {result:?}");
         };
-        assert_eq!(trade.trader_address, "0xabcdef", "trader address must be lowercased");
+        assert_eq!(
+            trade.trader_address, "0xabcdef",
+            "trader address must be lowercased"
+        );
         assert_eq!(trade.token_id, "123456");
         assert_eq!(trade.condition_id, "0xcond");
         assert_eq!(trade.outcome_index, 0);
@@ -301,6 +320,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_trade_marked_is_combo_true() {
+        let raw = trade_message(r#","isCombo":true"#);
+        assert_eq!(
+            parse(&raw),
+            ParseResult::Rejected("combination bet (isCombo) excluded, v1 does not support it")
+        );
+    }
+
+    #[test]
+    fn accepts_a_trade_marked_is_combo_false() {
+        let raw = trade_message(r#","isCombo":false"#);
+        assert!(matches!(parse(&raw), ParseResult::Trade(_)));
+    }
+
+    #[test]
+    fn accepts_a_trade_with_no_is_combo_field_at_all() {
+        // Backward compatible: most real payloads (and every other test in
+        // this module) omit the field entirely.
+        assert!(matches!(parse(&trade_message("")), ParseResult::Trade(_)));
+    }
+
+    #[test]
     fn falls_back_to_proxy_wallet_when_trader_object_is_absent() {
         let raw = r#"{"topic":"activity","type":"trades","payload":{"asset":"1","conditionId":"0xc","outcomeIndex":0,"side":"SELL","price":"0.5","size":"1","timestamp":1735689600,"transactionHash":"0xh","proxyWallet":"0xFEDCBA"}}"#;
         let ParseResult::Trade(trade) = parse(raw) else {
@@ -340,7 +381,10 @@ mod tests {
 
     #[test]
     fn treats_a_timestamp_at_or_above_1e12_as_milliseconds_already() {
-        let raw = trade_message("").replace("\"timestamp\":1735689600,\"transactionHash\"", "\"timestamp\":1735689600000,\"transactionHash\"");
+        let raw = trade_message("").replace(
+            "\"timestamp\":1735689600,\"transactionHash\"",
+            "\"timestamp\":1735689600000,\"transactionHash\"",
+        );
         let ParseResult::Trade(trade) = parse(&raw) else {
             panic!("expected a parsed trade");
         };
@@ -352,8 +396,10 @@ mod tests {
         // Target the payload's timestamp specifically (the envelope also
         // carries an unrelated, ignored top-level timestamp field with the
         // same value) so this actually exercises string-timestamp parsing.
-        let raw = trade_message("")
-            .replace("\"timestamp\":1735689600,\"transactionHash\"", "\"timestamp\":\"1735689600\",\"transactionHash\"");
+        let raw = trade_message("").replace(
+            "\"timestamp\":1735689600,\"transactionHash\"",
+            "\"timestamp\":\"1735689600\",\"transactionHash\"",
+        );
         let ParseResult::Trade(trade) = parse(&raw) else {
             panic!("expected a parsed trade");
         };

@@ -310,8 +310,13 @@ pub fn read_record(path: &Path) -> Result<String, CanaryRecordError> {
 
 #[derive(Debug)]
 pub enum CanaryRecordError {
-    AlreadyExists { path: std::path::PathBuf },
-    Io { path: std::path::PathBuf, source: io::Error },
+    AlreadyExists {
+        path: std::path::PathBuf,
+    },
+    Io {
+        path: std::path::PathBuf,
+        source: io::Error,
+    },
 }
 
 impl fmt::Display for CanaryRecordError {
@@ -323,7 +328,11 @@ impl fmt::Display for CanaryRecordError {
                 path.display()
             ),
             Self::Io { path, source } => {
-                write!(formatter, "canary record I/O error at {}: {source}", path.display())
+                write!(
+                    formatter,
+                    "canary record I/O error at {}: {source}",
+                    path.display()
+                )
             }
         }
     }
@@ -363,11 +372,21 @@ mod tests {
     #[test]
     fn spec_rejects_a_price_at_or_outside_the_open_unit_interval() {
         assert!(matches!(
-            CanaryOrderSpec::new("123".to_owned(), CanarySide::Buy, Decimal::ZERO, Decimal::ONE),
+            CanaryOrderSpec::new(
+                "123".to_owned(),
+                CanarySide::Buy,
+                Decimal::ZERO,
+                Decimal::ONE
+            ),
             Err(CanarySpecError::PriceOutOfRange { .. })
         ));
         assert!(matches!(
-            CanaryOrderSpec::new("123".to_owned(), CanarySide::Buy, Decimal::ONE, Decimal::ONE),
+            CanaryOrderSpec::new(
+                "123".to_owned(),
+                CanarySide::Buy,
+                Decimal::ONE,
+                Decimal::ONE
+            ),
             Err(CanarySpecError::PriceOutOfRange { .. })
         ));
     }
@@ -435,7 +454,10 @@ mod tests {
             second_attempt,
             Err(CanaryRecordError::AlreadyExists { .. })
         ));
-        assert_eq!(read_record(&path).expect("record must be readable"), "first");
+        assert_eq!(
+            read_record(&path).expect("record must be readable"),
+            "first"
+        );
 
         fs::remove_file(path).expect("test artifact must be removable");
     }

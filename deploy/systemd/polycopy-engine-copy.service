@@ -1,0 +1,29 @@
+[Unit]
+Description=polycopy-engine bounded copy-execution progression
+Documentation=file:/opt/polycopy-engine/current/docs/LIVE_PROGRESSION_RUNBOOK.md
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/polycopy-engine/copy-public.env
+ConditionPathExists=/etc/polycopy-engine/credentials/copy-secrets.env
+ConditionPathExists=/opt/polycopy-engine/current/target/release/copy_run
+
+[Service]
+Type=exec
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/opt/polycopy-engine/current
+EnvironmentFile=/etc/polycopy-engine/copy-public.env
+LoadCredential=polycopy-copy-secrets:/etc/polycopy-engine/credentials/copy-secrets.env
+ExecStart=/opt/polycopy-engine/current/target/release/copy_run
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/polycopy-engine /var/log/polycopy-engine
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# There is intentionally no [Install] section. This unit is static and is
+# never enabled as a timer or boot service. Starting it requires a separate,
+# documented, human-reviewed Phase 0.5/Phase 7 gate decision.

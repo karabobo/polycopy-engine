@@ -65,8 +65,12 @@ pub enum DbError {
 impl fmt::Display for DbError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Connect(source) => write!(formatter, "unable to open the copy database: {source}"),
-            Self::Migration(source) => write!(formatter, "unable to apply database migrations: {source}"),
+            Self::Connect(source) => {
+                write!(formatter, "unable to open the copy database: {source}")
+            }
+            Self::Migration(source) => {
+                write!(formatter, "unable to apply database migrations: {source}")
+            }
         }
     }
 }
@@ -234,10 +238,12 @@ mod tests {
     async fn an_address_cannot_be_enabled_under_two_leaders_at_once() {
         let db = TestDb::new().await;
 
-        sqlx::query("INSERT INTO leader_config (id, label) VALUES (1, 'leader-one'), (2, 'leader-two')")
-            .execute(&*db)
-            .await
-            .expect("both leaders must insert");
+        sqlx::query(
+            "INSERT INTO leader_config (id, label) VALUES (1, 'leader-one'), (2, 'leader-two')",
+        )
+        .execute(&*db)
+        .await
+        .expect("both leaders must insert");
 
         sqlx::query(
             "INSERT INTO leader_wallet_aliases (leader_id, address) VALUES (1, '0x1111111111111111111111111111111111111111')",
@@ -261,9 +267,9 @@ mod tests {
     async fn migrating_twice_is_idempotent() {
         let path = unique_temp_db_path();
         open_and_migrate(&path).await.expect("first migration run");
-        let pool = open_and_migrate(&path)
-            .await
-            .expect("a second migration run against the same database must be a no-op, not an error");
+        let pool = open_and_migrate(&path).await.expect(
+            "a second migration run against the same database must be a no-op, not an error",
+        );
 
         pool.close().await;
         let _ = fs::remove_file(&path);
@@ -308,7 +314,10 @@ mod tests {
             .await
             .expect("event count must be queryable")
             .get(0);
-        assert_eq!(event_count, 1, "replay must not create a second canonical event");
+        assert_eq!(
+            event_count, 1,
+            "replay must not create a second canonical event"
+        );
     }
 
     #[tokio::test]
@@ -526,13 +535,17 @@ mod tests {
             .unwrap_or_else(|error| panic!("leader {leader_id}'s lot must insert: {error}"));
         }
 
-        let lot_count: i64 =
-            sqlx::query("SELECT COUNT(*) FROM position_lots WHERE account_id = 1 AND token_id = '123'")
-                .fetch_one(&*db)
-                .await
-                .expect("lot count must be queryable")
-                .get(0);
-        assert_eq!(lot_count, 2, "each leader must keep its own lot for the same token");
+        let lot_count: i64 = sqlx::query(
+            "SELECT COUNT(*) FROM position_lots WHERE account_id = 1 AND token_id = '123'",
+        )
+        .fetch_one(&*db)
+        .await
+        .expect("lot count must be queryable")
+        .get(0);
+        assert_eq!(
+            lot_count, 2,
+            "each leader must keep its own lot for the same token"
+        );
     }
 
     #[tokio::test]
@@ -564,7 +577,10 @@ mod tests {
         .await
         .expect("open case count must be queryable")
         .get(0);
-        assert_eq!(open_case_count, 1, "the case must be visible as open until resolved");
+        assert_eq!(
+            open_case_count, 1,
+            "the case must be visible as open until resolved"
+        );
     }
 
     #[tokio::test]

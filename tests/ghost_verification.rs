@@ -4,9 +4,9 @@ use std::{collections::HashMap, str::FromStr as _};
 
 use async_trait::async_trait;
 use polycopy_engine::{
-    BalanceVerification, ExpectedTokenBalance, GhostSnapshot, GhostVerifier, OutcomeTokenId,
-    StrictAccountBalanceReader, StrictCollateralError, StrictPositionError,
-    StrictTokenBalanceReader,
+    ghost_to_record, BalanceRecordStatus, BalanceVerification, ExpectedTokenBalance,
+    GhostRunRecord, GhostSnapshot, GhostVerifier, OutcomeTokenId, StrictAccountBalanceReader,
+    StrictCollateralError, StrictPositionError, StrictTokenBalanceReader,
 };
 use polymarket_client_sdk_v2::{error::Error as SdkError, types::Decimal};
 
@@ -199,4 +199,90 @@ impl StrictAccountBalanceReader for StubReader {
 
         Ok(self.collateral)
     }
+
+    async fn collateral_allowance_strict(&self) -> Result<Decimal, StrictCollateralError> {
+        if self.collateral_error {
+            return Err(StrictCollateralError::Query {
+                source: SdkError::validation("simulated GHOST allowance-query failure"),
+            });
+        }
+
+        Ok(self.collateral)
+    }
+}
+
+// Phase 7's 72-hour GHOST run needs one persistable record per run so a
+// later pass can reconcile the whole window without holding a venue
+// connection open the entire time -- these tests lock in that the record
+// faithfully reflects a real GhostVerification produced by the exact same
+// GhostVerifier::verify path the other tests in this file already exercise.
+
+#[tokio::test]
+async fn a_clean_report_produces_a_clean_record_with_no_error_fields() {
+    let token_id = token("123456789");
+    let snapshot = GhostSnapshot::new(
+        Decimal::from(50),
+        vec![ExpectedTokenBalance::new(
+            token_id.clone(),
+            Decimal::from(7),
+        )],
+    )
+    .expect("valid snapshot");
+    let reader = StubReader::matching(Decimal::from(50), [(token_id, Decimal::from(7))]);
+    let report = GhostVerifier::new(reader).verify(&snapshot).await;
+
+    let record = ghost_to_record(&report, "2026-09-01T00:00:00Z", "2026-09-01T00:00:01Z");
+
+    assert!(record.is_clean);
+    assert_eq!(record.snapshot_at_utc, "2026-09-01T00:00:00Z");
+    assert_eq!(record.checked_at_utc, "2026-09-01T00:00:01Z");
+    assert_eq!(record.collateral.status, BalanceRecordStatus::Match);
+    assert_eq!(record.collateral.error, None);
+    assert_eq!(record.token_balances.len(), 1);
+    assert_eq!(record.token_balances[0].token_id, "123456789");
+    assert_eq!(
+        record.token_balances[0].balance.status,
+        BalanceRecordStatus::Match
+    );
+}
+
+#[tokio::test]
+async fn a_query_failure_is_recorded_with_its_error_and_no_observed_value() {
+    let snapshot = GhostSnapshot::new(Decimal::from(50), vec![]).expect("valid snapshot");
+    let reader = StubReader::failing_collateral();
+    let report = GhostVerifier::new(reader).verify(&snapshot).await;
+
+    let record = ghost_to_record(&report, "2026-09-01T00:00:00Z", "2026-09-01T00:00:01Z");
+
+    assert!(!record.is_clean);
+    assert_eq!(record.collateral.status, BalanceRecordStatus::QueryFailed);
+    assert_eq!(record.collateral.observed, None);
+    assert!(record.collateral.error.is_some());
+}
+
+#[tokio::test]
+async fn a_mismatch_is_recorded_as_unclean_with_both_magnitudes() {
+    let snapshot = GhostSnapshot::new(Decimal::from(50), vec![]).expect("valid snapshot");
+    let reader = StubReader::matching(Decimal::from(49), []);
+    let report = GhostVerifier::new(reader).verify(&snapshot).await;
+
+    let record = ghost_to_record(&report, "2026-09-01T00:00:00Z", "2026-09-01T00:00:01Z");
+
+    assert!(!record.is_clean);
+    assert_eq!(record.collateral.status, BalanceRecordStatus::Mismatch);
+    assert_eq!(record.collateral.expected, "50");
+    assert_eq!(record.collateral.observed.as_deref(), Some("49"));
+}
+
+#[tokio::test]
+async fn a_record_round_trips_through_json() {
+    let snapshot = GhostSnapshot::new(Decimal::from(50), vec![]).expect("valid snapshot");
+    let reader = StubReader::matching(Decimal::from(50), []);
+    let report = GhostVerifier::new(reader).verify(&snapshot).await;
+    let record = ghost_to_record(&report, "2026-09-01T00:00:00Z", "2026-09-01T00:00:01Z");
+
+    let json = serde_json::to_string(&record).expect("record must serialize");
+    let restored: GhostRunRecord = serde_json::from_str(&json).expect("record must deserialize");
+
+    assert_eq!(restored, record);
 }

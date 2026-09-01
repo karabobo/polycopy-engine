@@ -9,9 +9,11 @@ until Phase 0.5 and Phase 7 pass, the server may run only authenticated
 read-only GHOST verification or an explicitly operator-confirmed Phase 0.5
 canary.
 
-There is no production copy-execution service yet. In particular,
-`CopyExecution::submit_exact_envelope` has no non-test implementation. Do not
-create, enable, or start a service that claims to perform automatic copying.
+The repository now contains a bounded copy-execution binary, including a real
+`submit_exact_envelope` adapter. It is intentionally **not deployed or
+enabled** by this document: the binary refuses to write unless all runtime
+gates are present, and the systemd unit is static. Do not create an automatic
+timer for copy execution.
 
 ## Layout and ownership
 
@@ -62,9 +64,9 @@ runtime evidence, or artifacts. It does not start, restart, enable, or install
 a service. A failed build remains non-current for diagnosis; do not delete it
 until the cause has been recorded.
 
-The `current` symlink is changed only after the remote build succeeds. Since
-this repository has no live execution unit, changing that symlink cannot send
-an order.
+The `current` symlink is changed only after the remote build succeeds. It does
+not start, restart, enable, or reload a unit, so changing it cannot send an
+order.
 
 ## Read-only GHOST unit
 
@@ -106,9 +108,24 @@ journalctl -u polycopy-engine-ghost.service --since '-10 min' --no-pager
 ```
 
 The unit has no `[Install]` section and therefore its systemd state is
-`static`, not enabled: it cannot be enabled for automatic execution. A passing
-GHOST check is evidence only of a matching read-only snapshot; it never
-authorizes trading.
+`static`, not enabled. A passing GHOST check is evidence only of a matching
+read-only snapshot; it never authorizes trading.
+
+## Disabled execution and GHOST operations
+
+After a release, `deploy/install-production-units.sh` may install the static
+copy unit and the disabled GHOST timer. It refuses to replace an existing unit,
+never creates either configuration file, never creates credentials, and never
+starts or enables anything. See
+[`LIVE_PROGRESSION_RUNBOOK.md`](LIVE_PROGRESSION_RUNBOOK.md) for the only
+permitted order of operations.
+
+The copy unit reads public, non-secret bounds from
+`/etc/polycopy-engine/copy-public.env` and signing/L2 material only through
+`LoadCredential=polycopy-copy-secrets`. In its bounded-progression mode it
+requires exactly one enabled leader, exactly one attempted order per process,
+and a per-order maximum no greater than 5 USDC. Any schedule mismatch, open
+reconciliation case, Activity WS failure, or REST backfill failure stops it.
 
 All deployment scripts are hard-locked to the SSH alias
 `aliyun-8-220-180-39` and use key-only, strict-host-key SSH options. Supplying
@@ -127,8 +144,8 @@ and independently reviewed:
 
 1. Phase 0.5 proves the exact `taker_order_id` recovery lookup after a truly
    lost response, not merely the submission response's order ID.
-2. The actual live order writer, current market/allowance checks, and its
-   failure-injection tests are implemented and reviewed separately.
+2. The live order writer, strict collateral preflight, market/allowance checks,
+   and its failure-injection tests are implemented and independently reviewed.
 3. Phase 7 historical replay, 72-hour GHOST verification, and bounded
    single-leader seven-day live progression complete with no unresolved drift.
 

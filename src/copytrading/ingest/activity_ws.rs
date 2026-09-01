@@ -11,8 +11,10 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use sqlx::SqlitePool;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{address_resolver::AddressResolver, apply::apply_trade, normalize, normalize::ParseResult};
 pub use super::apply::ProcessOutcome;
+use super::{
+    address_resolver::AddressResolver, apply::apply_trade, normalize, normalize::ParseResult,
+};
 
 pub const RTDS_URL: &str = "wss://ws-live-data.polymarket.com";
 const SUBSCRIBE_MESSAGE: &str = r#"{"action":"subscribe","subscriptions":[{"topic":"activity","type":"trades"},{"topic":"activity","type":"orders_matched"}]}"#;
@@ -45,7 +47,15 @@ pub async fn process_message(
         ParseResult::Rejected(reason) => return ProcessOutcome::Rejected(reason),
     };
     let transaction_hash = trade.transaction_hash.clone();
-    apply_trade(pool, resolver, &trade, "activity_ws", &transaction_hash, raw).await
+    apply_trade(
+        pool,
+        resolver,
+        &trade,
+        "activity_ws",
+        &transaction_hash,
+        raw,
+    )
+    .await
 }
 
 /// Runs the activity WebSocket connection forever, reconnecting with
@@ -69,7 +79,10 @@ pub async fn run(pool: SqlitePool, resolver: &AddressResolver) -> ! {
 /// is currently no clean-shutdown signal); every real exit path is an
 /// `Err`, including a graceful server-initiated close, so the caller always
 /// treats leaving this function as "reconnect".
-async fn run_once(pool: &SqlitePool, resolver: &AddressResolver) -> Result<std::convert::Infallible, ActivityWsError> {
+async fn run_once(
+    pool: &SqlitePool,
+    resolver: &AddressResolver,
+) -> Result<std::convert::Infallible, ActivityWsError> {
     ensure_crypto_provider_installed();
 
     let (ws_stream, _response) = tokio_tungstenite::connect_async(RTDS_URL)
@@ -236,7 +249,12 @@ mod tests {
         let db = TestDb::new().await;
         let resolver = AddressResolver::new();
 
-        let outcome = process_message(&db, &resolver, &trade_message("0xh1", "0xdeadbeef", 1735689600)).await;
+        let outcome = process_message(
+            &db,
+            &resolver,
+            &trade_message("0xh1", "0xdeadbeef", 1735689600),
+        )
+        .await;
         assert_eq!(outcome, ProcessOutcome::NotWatched);
     }
 
@@ -250,7 +268,12 @@ mod tests {
         let resolver = AddressResolver::new();
         resolver.reload([("0xleader".to_owned(), 1)]);
 
-        let outcome = process_message(&db, &resolver, &trade_message("0xh1", "0xleader", 1735689600)).await;
+        let outcome = process_message(
+            &db,
+            &resolver,
+            &trade_message("0xh1", "0xleader", 1735689600),
+        )
+        .await;
         assert_eq!(outcome, ProcessOutcome::LeaderNotActivated);
     }
 
@@ -262,7 +285,12 @@ mod tests {
         resolver.reload([("0xleader".to_owned(), 1)]);
 
         // 1735689600 is 2025-01-01T00:00:00Z -- before the 2026 activation.
-        let outcome = process_message(&db, &resolver, &trade_message("0xh1", "0xleader", 1735689600)).await;
+        let outcome = process_message(
+            &db,
+            &resolver,
+            &trade_message("0xh1", "0xleader", 1735689600),
+        )
+        .await;
         assert_eq!(outcome, ProcessOutcome::BeforeActivation);
     }
 
@@ -273,7 +301,12 @@ mod tests {
         let resolver = AddressResolver::new();
         resolver.reload([("0xleader".to_owned(), 1)]);
 
-        let outcome = process_message(&db, &resolver, &trade_message("0xh1", "0xleader", 1735689600)).await;
+        let outcome = process_message(
+            &db,
+            &resolver,
+            &trade_message("0xh1", "0xleader", 1735689600),
+        )
+        .await;
         assert_eq!(
             outcome,
             ProcessOutcome::Ingested {
@@ -300,7 +333,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replaying_the_same_message_twice_ingests_once_and_the_second_call_still_reports_ingested() {
+    async fn replaying_the_same_message_twice_ingests_once_and_the_second_call_still_reports_ingested(
+    ) {
         let db = TestDb::new().await;
         seed_activated_leader(&db, 1, "2020-01-01T00:00:00.000Z").await;
         let resolver = AddressResolver::new();
@@ -328,7 +362,8 @@ mod tests {
         resolver.reload([("0xleader".to_owned(), 1)]);
 
         let trades_message = trade_message("0xh1", "0xleader", 1735689600);
-        let orders_matched_message = trades_message.replace("\"type\":\"trades\"", "\"type\":\"orders_matched\"");
+        let orders_matched_message =
+            trades_message.replace("\"type\":\"trades\"", "\"type\":\"orders_matched\"");
 
         process_message(&db, &resolver, &trades_message).await;
         process_message(&db, &resolver, &orders_matched_message).await;

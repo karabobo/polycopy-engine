@@ -27,3 +27,4 @@
 /artifacts/
 /canary-artifacts/
 /ghost-artifacts/
+.DS_Store

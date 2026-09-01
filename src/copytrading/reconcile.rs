@@ -1,14 +1,13 @@
 //! Phase 5: prepared submission, strict venue API, and reconciliation. See
 //! `docs/COPY_ENGINE_BLUEPRINT.md` section 10.
 //!
-//! **`CopyExecution` has no implementation anywhere in this crate outside
-//! test code.** `submit_exact_envelope` is a real, live order-writing call
-//! against the venue -- the one action this project's assistant will never
-//! write or run, matching Phase 4's `OrderSubmitter` seam exactly. Everything
-//! else in this module is pure decision logic or database bookkeeping: the
-//! envelope-persistence critical section, the submission recovery matrix,
-//! and the retry-budget check are all built and fully tested here, against
-//! fakes, without any code that could place a live order.
+//! `CopyExecution` has one concrete implementation in
+//! `venue::intl_clob_exec`, used only by the default-disabled, bounded
+//! `copy_run` process. `submit_exact_envelope` is a real live order-writing
+//! call, so all other callers must remain test fakes or explicit future
+//! integrations. The envelope-persistence critical section, submission
+//! recovery matrix, and retry-budget check are independently tested against
+//! fakes without contacting the venue.
 //!
 //! Phase 0.5's canary (`docs/PHASE_0_5_CANARY_REPORT.md`) found that the
 //! SDK's `SignedOrder` has no `Deserialize` impl, so it cannot itself survive
@@ -24,14 +23,12 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
-use crate::{
-    venue::{
-        intl_clob::{
-            AccountTrade, AccountTradeRole, AccountTradeSide, AccountTradeStatus,
-            OutcomeTokenId, StrictTradeHistoryError, StrictTradeHistoryReader,
-        },
-        OrderReceipt,
+use crate::venue::{
+    intl_clob::{
+        AccountTrade, AccountTradeRole, AccountTradeSide, AccountTradeStatus, OutcomeTokenId,
+        StrictTradeHistoryError, StrictTradeHistoryReader,
     },
+    OrderReceipt,
 };
 
 /// Maximum submission attempts for one intent within [`RETRY_WINDOW_SECONDS`]
@@ -93,7 +90,10 @@ pub struct TradeHistoryWindow {
 }
 
 impl TradeHistoryWindow {
-    pub fn new(after: DateTime<Utc>, before: DateTime<Utc>) -> Result<Self, TradeHistoryRecoveryError> {
+    pub fn new(
+        after: DateTime<Utc>,
+        before: DateTime<Utc>,
+    ) -> Result<Self, TradeHistoryRecoveryError> {
         if after > before {
             return Err(TradeHistoryRecoveryError::InvalidWindow);
         }
@@ -156,10 +156,18 @@ impl fmt::Display for TradeHistoryRecoveryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidWindow => write!(formatter, "trade-history window ends before it starts"),
-            Self::InvalidTokenId => write!(formatter, "prepared envelope has an invalid outcome token ID"),
+            Self::InvalidTokenId => write!(
+                formatter,
+                "prepared envelope has an invalid outcome token ID"
+            ),
             Self::InvalidSide => write!(formatter, "prepared envelope has an invalid order side"),
-            Self::InvalidLimitPrice => write!(formatter, "prepared envelope has an invalid limit price"),
-            Self::UnsupportedOrderType => write!(formatter, "trade-history recovery only supports FAK envelopes"),
+            Self::InvalidLimitPrice => {
+                write!(formatter, "prepared envelope has an invalid limit price")
+            }
+            Self::UnsupportedOrderType => write!(
+                formatter,
+                "trade-history recovery only supports FAK envelopes"
+            ),
             Self::MissingOrderFingerprint => write!(
                 formatter,
                 "prepared envelope has no precomputed taker-order identifier"
@@ -234,7 +242,8 @@ pub fn recover_fak_taker_order_from_trades(
     ) {
         return Err(TradeHistoryRecoveryError::InvalidSignedOrderJson);
     }
-    if envelope.token_id.is_empty() || !envelope.token_id.bytes().all(|byte| byte.is_ascii_digit()) {
+    if envelope.token_id.is_empty() || !envelope.token_id.bytes().all(|byte| byte.is_ascii_digit())
+    {
         return Err(TradeHistoryRecoveryError::InvalidTokenId);
     }
     let side = match envelope.side.as_str() {
@@ -320,8 +329,36 @@ pub trait CopyExecution {
     fn submit_exact_envelope(
         &self,
         envelope: &PreparedOrderEnvelope,
-    ) -> impl std::future::Future<Output = Result<OrderReceipt, String>> + Send;
+    ) -> impl std::future::Future<Output = Result<OrderReceipt, SubmitError>> + Send;
 }
+
+/// Distinguishes a local failure (the request never left this process) from
+/// a transport failure (the request may have crossed the venue boundary)
+/// from a definitive venue rejection (no `order_id` was created).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitError {
+    /// Reconstruction, validation, or other local work failed. The attempt
+    /// must not be marked `uncertain` because nothing was submitted.
+    Local(String),
+    /// A network/timeout/5xx error after the request may have been sent.
+    /// The attempt becomes `uncertain` and is never retried automatically.
+    Transport(String),
+    /// The venue processed the request and refused it before creating an
+    /// order (HTTP 4xx, including the live `invalid. Duplicated.` case).
+    Rejected(String),
+}
+
+impl fmt::Display for SubmitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local(detail) => write!(formatter, "local submission error: {detail}"),
+            Self::Transport(detail) => write!(formatter, "transport submission error: {detail}"),
+            Self::Rejected(detail) => write!(formatter, "venue rejected order: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for SubmitError {}
 
 /// Reads the existing envelope persisted for `(intent_id, attempt_number)`,
 /// or -- if none exists -- persists `candidate` as the one envelope for
@@ -340,7 +377,10 @@ pub async fn load_or_prepare_attempt(
     candidate: &PreparedOrderEnvelope,
 ) -> Result<PreparedOrderEnvelope, ReconcileError> {
     let mut conn = pool.acquire().await.map_err(db_err)?;
-    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await.map_err(db_err)?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
 
     let result: Result<PreparedOrderEnvelope, ReconcileError> = async {
         let existing: Option<String> = sqlx::query_scalar(
@@ -375,7 +415,10 @@ pub async fn load_or_prepare_attempt(
 
     match &result {
         Ok(_) => {
-            sqlx::query("COMMIT").execute(&mut *conn).await.map_err(db_err)?;
+            sqlx::query("COMMIT")
+                .execute(&mut *conn)
+                .await
+                .map_err(db_err)?;
         }
         Err(_) => {
             let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
@@ -443,6 +486,35 @@ pub async fn mark_attempt_uncertain_after_submission_error(
     Ok(())
 }
 
+/// Records a definitive venue rejection. The attempt did create a durable
+/// response (HTTP 4xx, no `order_id`); it is not `uncertain` and a later
+/// cycle may prepare a new attempt if retry budget remains.
+pub async fn mark_attempt_rejected(
+    pool: &SqlitePool,
+    intent_id: i64,
+    attempt_id: i64,
+    failure_detail: &str,
+) -> Result<(), ReconcileError> {
+    let result = sqlx::query(
+        "UPDATE order_attempts \
+         SET status = 'rejected', failure_detail = ?, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE id = ? AND intent_id = ? AND status IN ('submitting', 'prepared')",
+    )
+    .bind(failure_detail)
+    .bind(attempt_id)
+    .bind(intent_id)
+    .execute(pool)
+    .await
+    .map_err(db_err)?;
+
+    if result.rows_affected() != 1 {
+        return Err(ReconcileError::InvalidAttemptTransition);
+    }
+
+    Ok(())
+}
+
 struct PendingTradeHistoryRecovery {
     envelope: PreparedOrderEnvelope,
     window: TradeHistoryWindow,
@@ -470,14 +542,16 @@ async fn load_pending_trade_history_recovery(
     if !matches!(status.as_str(), "submitting" | "uncertain") {
         return Err(ReconcileError::InvalidAttemptTransition);
     }
-    let submission_started_at = submission_started_at.ok_or(ReconcileError::MissingSubmissionStartedAt)?;
+    let submission_started_at =
+        submission_started_at.ok_or(ReconcileError::MissingSubmissionStartedAt)?;
     let submission_started_at = DateTime::parse_from_rfc3339(&submission_started_at)
         .map_err(|_| ReconcileError::InvalidSubmissionStartedAt)?
         .with_timezone(&Utc);
     if submission_started_at > queried_at {
         return Err(ReconcileError::InvalidSubmissionWindow);
     }
-    let envelope = serde_json::from_str(&envelope_json).map_err(|_| ReconcileError::InvalidEnvelope)?;
+    let envelope =
+        serde_json::from_str(&envelope_json).map_err(|_| ReconcileError::InvalidEnvelope)?;
     let window = TradeHistoryWindow::new(
         submission_started_at - chrono::Duration::seconds(TRADE_HISTORY_TIMESTAMP_SKEW_SECONDS),
         queried_at,
@@ -530,21 +604,22 @@ pub async fn recover_lost_submission_response<R>(
 where
     R: StrictTradeHistoryReader + ?Sized,
 {
-    let pending = match load_pending_trade_history_recovery(pool, intent_id, attempt_id, queried_at).await {
-        Ok(pending) => pending,
-        Err(error @ ReconcileError::Database(_)) => return Err(error),
-        Err(error) => {
-            open_reconciliation_case(
-                pool,
-                intent_id,
-                Some(attempt_id),
-                "unknown_submission",
-                &format!("submission recovery could not start: {error}"),
-            )
-            .await?;
-            return Ok(LostSubmissionRecoveryOutcome::NeedsReconcile);
-        }
-    };
+    let pending =
+        match load_pending_trade_history_recovery(pool, intent_id, attempt_id, queried_at).await {
+            Ok(pending) => pending,
+            Err(error @ ReconcileError::Database(_)) => return Err(error),
+            Err(error) => {
+                open_reconciliation_case(
+                    pool,
+                    intent_id,
+                    Some(attempt_id),
+                    "unknown_submission",
+                    &format!("submission recovery could not start: {error}"),
+                )
+                .await?;
+                return Ok(LostSubmissionRecoveryOutcome::NeedsReconcile);
+            }
+        };
 
     match lookup_prepared_fak_in_trade_history(reader, &pending.envelope, pending.window).await {
         Ok(TradeHistoryLookup::Recovered { order_id, .. }) => {
@@ -751,12 +826,29 @@ impl fmt::Display for ReconcileError {
         match self {
             Self::Database(error) => write!(formatter, "database error: {error}"),
             Self::InvalidEnvelope => write!(formatter, "invalid or unparseable order envelope"),
-            Self::AttemptNotFound => write!(formatter, "order attempt was not found for this intent"),
-            Self::InvalidAttemptTransition => write!(formatter, "order attempt is not in the required recovery state"),
-            Self::MissingSubmissionStartedAt => write!(formatter, "order attempt has no durable submission-start timestamp"),
-            Self::InvalidSubmissionStartedAt => write!(formatter, "order attempt has an invalid submission-start timestamp"),
-            Self::InvalidSubmissionWindow => write!(formatter, "order attempt has an invalid submission recovery window"),
-            Self::ConflictingRecoveredOrderId => write!(formatter, "order attempt already records a different venue order ID"),
+            Self::AttemptNotFound => {
+                write!(formatter, "order attempt was not found for this intent")
+            }
+            Self::InvalidAttemptTransition => write!(
+                formatter,
+                "order attempt is not in the required recovery state"
+            ),
+            Self::MissingSubmissionStartedAt => write!(
+                formatter,
+                "order attempt has no durable submission-start timestamp"
+            ),
+            Self::InvalidSubmissionStartedAt => write!(
+                formatter,
+                "order attempt has an invalid submission-start timestamp"
+            ),
+            Self::InvalidSubmissionWindow => write!(
+                formatter,
+                "order attempt has an invalid submission recovery window"
+            ),
+            Self::ConflictingRecoveredOrderId => write!(
+                formatter,
+                "order attempt already records a different venue order ID"
+            ),
         }
     }
 }
@@ -793,7 +885,9 @@ mod tests {
                 "polycopy-engine-reconcile-test-{}-{nonce}-{counter}.sqlite",
                 process::id()
             ));
-            let pool = open_and_migrate(&path).await.expect("migrations must apply to a fresh database");
+            let pool = open_and_migrate(&path)
+                .await
+                .expect("migrations must apply to a fresh database");
             Self { pool, path }
         }
     }
@@ -966,12 +1060,9 @@ mod tests {
             ),
         ];
 
-        let recovered = recover_fak_taker_order_from_trades(
-            &envelope(42),
-            trade_history_window(),
-            &trades,
-        )
-        .expect("a valid trade history must be matchable");
+        let recovered =
+            recover_fak_taker_order_from_trades(&envelope(42), trade_history_window(), &trades)
+                .expect("a valid trade history must be matchable");
 
         assert_eq!(
             recovered,
@@ -994,12 +1085,9 @@ mod tests {
             1,
         )];
 
-        let recovered = recover_fak_taker_order_from_trades(
-            &envelope(42),
-            trade_history_window(),
-            &trades,
-        )
-        .expect("a better-priced BUY fill can exceed the requested budget value");
+        let recovered =
+            recover_fak_taker_order_from_trades(&envelope(42), trade_history_window(), &trades)
+                .expect("a better-priced BUY fill can exceed the requested budget value");
 
         assert!(matches!(
             recovered,
@@ -1165,24 +1253,28 @@ mod tests {
             }
         );
 
-        let row: (Option<String>, String) = sqlx::query_as(
-            "SELECT venue_order_id, status FROM order_attempts WHERE id = ?",
-        )
-        .bind(attempt_id)
-        .fetch_one(&*db)
-        .await
-        .expect("recovered ID must be durable");
+        let row: (Option<String>, String) =
+            sqlx::query_as("SELECT venue_order_id, status FROM order_attempts WHERE id = ?")
+                .bind(attempt_id)
+                .fetch_one(&*db)
+                .await
+                .expect("recovered ID must be durable");
         assert_eq!(row.0.as_deref(), Some("order-a"));
-        assert_eq!(row.1, "uncertain", "receipt still requires strict by-ID confirmation");
+        assert_eq!(
+            row.1, "uncertain",
+            "receipt still requires strict by-ID confirmation"
+        );
 
-        let case_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ?",
-        )
-        .bind(intent_id)
-        .fetch_one(&*db)
-        .await
-        .expect("case query must succeed");
-        assert_eq!(case_count, 0, "a uniquely recovered ID is not a receipt or a failure");
+        let case_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ?")
+                .bind(intent_id)
+                .fetch_one(&*db)
+                .await
+                .expect("case query must succeed");
+        assert_eq!(
+            case_count, 0,
+            "a uniquely recovered ID is not a receipt or a failure"
+        );
     }
 
     #[tokio::test]
@@ -1204,17 +1296,19 @@ mod tests {
         .expect("an empty history is handled by the fail-closed recovery path");
         assert_eq!(outcome, LostSubmissionRecoveryOutcome::NeedsReconcile);
 
-        let intent_status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
-            .bind(intent_id)
-            .fetch_one(&*db)
-            .await
-            .expect("intent must remain queryable");
+        let intent_status: String =
+            sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+                .bind(intent_id)
+                .fetch_one(&*db)
+                .await
+                .expect("intent must remain queryable");
         assert_eq!(intent_status, "needs_reconcile");
-        let attempt_status: String = sqlx::query_scalar("SELECT status FROM order_attempts WHERE id = ?")
-            .bind(attempt_id)
-            .fetch_one(&*db)
-            .await
-            .expect("attempt must remain queryable");
+        let attempt_status: String =
+            sqlx::query_scalar("SELECT status FROM order_attempts WHERE id = ?")
+                .bind(attempt_id)
+                .fetch_one(&*db)
+                .await
+                .expect("attempt must remain queryable");
         assert_eq!(attempt_status, "uncertain");
 
         // Re-running a delayed-history query must not manufacture a second
@@ -1329,15 +1423,19 @@ mod tests {
         let db = TestDb::new().await;
         let intent_id = seed_intent(&db).await;
 
-        let persisted = load_or_prepare_attempt(&db, intent_id, 1, &envelope(42)).await.unwrap();
+        let persisted = load_or_prepare_attempt(&db, intent_id, 1, &envelope(42))
+            .await
+            .unwrap();
         assert_eq!(persisted.salt, 42);
 
-        let row_count: i64 = sqlx::query("SELECT COUNT(*) FROM order_attempts WHERE intent_id = ? AND attempt_number = 1")
-            .bind(intent_id)
-            .fetch_one(&*db)
-            .await
-            .unwrap()
-            .get(0);
+        let row_count: i64 = sqlx::query(
+            "SELECT COUNT(*) FROM order_attempts WHERE intent_id = ? AND attempt_number = 1",
+        )
+        .bind(intent_id)
+        .fetch_one(&*db)
+        .await
+        .unwrap()
+        .get(0);
         assert_eq!(row_count, 1);
     }
 
@@ -1359,15 +1457,23 @@ mod tests {
         let first = first.expect("first caller must succeed");
         let second = second.expect("second caller must succeed");
 
-        assert_eq!(first, second, "both callers must observe the same, single persisted envelope");
+        assert_eq!(
+            first, second,
+            "both callers must observe the same, single persisted envelope"
+        );
 
-        let row_count: i64 = sqlx::query("SELECT COUNT(*) FROM order_attempts WHERE intent_id = ? AND attempt_number = 1")
-            .bind(intent_id)
-            .fetch_one(&*db)
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(row_count, 1, "exactly one row, whichever candidate won the race");
+        let row_count: i64 = sqlx::query(
+            "SELECT COUNT(*) FROM order_attempts WHERE intent_id = ? AND attempt_number = 1",
+        )
+        .bind(intent_id)
+        .fetch_one(&*db)
+        .await
+        .unwrap()
+        .get(0);
+        assert_eq!(
+            row_count, 1,
+            "exactly one row, whichever candidate won the race"
+        );
     }
 
     #[tokio::test]
@@ -1375,21 +1481,46 @@ mod tests {
         let db = TestDb::new().await;
         let intent_id = seed_intent(&db).await;
 
-        let first = load_or_prepare_attempt(&db, intent_id, 1, &envelope(1)).await.unwrap();
-        let second = load_or_prepare_attempt(&db, intent_id, 1, &envelope(999)).await.unwrap();
+        let first = load_or_prepare_attempt(&db, intent_id, 1, &envelope(1))
+            .await
+            .unwrap();
+        let second = load_or_prepare_attempt(&db, intent_id, 1, &envelope(999))
+            .await
+            .unwrap();
 
         assert_eq!(first, second);
-        assert_eq!(second.salt, 1, "the second call's own candidate salt (999) must never be used");
+        assert_eq!(
+            second.salt, 1,
+            "the second call's own candidate salt (999) must never be used"
+        );
     }
 
     #[test]
     fn the_recovery_matrix_matches_every_documented_state() {
-        assert_eq!(permitted_recovery_action("prepared", true, 0), RecoveryAction::MarkSubmittingThenSubmit);
-        assert_eq!(permitted_recovery_action("submitting", true, 0), RecoveryAction::QueryFirst);
-        assert_eq!(permitted_recovery_action("uncertain", true, 0), RecoveryAction::QueryFirst);
-        assert_eq!(permitted_recovery_action("accepted", true, 0), RecoveryAction::ReconcileOrFinalize);
-        assert_eq!(permitted_recovery_action("finalized", true, 0), RecoveryAction::ReconcileOrFinalize);
-        assert_eq!(permitted_recovery_action("rejected", true, 0), RecoveryAction::MayPrepareNewAttempt);
+        assert_eq!(
+            permitted_recovery_action("prepared", true, 0),
+            RecoveryAction::MarkSubmittingThenSubmit
+        );
+        assert_eq!(
+            permitted_recovery_action("submitting", true, 0),
+            RecoveryAction::QueryFirst
+        );
+        assert_eq!(
+            permitted_recovery_action("uncertain", true, 0),
+            RecoveryAction::QueryFirst
+        );
+        assert_eq!(
+            permitted_recovery_action("accepted", true, 0),
+            RecoveryAction::ReconcileOrFinalize
+        );
+        assert_eq!(
+            permitted_recovery_action("finalized", true, 0),
+            RecoveryAction::ReconcileOrFinalize
+        );
+        assert_eq!(
+            permitted_recovery_action("rejected", true, 0),
+            RecoveryAction::MayPrepareNewAttempt
+        );
     }
 
     #[test]
@@ -1397,8 +1528,14 @@ mod tests {
         // The core of "a crash after the request may have crossed the
         // network boundary never causes a direct resubmission on restart":
         // `submitting` found on restart must query first, never resubmit.
-        assert_ne!(permitted_recovery_action("submitting", true, 0), RecoveryAction::MarkSubmittingThenSubmit);
-        assert_eq!(permitted_recovery_action("submitting", true, 0), RecoveryAction::QueryFirst);
+        assert_ne!(
+            permitted_recovery_action("submitting", true, 0),
+            RecoveryAction::MarkSubmittingThenSubmit
+        );
+        assert_eq!(
+            permitted_recovery_action("submitting", true, 0),
+            RecoveryAction::QueryFirst
+        );
     }
 
     #[test]
@@ -1425,7 +1562,14 @@ mod tests {
         let intent_id = seed_intent(&db).await;
 
         for attempt_number in 1..=3 {
-            load_or_prepare_attempt(&db, intent_id, attempt_number, &envelope(attempt_number as u64)).await.unwrap();
+            load_or_prepare_attempt(
+                &db,
+                intent_id,
+                attempt_number,
+                &envelope(attempt_number as u64),
+            )
+            .await
+            .unwrap();
         }
         // A different intent's attempts must not be counted here.
         sqlx::query("INSERT INTO leader_config (id, label) VALUES (2, 'leader-two')")
@@ -1442,9 +1586,15 @@ mod tests {
         let db = TestDb::new().await;
         let intent_id = seed_intent(&db).await;
 
-        open_reconciliation_case(&db, intent_id, None, "strict_query_failure", "mock venue query error")
-            .await
-            .unwrap();
+        open_reconciliation_case(
+            &db,
+            intent_id,
+            None,
+            "strict_query_failure",
+            "mock venue query error",
+        )
+        .await
+        .unwrap();
 
         let status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
             .bind(intent_id)
@@ -1484,12 +1634,146 @@ mod tests {
         .await
         .unwrap();
 
-        crate::copytrading::execute::finalize_receipt(&db, intent_id, attempt_id, &receipt).await.unwrap();
+        crate::copytrading::execute::finalize_receipt(&db, intent_id, attempt_id, &receipt)
+            .await
+            .unwrap();
 
         let lot_qty: String = sqlx::query_scalar("SELECT qty FROM position_lots WHERE account_id = 1 AND leader_id = 1 AND token_id = '123456'")
             .fetch_one(&*db)
             .await
             .unwrap();
-        assert_eq!(lot_qty, "2", "the lot must reflect only the matched quantity, never the requested one");
+        assert_eq!(
+            lot_qty, "2",
+            "the lot must reflect only the matched quantity, never the requested one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_crash_between_dispatch_and_receipt_recovers_to_exactly_one_lot_no_resubmission() {
+        // Phase 7 required test: "process death after request dispatch but
+        // before receipt persistence, followed by recovery without a
+        // duplicate lot or unsafe resubmission." Chains the actual recovery
+        // path (recover_lost_submission_response) into the actual
+        // finalization path (execute::finalize_receipt) end to end, the way
+        // a restarted orchestrator would really walk it -- not just the
+        // individual pieces each already-passing unit test covers alone.
+        let db = TestDb::new().await;
+        // "Process death after request dispatch": the attempt was marked
+        // `submitting` (the request may have crossed the network boundary)
+        // and the process then died before ever reading a response.
+        let (intent_id, attempt_id, _started_at) = prepared_submitting_attempt(&db).await;
+
+        // "Recovery": on restart, a read-only trade-history query finds the
+        // exact taker order this attempt's envelope precomputed.
+        let reader = FakeTradeHistoryReader {
+            reply: FakeTradeHistoryReply::Trades(vec![account_trade(
+                "trade-a",
+                "order-a",
+                AccountTradeSide::Buy,
+                Decimal::new(49, 2),
+                Decimal::new(5_288_460, 6),
+                AccountTradeRole::Taker,
+                1,
+            )]),
+        };
+        let outcome = recover_lost_submission_response(
+            &db,
+            &reader,
+            intent_id,
+            attempt_id,
+            trade_history_window().before(),
+        )
+        .await
+        .expect("recovery must succeed");
+        assert_eq!(
+            outcome,
+            LostSubmissionRecoveryOutcome::Recovered {
+                order_id: OrderId("order-a".to_owned())
+            }
+        );
+
+        // Recovery alone must never touch position_lots -- it only attaches
+        // an ID; a lot may change only once the normal strict by-ID receipt
+        // lookup (simulated here) confirms the fill and finalize_receipt
+        // runs.
+        let lots_before_finalize: i64 = sqlx::query("SELECT COUNT(*) FROM position_lots")
+            .fetch_one(&*db)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(lots_before_finalize, 0);
+
+        let receipt = OrderReceipt::from_fak_buy_budget(
+            Decimal::new(5, 0),
+            Decimal::new(5, 0),
+            Decimal::new(5_288_460, 6),
+        )
+        .unwrap();
+        crate::copytrading::execute::finalize_receipt(&db, intent_id, attempt_id, &receipt)
+            .await
+            .unwrap();
+
+        let lot_qty: String = sqlx::query_scalar(
+            "SELECT qty FROM position_lots WHERE account_id = 1 AND leader_id = 1 AND token_id = '123456'",
+        )
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        assert_eq!(lot_qty, "5.288460");
+        let lot_count: i64 = sqlx::query("SELECT COUNT(*) FROM position_lots")
+            .fetch_one(&*db)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(lot_count, 1, "exactly one lot row, never a duplicate");
+
+        // "No unsafe resubmission": if the recovery walk (or its caller)
+        // runs a second time -- e.g. the orchestrator retries after another
+        // restart -- neither recovery nor finalize may double anything.
+        let second_outcome = recover_lost_submission_response(
+            &db,
+            &reader,
+            intent_id,
+            attempt_id,
+            trade_history_window().before(),
+        )
+        .await
+        .expect("re-running recovery on an already-recovered attempt must not error");
+        assert_eq!(
+            second_outcome,
+            LostSubmissionRecoveryOutcome::Recovered {
+                order_id: OrderId("order-a".to_owned())
+            },
+            "recovery is idempotent: it reports the same already-recorded ID, not a fresh submission"
+        );
+        crate::copytrading::execute::finalize_receipt(&db, intent_id, attempt_id, &receipt)
+            .await
+            .expect("re-finalizing the identical receipt must not error");
+
+        let lot_qty_after_replay: String = sqlx::query_scalar(
+            "SELECT qty FROM position_lots WHERE account_id = 1 AND leader_id = 1 AND token_id = '123456'",
+        )
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        assert_eq!(
+            lot_qty_after_replay, "5.288460",
+            "replaying recovery+finalize must leave the lot exactly where it was, never double it"
+        );
+        let lot_count_after_replay: i64 = sqlx::query("SELECT COUNT(*) FROM position_lots")
+            .fetch_one(&*db)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(lot_count_after_replay, 1);
+        let case_count: i64 = sqlx::query("SELECT COUNT(*) FROM reconciliation_cases")
+            .fetch_one(&*db)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            case_count, 0,
+            "a clean recovery must never open a reconciliation case"
+        );
     }
 }

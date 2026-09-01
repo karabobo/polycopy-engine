@@ -19,6 +19,9 @@ pub mod canary_run;
 pub mod ghost;
 
 #[cfg(feature = "intl_clob")]
+pub mod ghost_drift;
+
+#[cfg(feature = "intl_clob")]
 pub mod ghost_run;
 
 pub use engine_lock::{EngineLock, EngineLockError};
@@ -26,9 +29,13 @@ pub use venue::{OrderReceipt, ReceiptError};
 
 #[cfg(feature = "intl_clob")]
 pub use ghost::{
-    BalanceVerification, ExpectedTokenBalance, GhostSnapshot, GhostSnapshotError,
-    GhostVerification, GhostVerifier, TokenBalanceVerification,
+    to_record as ghost_to_record, BalanceRecord, BalanceRecordStatus, BalanceVerification,
+    ExpectedTokenBalance, GhostRunRecord, GhostSnapshot, GhostSnapshotError, GhostVerification,
+    GhostVerifier, TokenBalanceRecord, TokenBalanceVerification,
 };
+
+#[cfg(feature = "intl_clob")]
+pub use ghost_drift::{build_drift_report, DriftGap, DriftReport};
 
 #[cfg(feature = "intl_clob")]
 pub use venue::intl_clob::{

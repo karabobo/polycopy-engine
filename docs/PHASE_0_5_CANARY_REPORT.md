@@ -287,6 +287,15 @@ but not yet queried and checked in a live run.
       mock server — doing that would need the CLOB host and authentication to
       be injectable for tests, which is not yet built. That remains open.
 
+The probe now also has a separate, read-only
+`POLYCOPY_CANARY_VERIFY_TRADE_LOOKUP=yes` mode. Given a persisted expected
+order ID and the token, it queries authenticated trade history over a bounded
+24-hour window and writes an exact `taker_order_id` match/miss/failure record.
+It never builds, signs, submits, retries, or duplicates an order. Running this
+against a known matched canary is the remaining live-only evidence required by
+the first checkbox; until its record exists and is independently reviewed, the
+gate remains not passed.
+
 Decision: **not passed until every box is checked and independently reviewed.**
 Three of the four boxes now have a live-tested answer; two of those three are
 positive. Confirmed in the negative: the field-based fallback lookup does not

@@ -7,11 +7,11 @@
 use std::{collections::HashMap, env, error::Error, fmt, fs, path::PathBuf, str::FromStr};
 
 use polymarket_client_sdk_v2::{
-    POLYGON,
     auth::{Credentials, LocalSigner, Signer as _},
-    clob::{Client, Config, types::SignatureType},
+    clob::{types::SignatureType, Client, Config},
     error::Error as SdkError,
     types::{Address, DateTime, Decimal},
+    POLYGON,
 };
 
 use crate::{

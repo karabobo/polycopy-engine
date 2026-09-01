@@ -10,10 +10,10 @@ does not vendor DRADIS source code or preserve DRADIS commit history.
 The exact audit reference and this independent-implementation decision are
 recorded in [`docs/DRADIS_REFERENCE_BASELINE.md`](docs/DRADIS_REFERENCE_BASELINE.md).
 
-No automated copy-trading client is enabled. The only order-writing code is
-the narrowly scoped Phase 0.5 canary probe below, which is a dry run unless
-the operator explicitly opts in. The broader copy-execution path remains
-blocked until the Phase 0.5 and Phase 7 gates in the blueprint are completed.
+No automated copy-trading client is enabled. The repository contains both a
+narrow Phase 0.5 canary and a bounded copy-execution binary, but neither is
+deployed or enabled. The copy binary requires explicit runtime gates and
+remains blocked until the Phase 0.5 and Phase 7 gates in the blueprint pass.
 
 ## Current development status
 
@@ -36,9 +36,10 @@ durably accepted or explicitly rejected `copy_intent`. Phase 4 claims an
 intent, sizes and reserves it, and finalizes an idempotent receipt into
 `position_lots`. Phase 5 adds the durably persisted order envelope, the
 submission recovery matrix, and the retry budget that govern how a claimed
-intent is actually submitted — but `submit_exact_envelope`, the one call
-that would write a live order, has **no implementation anywhere in this
-crate**, and this project's assistant will never write or run that code.
+intent is actually submitted. The real writer reconstructs one persisted,
+signed envelope and submits it once; transport uncertainty never retries and
+instead enters query-first reconciliation. It is still not permission to trade:
+see the production gates below.
 Phase 6 adds a read-only leader/intent/lot/reconciliation status layer and
 full attempt-to-event-to-account traceability; it writes nothing. See
 "Database (Phase 1)", "Activity ingestion (Phase 2)", "Intent planning
@@ -54,21 +55,22 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo build --release --all-features --locked
 ```
 
-The project's only live-order path is the `canary_probe` command below,
-gated behind an explicit operator-set environment variable and used solely to
-produce the evidence required by the Phase 0.5 gate. See
+The `canary_probe` command remains the only permitted live-order path before
+Phase 0.5 closes. It is gated behind an explicit operator-set environment
+variable and is used solely to produce the evidence required by that gate. See
 [`docs/PHASE_0_STATUS.md`](docs/PHASE_0_STATUS.md) for Phase 0's closed
 status and [`docs/PHASE_0_5_CANARY_REPORT.md`](docs/PHASE_0_5_CANARY_REPORT.md)
 for the required real-order safety evidence template.
 
-The execution host's release, GHOST-only systemd unit, secret boundary, and
-production-promotion gates are documented in
-[`docs/SERVER_DEPLOYMENT.md`](docs/SERVER_DEPLOYMENT.md). The deployment
-scripts do not install or start a copy-trading service.
+The execution host's release, default-disabled systemd units, secret boundary,
+and production-promotion gates are documented in
+[`docs/SERVER_DEPLOYMENT.md`](docs/SERVER_DEPLOYMENT.md) and
+[`docs/LIVE_PROGRESSION_RUNBOOK.md`](docs/LIVE_PROGRESSION_RUNBOOK.md). The
+deployment scripts do not start or enable a copy-trading service.
 
-The optional `intl_clob` feature enables **read-only**, strict per-outcome
-token balances and authenticated account-trade-history reads. It has no
-order-writing API; see
+The optional `intl_clob` feature provides strict per-outcome token balances
+and authenticated account-trade-history reads. The execution feature adds one
+narrow, default-disabled order-writing adapter; see
 [`docs/INTL_CLOB_SDK_BOUNDARY.md`](docs/INTL_CLOB_SDK_BOUNDARY.md).
 
 ## Authenticated GHOST verification
@@ -364,13 +366,11 @@ The `execute` feature also gates `polycopy_engine::copytrading::reconcile`
 (blueprint section 10): the layer between a sized, reserved intent and the
 venue. It defines a generic `CopyExecution` trait —
 `position_for_token_strict`, `order_for_receipt`,
-`query_prepared_envelope`, and `submit_exact_envelope` — and, exactly like
-Phase 4's `OrderSubmitter`, **`CopyExecution` has no implementation
-anywhere in this crate outside test code.** `submit_exact_envelope` is the
-one call that would write a live order; this project's assistant will
-never write or run it. See
-[`docs/LIVE_EXECUTION_HANDOFF.md`](docs/LIVE_EXECUTION_HANDOFF.md) for the
-handoff spec a hired developer would need to close this specific gap.
+`query_prepared_envelope`, and `submit_exact_envelope`. The `execute` feature
+implements this adapter only for the bounded `copy_run` process. It accepts
+one persisted envelope, never rebuilds it after a transport error, and remains
+default-disabled until every production gate passes. See
+[`docs/LIVE_PROGRESSION_RUNBOOK.md`](docs/LIVE_PROGRESSION_RUNBOOK.md).
 
 What Phase 5 does implement, and test without ever calling a real venue,
 is the logic around that seam:
@@ -447,3 +447,20 @@ leader leaves its existing lots fully visible, that a reconciliation case
 with no `intent_id` is correctly excluded from any leader's view rather than
 silently misattributed, and a full `trace_attempt` round trip through every
 linked table.
+
+## End-to-end verification (Phase 7)
+
+See [`docs/PHASE_7_VERIFICATION.md`](docs/PHASE_7_VERIFICATION.md) for the
+full status. Summary: the historical-replay and required-tests portions of
+blueprint section 12 are built (crash-injection, multi-leader interleaved
+BUY/SELL, an end-to-end crash-recovery test chaining the real recovery and
+finalize paths together, a new startup check that refuses to run when
+`execution_schedule`'s lane count changed while a non-terminal intent still
+carries the old value, a historical-replay harness fed with 305 real
+PolyHermes production rows, and 72-hour GHOST-run tooling: `ghost_verify`
+now emits a structured `GHOST_RECORD:` line per run,
+and the new `ghost_drift_report` binary summarizes a log of them for
+mismatches and gaps). "Live progression" (the later gate that runs one
+leader with a bounded live amount for seven days) is not started — it
+requires independently reviewed Phase 0.5 and 72-hour GHOST evidence; see
+[`docs/LIVE_PROGRESSION_RUNBOOK.md`](docs/LIVE_PROGRESSION_RUNBOOK.md).

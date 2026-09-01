@@ -79,7 +79,9 @@ pub fn expected_order_id(
             if p.order.signatureType == SignatureType::Poly1271 as u8 {
                 return Err(OrderHashError::UnsupportedSignatureType);
             }
-            let exchange = exchanges.v2.ok_or(OrderHashError::MissingV2ExchangeAddress)?;
+            let exchange = exchanges
+                .v2
+                .ok_or(OrderHashError::MissingV2ExchangeAddress)?;
             let domain = domain(ORDER_DOMAIN_VERSION_V2, chain_id, exchange);
             Ok(p.order.eip712_signing_hash(&domain))
         }
@@ -232,7 +234,8 @@ mod tests {
         // in-struct; V2 carries timestamp/metadata/builder instead) -- they
         // must never collide.
         let v1_payload = OrderPayload::new_v1(v1_order(SignatureType::GnosisSafe));
-        let v2_payload = OrderPayload::new(v2_order(SignatureType::GnosisSafe), U256::from(9_999u64));
+        let v2_payload =
+            OrderPayload::new(v2_order(SignatureType::GnosisSafe), U256::from(9_999u64));
 
         let v1_hash = expected_order_id(&v1_payload, &exchanges(), 137).unwrap();
         let v2_hash = expected_order_id(&v2_payload, &exchanges(), 137).unwrap();
@@ -278,6 +281,8 @@ mod tests {
 
         assert!(formatted.starts_with("0x"));
         assert_eq!(formatted.len(), 66);
-        assert!(formatted[2..].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(formatted[2..]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 }

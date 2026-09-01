@@ -8,6 +8,7 @@
 use std::{collections::HashSet, error::Error, fmt};
 
 use polymarket_client_sdk_v2::types::Decimal;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     OutcomeTokenId, StrictAccountBalanceReader, StrictCollateralError, StrictPositionError,
@@ -262,3 +263,91 @@ impl fmt::Display for GhostSnapshotError {
 }
 
 impl Error for GhostSnapshotError {}
+
+/// A plain, JSON-serializable record of one GHOST run, for Phase 7's
+/// multi-day GHOST verification. Persisting one of these per run (e.g. one
+/// JSON line per invocation, appended to a log by the operator's own
+/// wrapper around `ghost_verify`) is what lets a later pass reconcile a
+/// whole run -- checking for any mismatch, any query failure, and any gap
+/// in the run cadence wide enough to represent "unexplained event loss" --
+/// without needing to keep the venue connection or credentials open for the
+/// whole window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GhostRunRecord {
+    pub snapshot_at_utc: String,
+    pub checked_at_utc: String,
+    pub is_clean: bool,
+    pub collateral: BalanceRecord,
+    pub token_balances: Vec<TokenBalanceRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BalanceRecord {
+    pub status: BalanceRecordStatus,
+    pub expected: String,
+    pub observed: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BalanceRecordStatus {
+    Match,
+    Mismatch,
+    QueryFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TokenBalanceRecord {
+    pub token_id: String,
+    #[serde(flatten)]
+    pub balance: BalanceRecord,
+}
+
+/// Builds the redacted, persistable record for one completed GHOST run.
+/// Contains only comparison results (expected/observed magnitudes and
+/// match/mismatch/query-failed status) -- never a credential, signed
+/// envelope, or raw response body.
+pub fn to_record(
+    report: &GhostVerification,
+    snapshot_at_utc: &str,
+    checked_at_utc: &str,
+) -> GhostRunRecord {
+    GhostRunRecord {
+        snapshot_at_utc: snapshot_at_utc.to_owned(),
+        checked_at_utc: checked_at_utc.to_owned(),
+        is_clean: report.is_clean(),
+        collateral: balance_record(report.collateral()),
+        token_balances: report
+            .token_balances()
+            .iter()
+            .map(|token_balance| TokenBalanceRecord {
+                token_id: token_balance.token_id().to_string(),
+                balance: balance_record(token_balance.result()),
+            })
+            .collect(),
+    }
+}
+
+fn balance_record<E: fmt::Display>(verification: &BalanceVerification<E>) -> BalanceRecord {
+    match verification {
+        BalanceVerification::Match { expected, observed } => BalanceRecord {
+            status: BalanceRecordStatus::Match,
+            expected: expected.to_string(),
+            observed: Some(observed.to_string()),
+            error: None,
+        },
+        BalanceVerification::Mismatch { expected, observed } => BalanceRecord {
+            status: BalanceRecordStatus::Mismatch,
+            expected: expected.to_string(),
+            observed: Some(observed.to_string()),
+            error: None,
+        },
+        BalanceVerification::QueryFailed { expected, source } => BalanceRecord {
+            status: BalanceRecordStatus::QueryFailed,
+            expected: expected.to_string(),
+            observed: None,
+            error: Some(source.to_string()),
+        },
+    }
+}

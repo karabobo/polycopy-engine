@@ -21,7 +21,7 @@ use polymarket_client_sdk_v2::{
     clob::{
         types::{
             response::{OpenOrderResponse, PostOrderResponse},
-            OrderPayload, OrderType, SignableOrder, SignatureType, SignedOrder, Side,
+            OrderPayload, OrderType, Side, SignableOrder, SignatureType, SignedOrder,
         },
         Client, Config,
     },
@@ -256,15 +256,18 @@ pub async fn expected_order_id(
     let token_id = match payload {
         OrderPayload::V1(p) => p.order.tokenId,
         OrderPayload::V2(p) => p.order.tokenId,
-        _ => return Err(CanaryRunError::OrderHash(OrderHashError::UnsupportedPayloadVersion)),
+        _ => {
+            return Err(CanaryRunError::OrderHash(
+                OrderHashError::UnsupportedPayloadVersion,
+            ))
+        }
     };
     let neg_risk = client
         .neg_risk(token_id)
         .await
         .map_err(CanaryRunError::NegRiskQuery)?
         .neg_risk;
-    let config =
-        contract_config(POLYGON, neg_risk).ok_or(CanaryRunError::MissingContractConfig)?;
+    let config = contract_config(POLYGON, neg_risk).ok_or(CanaryRunError::MissingContractConfig)?;
     let exchanges = ExchangeAddresses {
         v1: config.exchange,
         v2: config.exchange_v2,

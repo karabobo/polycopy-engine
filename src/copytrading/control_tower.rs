@@ -51,7 +51,10 @@ pub struct LeaderStatus {
 /// leader's own row only -- no other leader's already-planned intents are
 /// touched by it (blueprint acceptance: "updating one leader does not
 /// affect another leader's snapshot").
-pub async fn leader_status(pool: &SqlitePool, leader_id: i64) -> Result<LeaderStatus, ControlTowerError> {
+pub async fn leader_status(
+    pool: &SqlitePool,
+    leader_id: i64,
+) -> Result<LeaderStatus, ControlTowerError> {
     sqlx::query_as::<_, LeaderStatus>(
         "SELECT id AS leader_id, label, enabled, activation_at FROM leader_config WHERE id = ?",
     )
@@ -81,7 +84,10 @@ pub struct IntentSummary {
 /// Disabling a leader stops new intents from being *planned* for it (Phase
 /// 3's `plan_next_batch`); it never deletes or hides an intent already
 /// here.
-pub async fn leader_intents(pool: &SqlitePool, leader_id: i64) -> Result<Vec<IntentSummary>, ControlTowerError> {
+pub async fn leader_intents(
+    pool: &SqlitePool,
+    leader_id: i64,
+) -> Result<Vec<IntentSummary>, ControlTowerError> {
     sqlx::query_as::<_, IntentSummary>(
         "SELECT id AS intent_id, event_id, leader_id, account_id, token_id, side, status, \
          reserved_qty, config_snapshot_json, config_snapshot_hash, created_at \
@@ -108,7 +114,10 @@ pub struct LotSummary {
 /// or silently close positions") -- this reads the same `position_lots`
 /// rows `execute::finalize_receipt` writes, with no `enabled` filter at
 /// all.
-pub async fn leader_lots(pool: &SqlitePool, leader_id: i64) -> Result<Vec<LotSummary>, ControlTowerError> {
+pub async fn leader_lots(
+    pool: &SqlitePool,
+    leader_id: i64,
+) -> Result<Vec<LotSummary>, ControlTowerError> {
     sqlx::query_as::<_, LotSummary>(
         "SELECT account_id, leader_id, token_id, qty, updated_at \
          FROM position_lots WHERE leader_id = ? ORDER BY token_id",
@@ -224,7 +233,10 @@ struct AttemptTraceRow {
     signature_type: String,
 }
 
-pub async fn trace_attempt(pool: &SqlitePool, attempt_id: i64) -> Result<AttemptTrace, ControlTowerError> {
+pub async fn trace_attempt(
+    pool: &SqlitePool,
+    attempt_id: i64,
+) -> Result<AttemptTrace, ControlTowerError> {
     let row: Option<AttemptTraceRow> = sqlx::query_as(
         "SELECT \
             oa.id AS attempt_id, oa.attempt_number, oa.status AS attempt_status, \
@@ -358,7 +370,9 @@ mod tests {
                 "polycopy-engine-control-tower-test-{}-{nonce}-{counter}.sqlite",
                 process::id()
             ));
-            let pool = open_and_migrate(&path).await.expect("migrations must apply to a fresh database");
+            let pool = open_and_migrate(&path)
+                .await
+                .expect("migrations must apply to a fresh database");
             Self { pool, path }
         }
     }
@@ -454,10 +468,12 @@ mod tests {
         // Update leader one's config and status -- leader two's already
         // planned intent, and leader two's own status row, must be
         // unaffected.
-        sqlx::query("UPDATE leader_config SET label = 'leader-one-renamed', enabled = 0 WHERE id = 1")
-            .execute(&*db)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE leader_config SET label = 'leader-one-renamed', enabled = 0 WHERE id = 1",
+        )
+        .execute(&*db)
+        .await
+        .unwrap();
         let _ = intent_one;
 
         let after = leader_intents(&db, 2).await.unwrap();
@@ -466,7 +482,10 @@ mod tests {
         assert_eq!(after[0].intent_id, intent_two);
 
         let leader_two_status = leader_status(&db, 2).await.unwrap();
-        assert!(leader_two_status.enabled, "leader two must still be enabled");
+        assert!(
+            leader_two_status.enabled,
+            "leader two must still be enabled"
+        );
         assert_eq!(leader_two_status.label, "leader-two");
     }
 
@@ -498,7 +517,11 @@ mod tests {
         assert!(!status.enabled);
 
         let lots = leader_lots(&db, 1).await.unwrap();
-        assert_eq!(lots.len(), 1, "disabling a leader must never erase its lots");
+        assert_eq!(
+            lots.len(),
+            1,
+            "disabling a leader must never erase its lots"
+        );
         assert_eq!(lots[0].qty, "20");
     }
 
@@ -537,7 +560,10 @@ mod tests {
         assert_eq!(trace.leader.label, "leader-one");
         assert_eq!(trace.account.account_id, 1);
         assert_eq!(trace.reconciliation_cases.len(), 1);
-        assert_eq!(trace.reconciliation_cases[0].case_type, "strict_query_failure");
+        assert_eq!(
+            trace.reconciliation_cases[0].case_type,
+            "strict_query_failure"
+        );
     }
 
     #[tokio::test]
@@ -574,6 +600,9 @@ mod tests {
             .await
             .unwrap()
             .get(0);
-        assert_eq!(row_count, 1, "the unattributed case must still exist in the table");
+        assert_eq!(
+            row_count, 1,
+            "the unattributed case must still exist in the table"
+        );
     }
 }

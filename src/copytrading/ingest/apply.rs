@@ -15,7 +15,10 @@ use super::{address_resolver::AddressResolver, normalize::NormalizedTrade, Trade
 pub enum ProcessOutcome {
     /// Written to `leader_events`/`leader_event_observations` (or already
     /// present from a prior observation of the same canonical event).
-    Ingested { leader_id: i64, canonical_event_key: String },
+    Ingested {
+        leader_id: i64,
+        canonical_event_key: String,
+    },
     /// Not a trade at all (only meaningful for a source that can also
     /// produce non-trade values, e.g. a ping/pong keepalive or an
     /// unrelated topic on the WS firehose).
@@ -36,8 +39,14 @@ pub enum ProcessOutcome {
 impl fmt::Display for ProcessOutcome {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Ingested { leader_id, canonical_event_key } => {
-                write!(formatter, "ingested leader_id={leader_id} key={canonical_event_key}")
+            Self::Ingested {
+                leader_id,
+                canonical_event_key,
+            } => {
+                write!(
+                    formatter,
+                    "ingested leader_id={leader_id} key={canonical_event_key}"
+                )
             }
             Self::Skip => write!(formatter, "skip"),
             Self::Rejected(reason) => write!(formatter, "rejected: {reason}"),
@@ -68,16 +77,15 @@ pub async fn apply_trade(
         return ProcessOutcome::NotWatched;
     };
 
-    let activation_at: Option<String> = match sqlx::query_scalar(
-        "SELECT activation_at FROM leader_config WHERE id = ?",
-    )
-    .bind(leader_id)
-    .fetch_optional(pool)
-    .await
-    {
-        Ok(row) => row.flatten(),
-        Err(error) => return ProcessOutcome::DatabaseError(error.to_string()),
-    };
+    let activation_at: Option<String> =
+        match sqlx::query_scalar("SELECT activation_at FROM leader_config WHERE id = ?")
+            .bind(leader_id)
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(row) => row.flatten(),
+            Err(error) => return ProcessOutcome::DatabaseError(error.to_string()),
+        };
 
     let Some(activation_at) = activation_at else {
         return ProcessOutcome::LeaderNotActivated;
@@ -159,7 +167,10 @@ pub async fn apply_trade(
         return ProcessOutcome::DatabaseError(error.to_string());
     }
 
-    ProcessOutcome::Ingested { leader_id, canonical_event_key }
+    ProcessOutcome::Ingested {
+        leader_id,
+        canonical_event_key,
+    }
 }
 
 #[cfg(test)]
@@ -243,19 +254,42 @@ mod tests {
         let resolver = AddressResolver::new();
         resolver.reload([("0xleader".to_owned(), 1)]);
 
-        let first = apply_trade(&db, &resolver, &trade("8839.47", "0xshared"), "activity_backfill", "0xshared", "{}").await;
-        let second = apply_trade(&db, &resolver, &trade("3542.23", "0xshared"), "activity_backfill", "0xshared", "{}").await;
+        let first = apply_trade(
+            &db,
+            &resolver,
+            &trade("8839.47", "0xshared"),
+            "activity_backfill",
+            "0xshared",
+            "{}",
+        )
+        .await;
+        let second = apply_trade(
+            &db,
+            &resolver,
+            &trade("3542.23", "0xshared"),
+            "activity_backfill",
+            "0xshared",
+            "{}",
+        )
+        .await;
 
         assert!(matches!(first, ProcessOutcome::Ingested { .. }));
         assert!(matches!(second, ProcessOutcome::Ingested { .. }));
-        assert_ne!(first, second, "two distinct fills must not collapse onto one canonical event");
+        assert_ne!(
+            first, second,
+            "two distinct fills must not collapse onto one canonical event"
+        );
 
-        let event_count: i64 = sqlx::query("SELECT COUNT(*) FROM leader_events WHERE tx_hash = '0xshared'")
-            .fetch_one(&*db)
-            .await
-            .expect("event count must be queryable")
-            .get(0);
-        assert_eq!(event_count, 2, "both fills sharing one transaction hash must be recorded");
+        let event_count: i64 =
+            sqlx::query("SELECT COUNT(*) FROM leader_events WHERE tx_hash = '0xshared'")
+                .fetch_one(&*db)
+                .await
+                .expect("event count must be queryable")
+                .get(0);
+        assert_eq!(
+            event_count, 2,
+            "both fills sharing one transaction hash must be recorded"
+        );
     }
 
     #[tokio::test]
@@ -277,6 +311,9 @@ mod tests {
             .await
             .expect("event count must be queryable")
             .get(0);
-        assert_eq!(event_count, 1, "a true replay of the identical trade must not double-count");
+        assert_eq!(
+            event_count, 1,
+            "a true replay of the identical trade must not double-count"
+        );
     }
 }

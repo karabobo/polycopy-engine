@@ -17,7 +17,7 @@ use sqlx::SqlitePool;
 use crate::{
     copytrading::plan::PolicySnapshot,
     venue::{
-        intl_clob::{OutcomeTokenId, StrictTokenBalanceReader},
+        intl_clob::{OutcomeTokenId, StrictAccountBalanceReader},
         OrderReceipt,
     },
 };
@@ -29,14 +29,14 @@ pub enum Side {
 }
 
 impl Side {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Buy => "BUY",
             Self::Sell => "SELL",
         }
     }
 
-    fn from_str(raw: &str) -> Option<Self> {
+    pub(crate) fn from_str(raw: &str) -> Option<Self> {
         match raw {
             "BUY" => Some(Self::Buy),
             "SELL" => Some(Self::Sell),
@@ -84,7 +84,7 @@ pub async fn execute_intent<B, S>(
     intent_id: i64,
 ) -> Result<Option<ExecutionOutcome>, ExecuteError>
 where
-    B: StrictTokenBalanceReader,
+    B: StrictAccountBalanceReader,
     S: OrderSubmitter,
 {
     let Some(claimed) = claim_or_resume_intent(pool, intent_id).await? else {
@@ -112,7 +112,9 @@ where
     let attempt_id = record_attempt(pool, &decision, next_attempt_number, &receipt).await?;
     finalize_receipt(pool, decision.intent_id, attempt_id, &receipt).await?;
 
-    Ok(Some(ExecutionOutcome::Filled { filled_qty: receipt.filled_qty() }))
+    Ok(Some(ExecutionOutcome::Filled {
+        filled_qty: receipt.filled_qty(),
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,17 +124,17 @@ pub enum ExecutionOutcome {
     Expired,
 }
 
-struct ClaimedIntent {
-    intent_id: i64,
-    account_id: i64,
-    leader_id: i64,
-    token_id: String,
-    side: Side,
-    decision_deadline_at: Option<String>,
+pub struct ClaimedIntent {
+    pub intent_id: i64,
+    pub account_id: i64,
+    pub leader_id: i64,
+    pub token_id: String,
+    pub side: Side,
+    pub decision_deadline_at: Option<String>,
     /// Set only when this claim is resuming an intent that already has a
     /// persisted decision from an earlier attempt (a crash-recovery case,
     /// blueprint: "A recovery never recalculates a persisted decision").
-    existing_decision: Option<(Decimal, Decimal)>,
+    pub existing_decision: Option<(Decimal, Decimal)>,
 }
 
 /// Claims a `pending` intent (compare-and-set to `in_progress`, the
@@ -142,9 +144,17 @@ struct ClaimedIntent {
 /// exist or is in a terminal state.
 /// (account_id, leader_id, token_id, side, decision_deadline_at,
 /// planned_qty, planned_price)
-type IntentRow = (i64, i64, String, String, Option<String>, Option<String>, Option<String>);
+type IntentRow = (
+    i64,
+    i64,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
-async fn claim_or_resume_intent(
+pub async fn claim_or_resume_intent(
     pool: &SqlitePool,
     intent_id: i64,
 ) -> Result<Option<ClaimedIntent>, ExecuteError> {
@@ -166,14 +176,14 @@ async fn claim_or_resume_intent(
             // Not pending: either already in_progress (resume) or a
             // terminal/nonexistent id (nothing to do).
             let resumable: Option<IntentRow> = sqlx::query_as(
-                    "SELECT account_id, leader_id, token_id, side, decision_deadline_at, \
+                "SELECT account_id, leader_id, token_id, side, decision_deadline_at, \
                      planned_qty, planned_price \
                      FROM copy_intents WHERE id = ? AND status = 'in_progress'",
-                )
-                .bind(intent_id)
-                .fetch_optional(pool)
-                .await
-                .map_err(|error| ExecuteError::Database(error.to_string()))?;
+            )
+            .bind(intent_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| ExecuteError::Database(error.to_string()))?;
             match resumable {
                 Some(row) => row,
                 None => return Ok(None),
@@ -181,12 +191,16 @@ async fn claim_or_resume_intent(
         }
     };
 
-    let (account_id, leader_id, token_id, side, decision_deadline_at, planned_qty, planned_price) = row;
+    let (account_id, leader_id, token_id, side, decision_deadline_at, planned_qty, planned_price) =
+        row;
     let side = Side::from_str(&side).ok_or(ExecuteError::InvalidSide)?;
     let existing_decision = match (planned_qty, planned_price) {
         (Some(qty), Some(price)) => Some((
-            qty.parse().map_err(|_| ExecuteError::InvalidDecimal("copy_intents.planned_qty"))?,
-            price.parse().map_err(|_| ExecuteError::InvalidDecimal("copy_intents.planned_price"))?,
+            qty.parse()
+                .map_err(|_| ExecuteError::InvalidDecimal("copy_intents.planned_qty"))?,
+            price
+                .parse()
+                .map_err(|_| ExecuteError::InvalidDecimal("copy_intents.planned_price"))?,
         )),
         _ => None,
     };
@@ -202,7 +216,7 @@ async fn claim_or_resume_intent(
     }))
 }
 
-enum SizingOutcome {
+pub enum SizingOutcome {
     Decision(SizedDecision),
     NeedsReconcile(&'static str),
     Expired,
@@ -212,7 +226,7 @@ enum SizingOutcome {
 /// Strict venue data is read before any write transaction begins (the
 /// executor must not hold an SQLite write transaction across network I/O);
 /// the reservation itself is one short transaction.
-async fn size_and_reserve<B: StrictTokenBalanceReader>(
+pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
     pool: &SqlitePool,
     balance_reader: &B,
     claimed: &ClaimedIntent,
@@ -243,48 +257,103 @@ async fn size_and_reserve<B: StrictTokenBalanceReader>(
 
     let (qty, limit_price) = match claimed.side {
         Side::Sell => {
-            let leader_lot = load_position_lot(pool, claimed.account_id, claimed.leader_id, &claimed.token_id).await?;
+            let leader_lot = load_position_lot(
+                pool,
+                claimed.account_id,
+                claimed.leader_id,
+                &claimed.token_id,
+            )
+            .await?;
             let token = OutcomeTokenId::from_str(&claimed.token_id)
                 .map_err(|_| ExecuteError::InvalidTokenId)?;
             let strict_available = match balance_reader.position_for_token_strict(&token).await {
                 Ok(balance) => balance,
-                Err(_) => return Ok(SizingOutcome::NeedsReconcile("strict token balance query failed")),
+                Err(_) => {
+                    return Ok(SizingOutcome::NeedsReconcile(
+                        "strict token balance query failed",
+                    ))
+                }
             };
-            let other_reservations =
-                sum_other_active_reservations(pool, claimed.account_id, &claimed.token_id, claimed.intent_id).await?;
+            let other_reservations = sum_other_active_reservations(
+                pool,
+                claimed.account_id,
+                &claimed.token_id,
+                claimed.intent_id,
+            )
+            .await?;
             let account_sellable = (strict_available - other_reservations).max(Decimal::ZERO);
             let sell_qty = leader_lot.min(account_sellable).max(Decimal::ZERO);
             if sell_qty <= Decimal::ZERO {
                 // Never treated as "nothing to do": blueprint section 9 --
                 // a non-positive sell result is always needs_reconcile.
-                return Ok(SizingOutcome::NeedsReconcile("computed sell quantity is not positive"));
+                return Ok(SizingOutcome::NeedsReconcile(
+                    "computed sell quantity is not positive",
+                ));
             }
             let event_price = load_event_price(pool, claimed.intent_id).await?;
-            let price = round_price(apply_tolerance(event_price, policy.price_tolerance_bps, claimed.side), tick_size, claimed.side);
+            let price = round_price(
+                apply_tolerance(event_price, policy.price_tolerance_bps, claimed.side),
+                tick_size,
+                claimed.side,
+            );
             (sell_qty, price)
         }
         Side::Buy => {
             let event_size = load_event_size(pool, claimed.intent_id).await?;
             let event_price = load_event_price(pool, claimed.intent_id).await?;
-            let limit_price = round_price(apply_tolerance(event_price, policy.price_tolerance_bps, claimed.side), tick_size, claimed.side);
+            let limit_price = round_price(
+                apply_tolerance(event_price, policy.price_tolerance_bps, claimed.side),
+                tick_size,
+                claimed.side,
+            );
+            let strict_collateral = match balance_reader.collateral_balance_strict().await {
+                Ok(balance) => balance,
+                Err(_) => {
+                    return Ok(SizingOutcome::NeedsReconcile(
+                        "strict collateral balance query failed",
+                    ))
+                }
+            };
+            let strict_allowance = match balance_reader.collateral_allowance_strict().await {
+                Ok(allowance) => allowance,
+                Err(_) => {
+                    return Ok(SizingOutcome::NeedsReconcile(
+                        "strict collateral allowance query failed",
+                    ))
+                }
+            };
+            let other_buy_notional = sum_other_active_buy_reservation_notional(
+                pool,
+                claimed.account_id,
+                claimed.intent_id,
+            )
+            .await?;
+            let available_collateral =
+                (strict_collateral.min(strict_allowance) - other_buy_notional).max(Decimal::ZERO);
             let max_notional: Decimal = policy
                 .max_order_notional
                 .parse()
                 .map_err(|_| ExecuteError::InvalidDecimal("leader_policy.max_order_notional"))?;
+            let order_notional = max_notional.min(available_collateral);
             let notional_capped_qty = if limit_price > Decimal::ZERO {
-                max_notional / limit_price
+                order_notional / limit_price
             } else {
                 Decimal::ZERO
             };
             let qty = event_size.min(notional_capped_qty);
             if qty <= Decimal::ZERO {
-                return Ok(SizingOutcome::NeedsReconcile("computed buy quantity is not positive"));
+                return Ok(SizingOutcome::NeedsReconcile(
+                    "computed buy quantity is not positive",
+                ));
             }
             (qty, limit_price)
         }
     };
 
-    let mut tx = pool.begin().await.map_err(|error| ExecuteError::Database(error.to_string()))?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| ExecuteError::Database(error.to_string()))?;
     let updated = sqlx::query(
         "UPDATE copy_intents SET planned_qty = ?, planned_price = ?, tick_size = ?, \
          time_in_force = 'FAK', reserved_qty = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
@@ -298,13 +367,17 @@ async fn size_and_reserve<B: StrictTokenBalanceReader>(
     .execute(&mut *tx)
     .await
     .map_err(|error| ExecuteError::Database(error.to_string()))?;
-    tx.commit().await.map_err(|error| ExecuteError::Database(error.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|error| ExecuteError::Database(error.to_string()))?;
 
     if updated.rows_affected() == 0 {
         // Revalidation failed: the intent moved out of in_progress under us
         // (e.g. a concurrent cancellation). Treat as nothing to do rather
         // than proceeding on a stale claim.
-        return Ok(SizingOutcome::NeedsReconcile("intent state changed during sizing"));
+        return Ok(SizingOutcome::NeedsReconcile(
+            "intent state changed during sizing",
+        ));
     }
 
     Ok(SizingOutcome::Decision(SizedDecision {
@@ -341,16 +414,26 @@ fn round_price(price: Decimal, tick_size: Decimal, side: Side) -> Decimal {
     rounded_ticks * tick_size
 }
 
-async fn load_policy_snapshot(pool: &SqlitePool, intent_id: i64) -> Result<PolicySnapshot, ExecuteError> {
-    let json: String = sqlx::query_scalar("SELECT config_snapshot_json FROM copy_intents WHERE id = ?")
-        .bind(intent_id)
-        .fetch_one(pool)
-        .await
-        .map_err(|error| ExecuteError::Database(error.to_string()))?;
-    serde_json::from_str(&json).map_err(|_| ExecuteError::InvalidDecimal("copy_intents.config_snapshot_json"))
+async fn load_policy_snapshot(
+    pool: &SqlitePool,
+    intent_id: i64,
+) -> Result<PolicySnapshot, ExecuteError> {
+    let json: String =
+        sqlx::query_scalar("SELECT config_snapshot_json FROM copy_intents WHERE id = ?")
+            .bind(intent_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|error| ExecuteError::Database(error.to_string()))?;
+    serde_json::from_str(&json)
+        .map_err(|_| ExecuteError::InvalidDecimal("copy_intents.config_snapshot_json"))
 }
 
-async fn load_position_lot(pool: &SqlitePool, account_id: i64, leader_id: i64, token_id: &str) -> Result<Decimal, ExecuteError> {
+async fn load_position_lot(
+    pool: &SqlitePool,
+    account_id: i64,
+    leader_id: i64,
+    token_id: &str,
+) -> Result<Decimal, ExecuteError> {
     let qty: Option<String> = sqlx::query_scalar(
         "SELECT qty FROM position_lots WHERE account_id = ? AND leader_id = ? AND token_id = ?",
     )
@@ -361,9 +444,45 @@ async fn load_position_lot(pool: &SqlitePool, account_id: i64, leader_id: i64, t
     .await
     .map_err(|error| ExecuteError::Database(error.to_string()))?;
     match qty {
-        Some(qty) => qty.parse().map_err(|_| ExecuteError::InvalidDecimal("position_lots.qty")),
+        Some(qty) => qty
+            .parse()
+            .map_err(|_| ExecuteError::InvalidDecimal("position_lots.qty")),
         None => Ok(Decimal::ZERO),
     }
+}
+
+/// Sums other active BUY reservations as account-level collateral notional,
+/// excluding the current intent so crash recovery does not shrink an already
+/// persisted decision. `reserved_qty` remains the order size; BUY collateral
+/// usage is computed from `reserved_qty * planned_price`.
+async fn sum_other_active_buy_reservation_notional(
+    pool: &SqlitePool,
+    account_id: i64,
+    exclude_intent_id: i64,
+) -> Result<Decimal, ExecuteError> {
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT reserved_qty, planned_price FROM copy_intents \
+         WHERE account_id = ? AND id != ? AND side = 'BUY' \
+         AND status IN ('in_progress', 'partially_filled')",
+    )
+    .bind(account_id)
+    .bind(exclude_intent_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| ExecuteError::Database(error.to_string()))?;
+
+    let mut total = Decimal::ZERO;
+    for (reserved_qty, planned_price) in rows {
+        let reserved_qty = reserved_qty
+            .parse::<Decimal>()
+            .map_err(|_| ExecuteError::InvalidDecimal("copy_intents.reserved_qty"))?;
+        let planned_price = planned_price
+            .ok_or(ExecuteError::InvalidDecimal("copy_intents.planned_price"))?
+            .parse::<Decimal>()
+            .map_err(|_| ExecuteError::InvalidDecimal("copy_intents.planned_price"))?;
+        total += reserved_qty * planned_price;
+    }
+    Ok(total)
 }
 
 /// Sums other *currently active* intents' reservations for this
@@ -390,7 +509,9 @@ async fn sum_other_active_reservations(
 
     let mut total = Decimal::ZERO;
     for row in rows {
-        total += row.parse::<Decimal>().map_err(|_| ExecuteError::InvalidDecimal("copy_intents.reserved_qty"))?;
+        total += row
+            .parse::<Decimal>()
+            .map_err(|_| ExecuteError::InvalidDecimal("copy_intents.reserved_qty"))?;
     }
     Ok(total)
 }
@@ -403,7 +524,9 @@ async fn load_event_price(pool: &SqlitePool, intent_id: i64) -> Result<Decimal, 
     .fetch_one(pool)
     .await
     .map_err(|error| ExecuteError::Database(error.to_string()))?;
-    price.parse().map_err(|_| ExecuteError::InvalidDecimal("leader_events.price"))
+    price
+        .parse()
+        .map_err(|_| ExecuteError::InvalidDecimal("leader_events.price"))
 }
 
 async fn load_event_size(pool: &SqlitePool, intent_id: i64) -> Result<Decimal, ExecuteError> {
@@ -414,11 +537,19 @@ async fn load_event_size(pool: &SqlitePool, intent_id: i64) -> Result<Decimal, E
     .fetch_one(pool)
     .await
     .map_err(|error| ExecuteError::Database(error.to_string()))?;
-    size.parse().map_err(|_| ExecuteError::InvalidDecimal("leader_events.size"))
+    size.parse()
+        .map_err(|_| ExecuteError::InvalidDecimal("leader_events.size"))
 }
 
-async fn open_reconciliation_case(pool: &SqlitePool, claimed: &ClaimedIntent, reason: &'static str) -> Result<(), ExecuteError> {
-    let mut tx = pool.begin().await.map_err(|error| ExecuteError::Database(error.to_string()))?;
+pub async fn open_reconciliation_case(
+    pool: &SqlitePool,
+    claimed: &ClaimedIntent,
+    reason: &'static str,
+) -> Result<(), ExecuteError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| ExecuteError::Database(error.to_string()))?;
     sqlx::query(
         "UPDATE copy_intents SET status = 'needs_reconcile', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
@@ -437,10 +568,12 @@ async fn open_reconciliation_case(pool: &SqlitePool, claimed: &ClaimedIntent, re
     .execute(&mut *tx)
     .await
     .map_err(|error| ExecuteError::Database(error.to_string()))?;
-    tx.commit().await.map_err(|error| ExecuteError::Database(error.to_string()))
+    tx.commit()
+        .await
+        .map_err(|error| ExecuteError::Database(error.to_string()))
 }
 
-async fn cancel_expired_intent(pool: &SqlitePool, intent_id: i64) -> Result<(), ExecuteError> {
+pub async fn cancel_expired_intent(pool: &SqlitePool, intent_id: i64) -> Result<(), ExecuteError> {
     sqlx::query(
         "UPDATE copy_intents SET status = 'cancelled', rejection_reason = 'decision deadline expired', \
          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
@@ -452,12 +585,13 @@ async fn cancel_expired_intent(pool: &SqlitePool, intent_id: i64) -> Result<(), 
     .map_err(|error| ExecuteError::Database(error.to_string()))
 }
 
-async fn next_attempt_number(pool: &SqlitePool, intent_id: i64) -> Result<i64, ExecuteError> {
-    let max: Option<i64> = sqlx::query_scalar("SELECT MAX(attempt_number) FROM order_attempts WHERE intent_id = ?")
-        .bind(intent_id)
-        .fetch_one(pool)
-        .await
-        .map_err(|error| ExecuteError::Database(error.to_string()))?;
+pub async fn next_attempt_number(pool: &SqlitePool, intent_id: i64) -> Result<i64, ExecuteError> {
+    let max: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(attempt_number) FROM order_attempts WHERE intent_id = ?")
+            .bind(intent_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|error| ExecuteError::Database(error.to_string()))?;
     Ok(max.unwrap_or(0) + 1)
 }
 
@@ -504,7 +638,10 @@ pub async fn finalize_receipt(
     attempt_id: i64,
     receipt: &OrderReceipt,
 ) -> Result<(), ExecuteError> {
-    let mut tx = pool.begin().await.map_err(|error| ExecuteError::Database(error.to_string()))?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| ExecuteError::Database(error.to_string()))?;
 
     let row: (i64, i64, String, String, String) = sqlx::query_as(
         "SELECT ci.account_id, ci.leader_id, ci.token_id, ci.side, oa.accounted_filled_qty \
@@ -517,8 +654,9 @@ pub async fn finalize_receipt(
     .map_err(|error| ExecuteError::Database(error.to_string()))?;
     let (account_id, leader_id, token_id, side, accounted_so_far) = row;
     let side = Side::from_str(&side).ok_or(ExecuteError::InvalidSide)?;
-    let accounted_so_far: Decimal =
-        accounted_so_far.parse().map_err(|_| ExecuteError::InvalidDecimal("order_attempts.accounted_filled_qty"))?;
+    let accounted_so_far: Decimal = accounted_so_far
+        .parse()
+        .map_err(|_| ExecuteError::InvalidDecimal("order_attempts.accounted_filled_qty"))?;
 
     let delta = (receipt.filled_qty() - accounted_so_far).max(Decimal::ZERO);
     let new_accounted = accounted_so_far + delta;
@@ -541,7 +679,9 @@ pub async fn finalize_receipt(
         .await
         .map_err(|error| ExecuteError::Database(error.to_string()))?;
         let current_qty: Decimal = match current_qty {
-            Some(qty) => qty.parse().map_err(|_| ExecuteError::InvalidDecimal("position_lots.qty"))?,
+            Some(qty) => qty
+                .parse()
+                .map_err(|_| ExecuteError::InvalidDecimal("position_lots.qty"))?,
             None => Decimal::ZERO,
         };
         let new_qty = current_qty + lot_delta;
@@ -561,16 +701,21 @@ pub async fn finalize_receipt(
         .map_err(|error| ExecuteError::Database(error.to_string()))?;
     }
 
-    sqlx::query("UPDATE order_attempts SET accounted_filled_qty = ?, receipt_json = ? WHERE id = ?")
-        .bind(new_accounted.to_string())
-        .bind(format!(
-            "{{\"requested\":\"{}\",\"accepted\":\"{}\",\"filled\":\"{}\",\"remaining\":\"{}\"}}",
-            receipt.requested_qty(), receipt.accepted_qty(), receipt.filled_qty(), receipt.remaining_qty()
-        ))
-        .bind(attempt_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| ExecuteError::Database(error.to_string()))?;
+    sqlx::query(
+        "UPDATE order_attempts SET accounted_filled_qty = ?, receipt_json = ? WHERE id = ?",
+    )
+    .bind(new_accounted.to_string())
+    .bind(format!(
+        "{{\"requested\":\"{}\",\"accepted\":\"{}\",\"filled\":\"{}\",\"remaining\":\"{}\"}}",
+        receipt.requested_qty(),
+        receipt.accepted_qty(),
+        receipt.filled_qty(),
+        receipt.remaining_qty()
+    ))
+    .bind(attempt_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| ExecuteError::Database(error.to_string()))?;
 
     let intent_status = if receipt.remaining_qty() > Decimal::ZERO && delta > Decimal::ZERO {
         "partially_filled"
@@ -586,7 +731,9 @@ pub async fn finalize_receipt(
     .await
     .map_err(|error| ExecuteError::Database(error.to_string()))?;
 
-    tx.commit().await.map_err(|error| ExecuteError::Database(error.to_string()))
+    tx.commit()
+        .await
+        .map_err(|error| ExecuteError::Database(error.to_string()))
 }
 
 #[derive(Debug)]
@@ -619,7 +766,10 @@ mod tests {
     use sqlx::Row as _;
 
     use super::*;
-    use crate::{copytrading::db::open_and_migrate, venue::intl_clob::StrictPositionError};
+    use crate::{
+        copytrading::db::open_and_migrate,
+        venue::intl_clob::{StrictCollateralError, StrictPositionError, StrictTokenBalanceReader},
+    };
 
     struct TestDb {
         pool: SqlitePool,
@@ -643,7 +793,9 @@ mod tests {
                 "polycopy-engine-execute-test-{}-{nonce}-{counter}.sqlite",
                 process::id()
             ));
-            let pool = open_and_migrate(&path).await.expect("migrations must apply to a fresh database");
+            let pool = open_and_migrate(&path)
+                .await
+                .expect("migrations must apply to a fresh database");
             Self { pool, path }
         }
     }
@@ -664,12 +816,48 @@ mod tests {
         }
     }
 
-    struct FixedBalanceReader(Decimal);
+    struct FixedBalanceReader {
+        token: Decimal,
+        collateral: Decimal,
+        allowance: Decimal,
+    }
+
+    impl FixedBalanceReader {
+        fn new(token: Decimal, collateral: Decimal) -> Self {
+            Self {
+                token,
+                collateral,
+                allowance: collateral,
+            }
+        }
+
+        fn with_allowance(token: Decimal, collateral: Decimal, allowance: Decimal) -> Self {
+            Self {
+                token,
+                collateral,
+                allowance,
+            }
+        }
+    }
 
     #[async_trait]
     impl StrictTokenBalanceReader for FixedBalanceReader {
-        async fn position_for_token_strict(&self, _token_id: &OutcomeTokenId) -> Result<Decimal, StrictPositionError> {
-            Ok(self.0)
+        async fn position_for_token_strict(
+            &self,
+            _token_id: &OutcomeTokenId,
+        ) -> Result<Decimal, StrictPositionError> {
+            Ok(self.token)
+        }
+    }
+
+    #[async_trait]
+    impl StrictAccountBalanceReader for FixedBalanceReader {
+        async fn collateral_balance_strict(&self) -> Result<Decimal, StrictCollateralError> {
+            Ok(self.collateral)
+        }
+
+        async fn collateral_allowance_strict(&self) -> Result<Decimal, StrictCollateralError> {
+            Ok(self.allowance)
         }
     }
 
@@ -677,10 +865,28 @@ mod tests {
 
     #[async_trait]
     impl StrictTokenBalanceReader for FailingBalanceReader {
-        async fn position_for_token_strict(&self, token_id: &OutcomeTokenId) -> Result<Decimal, StrictPositionError> {
+        async fn position_for_token_strict(
+            &self,
+            token_id: &OutcomeTokenId,
+        ) -> Result<Decimal, StrictPositionError> {
             Err(StrictPositionError::Query {
                 token_id: token_id.clone(),
                 source: SdkError::validation("mock balance query failure"),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl StrictAccountBalanceReader for FailingBalanceReader {
+        async fn collateral_balance_strict(&self) -> Result<Decimal, StrictCollateralError> {
+            Err(StrictCollateralError::Query {
+                source: SdkError::validation("mock collateral query failure"),
+            })
+        }
+
+        async fn collateral_allowance_strict(&self) -> Result<Decimal, StrictCollateralError> {
+            Err(StrictCollateralError::Query {
+                source: SdkError::validation("mock collateral allowance query failure"),
             })
         }
     }
@@ -693,16 +899,12 @@ mod tests {
     impl OrderSubmitter for FullFillSubmitter {
         async fn submit(&self, decision: &SizedDecision) -> Result<OrderReceipt, String> {
             match decision.side {
-                Side::Buy => OrderReceipt::from_fak_buy_budget(
-                    decision.qty,
-                    decision.qty,
-                    decision.qty,
-                ),
-                Side::Sell => OrderReceipt::from_fak_sell_shares(
-                    decision.qty,
-                    decision.qty,
-                    decision.qty,
-                ),
+                Side::Buy => {
+                    OrderReceipt::from_fak_buy_budget(decision.qty, decision.qty, decision.qty)
+                }
+                Side::Sell => {
+                    OrderReceipt::from_fak_sell_shares(decision.qty, decision.qty, decision.qty)
+                }
             }
             .map_err(|error| error.to_string())
         }
@@ -734,7 +936,14 @@ mod tests {
     /// Inserts one already-`pending` copy_intent directly (bypassing the
     /// planner, which is tested separately) with a real leader_event and
     /// policy snapshot behind it, so the executor has everything it needs.
-    async fn seed_pending_intent(db: &TestDb, leader_id: i64, token_id: &str, side: &str, event_size: &str, event_price: &str) -> i64 {
+    async fn seed_pending_intent(
+        db: &TestDb,
+        leader_id: i64,
+        token_id: &str,
+        side: &str,
+        event_size: &str,
+        event_price: &str,
+    ) -> i64 {
         let event_id: i64 = sqlx::query_scalar(
             "INSERT INTO leader_events \
              (canonical_event_key, leader_id, condition_id, token_id, outcome_index, side, size, price, occurred_at, observed_at) \
@@ -786,7 +995,10 @@ mod tests {
             time::{SystemTime, UNIX_EPOCH},
         };
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
         nanos.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 
@@ -811,13 +1023,85 @@ mod tests {
         let intent_1 = seed_pending_intent(&db, 1, "123456", "BUY", "5", "0.50").await;
         let intent_2 = seed_pending_intent(&db, 2, "123456", "BUY", "3", "0.50").await;
 
-        let balance_reader = FixedBalanceReader(Decimal::ZERO);
+        let balance_reader = FixedBalanceReader::new(Decimal::ZERO, Decimal::new(100, 0));
         let submitter = FullFillSubmitter;
-        execute_intent(&db, &balance_reader, &submitter, intent_1).await.unwrap();
-        execute_intent(&db, &balance_reader, &submitter, intent_2).await.unwrap();
+        execute_intent(&db, &balance_reader, &submitter, intent_1)
+            .await
+            .unwrap();
+        execute_intent(&db, &balance_reader, &submitter, intent_2)
+            .await
+            .unwrap();
 
         assert_eq!(lot_qty(&db, 1, "123456").await, Decimal::new(5, 0));
         assert_eq!(lot_qty(&db, 2, "123456").await, Decimal::new(3, 0));
+    }
+
+    #[tokio::test]
+    async fn multiple_leaders_interleaved_buy_and_sell_keep_exact_per_leader_lot_attribution() {
+        // Phase 7 required test: same account/token, multiple leaders,
+        // interleaved BUY/SELL, exact virtual-lot attribution. Every SELL
+        // here fully exits the leader's own lot (sell_all_on_exit --
+        // `sell_qty = min(leader_lot, account_sellable)`, not the leader
+        // event's own size), which this test also locks in: leader 1's
+        // SELL events below request "1" but must exit the leader's whole
+        // lot regardless.
+        let db = TestDb::new().await;
+        seed_account_and_schedule(&db).await;
+        seed_leader(&db, 1).await;
+        seed_leader(&db, 2).await;
+        let submitter = FullFillSubmitter;
+        let generous_balance = FixedBalanceReader::new(Decimal::new(100, 0), Decimal::new(100, 0));
+
+        let l1_buy_1 = seed_pending_intent(&db, 1, "123456", "BUY", "5", "0.50").await;
+        execute_intent(&db, &generous_balance, &submitter, l1_buy_1)
+            .await
+            .unwrap();
+        assert_eq!(lot_qty(&db, 1, "123456").await, Decimal::new(5, 0));
+        assert_eq!(lot_qty(&db, 2, "123456").await, Decimal::ZERO);
+
+        let l2_buy_1 = seed_pending_intent(&db, 2, "123456", "BUY", "3", "0.50").await;
+        execute_intent(&db, &generous_balance, &submitter, l2_buy_1)
+            .await
+            .unwrap();
+        assert_eq!(
+            lot_qty(&db, 1, "123456").await,
+            Decimal::new(5, 0),
+            "leader 2's buy must never touch leader 1's lot"
+        );
+        assert_eq!(lot_qty(&db, 2, "123456").await, Decimal::new(3, 0));
+
+        let l1_sell_1 = seed_pending_intent(&db, 1, "123456", "SELL", "1", "0.50").await;
+        execute_intent(&db, &generous_balance, &submitter, l1_sell_1)
+            .await
+            .unwrap();
+        assert_eq!(
+            lot_qty(&db, 1, "123456").await,
+            Decimal::ZERO,
+            "sell_all_on_exit: leader 1's SELL fully exits its 5-share lot, not just 1"
+        );
+        assert_eq!(
+            lot_qty(&db, 2, "123456").await,
+            Decimal::new(3, 0),
+            "leader 1's sell must never touch leader 2's lot"
+        );
+
+        let l2_buy_2 = seed_pending_intent(&db, 2, "123456", "BUY", "2", "0.50").await;
+        execute_intent(&db, &generous_balance, &submitter, l2_buy_2)
+            .await
+            .unwrap();
+        assert_eq!(lot_qty(&db, 1, "123456").await, Decimal::ZERO);
+        assert_eq!(lot_qty(&db, 2, "123456").await, Decimal::new(5, 0));
+
+        let l2_sell_1 = seed_pending_intent(&db, 2, "123456", "SELL", "1", "0.50").await;
+        execute_intent(&db, &generous_balance, &submitter, l2_sell_1)
+            .await
+            .unwrap();
+        assert_eq!(
+            lot_qty(&db, 1, "123456").await,
+            Decimal::ZERO,
+            "leader 2's sell must never touch leader 1's (already-zero) lot"
+        );
+        assert_eq!(lot_qty(&db, 2, "123456").await, Decimal::ZERO);
     }
 
     #[tokio::test]
@@ -837,21 +1121,39 @@ mod tests {
 
         // The account strictly holds only 12 real tokens total -- not
         // enough to cover both leaders' full 10+10 if summed naively.
-        let balance_reader = FixedBalanceReader(Decimal::new(12, 0));
+        let balance_reader = FixedBalanceReader::new(Decimal::new(12, 0), Decimal::new(100, 0));
 
         // Leader 1's sell claims and reserves, but is deliberately left
         // "uncertain" (reserved, not yet finalized) rather than calling
         // execute_intent, which would also submit+finalize it.
-        let claimed_1 = claim_or_resume_intent(&db, intent_1).await.unwrap().unwrap();
-        let SizingOutcome::Decision(decision_1) = size_and_reserve(&db, &balance_reader, &claimed_1).await.unwrap() else {
+        let claimed_1 = claim_or_resume_intent(&db, intent_1)
+            .await
+            .unwrap()
+            .unwrap();
+        let SizingOutcome::Decision(decision_1) =
+            size_and_reserve(&db, &balance_reader, &claimed_1)
+                .await
+                .unwrap()
+        else {
             panic!("leader 1's sell must size successfully");
         };
-        assert_eq!(decision_1.qty, Decimal::new(10, 0), "leader 1 sells its full lot: min(10 leader, 12 account)");
+        assert_eq!(
+            decision_1.qty,
+            Decimal::new(10, 0),
+            "leader 1 sells its full lot: min(10 leader, 12 account)"
+        );
 
         // Leader 2 sizes next, while leader 1's reservation of 10 is still
         // outstanding: only 12 - 10 = 2 of the strict balance remains.
-        let claimed_2 = claim_or_resume_intent(&db, intent_2).await.unwrap().unwrap();
-        let SizingOutcome::Decision(decision_2) = size_and_reserve(&db, &balance_reader, &claimed_2).await.unwrap() else {
+        let claimed_2 = claim_or_resume_intent(&db, intent_2)
+            .await
+            .unwrap()
+            .unwrap();
+        let SizingOutcome::Decision(decision_2) =
+            size_and_reserve(&db, &balance_reader, &claimed_2)
+                .await
+                .unwrap()
+        else {
             panic!("leader 2's sell must still size successfully, just smaller");
         };
         assert_eq!(
@@ -869,11 +1171,17 @@ mod tests {
         // No position_lots row at all: leader_virtual_lot is 0.
         let intent = seed_pending_intent(&db, 1, "123456", "SELL", "5", "0.50").await;
 
-        let balance_reader = FixedBalanceReader(Decimal::new(100, 0));
+        let balance_reader = FixedBalanceReader::new(Decimal::new(100, 0), Decimal::new(100, 0));
         let submitter = FullFillSubmitter;
-        let outcome = execute_intent(&db, &balance_reader, &submitter, intent).await.unwrap().unwrap();
+        let outcome = execute_intent(&db, &balance_reader, &submitter, intent)
+            .await
+            .unwrap()
+            .unwrap();
 
-        assert_eq!(outcome, ExecutionOutcome::NeedsReconcile("computed sell quantity is not positive"));
+        assert_eq!(
+            outcome,
+            ExecutionOutcome::NeedsReconcile("computed sell quantity is not positive")
+        );
         let status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
             .bind(intent)
             .fetch_one(&*db)
@@ -893,34 +1201,148 @@ mod tests {
             .unwrap();
         let intent = seed_pending_intent(&db, 1, "123456", "SELL", "5", "0.50").await;
 
-        let outcome = execute_intent(&db, &FailingBalanceReader, &FullFillSubmitter, intent).await.unwrap().unwrap();
-        assert_eq!(outcome, ExecutionOutcome::NeedsReconcile("strict token balance query failed"));
+        let outcome = execute_intent(&db, &FailingBalanceReader, &FullFillSubmitter, intent)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ExecutionOutcome::NeedsReconcile("strict token balance query failed")
+        );
     }
 
     #[tokio::test]
-    async fn replaying_the_same_receipt_after_a_simulated_crash_leaves_the_lot_unchanged_on_the_second_pass() {
+    async fn a_strict_collateral_query_failure_becomes_needs_reconcile_never_a_zero_balance() {
+        let db = TestDb::new().await;
+        seed_account_and_schedule(&db).await;
+        seed_leader(&db, 1).await;
+        let intent = seed_pending_intent(&db, 1, "123456", "BUY", "5", "0.50").await;
+
+        let outcome = execute_intent(&db, &FailingBalanceReader, &FullFillSubmitter, intent)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ExecutionOutcome::NeedsReconcile("strict collateral balance query failed")
+        );
+
+        let status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+            .bind(intent)
+            .fetch_one(&*db)
+            .await
+            .unwrap();
+        assert_eq!(status, "needs_reconcile");
+    }
+
+    #[tokio::test]
+    async fn a_buy_is_capped_by_confirmed_allowance_not_only_collateral_balance() {
+        let db = TestDb::new().await;
+        seed_account_and_schedule(&db).await;
+        seed_leader(&db, 1).await;
+        let intent = seed_pending_intent(&db, 1, "123456", "BUY", "20", "0.50").await;
+        let balance_reader = FixedBalanceReader::with_allowance(
+            Decimal::ZERO,
+            Decimal::new(100, 0),
+            Decimal::new(3, 0),
+        );
+
+        let claimed = claim_or_resume_intent(&db, intent).await.unwrap().unwrap();
+        let SizingOutcome::Decision(decision) = size_and_reserve(&db, &balance_reader, &claimed)
+            .await
+            .unwrap()
+        else {
+            panic!("positive confirmed allowance must produce a capped buy");
+        };
+
+        assert_eq!(decision.qty, Decimal::new(6, 0));
+        assert_eq!(decision.qty * decision.limit_price, Decimal::new(3, 0));
+    }
+
+    #[tokio::test]
+    async fn a_second_token_buy_cannot_overspend_collateral_reserved_by_the_first_buy() {
+        let db = TestDb::new().await;
+        seed_account_and_schedule(&db).await;
+        seed_leader(&db, 1).await;
+        seed_leader(&db, 2).await;
+        let intent_1 = seed_pending_intent(&db, 1, "111111", "BUY", "10", "0.50").await;
+        let intent_2 = seed_pending_intent(&db, 2, "222222", "BUY", "10", "0.50").await;
+        let balance_reader = FixedBalanceReader::new(Decimal::ZERO, Decimal::new(6, 0));
+
+        let claimed_1 = claim_or_resume_intent(&db, intent_1)
+            .await
+            .unwrap()
+            .unwrap();
+        let SizingOutcome::Decision(decision_1) =
+            size_and_reserve(&db, &balance_reader, &claimed_1)
+                .await
+                .unwrap()
+        else {
+            panic!("first buy must size successfully");
+        };
+        assert_eq!(decision_1.qty, Decimal::new(10, 0));
+        assert_eq!(decision_1.qty * decision_1.limit_price, Decimal::new(5, 0));
+
+        let claimed_2 = claim_or_resume_intent(&db, intent_2)
+            .await
+            .unwrap()
+            .unwrap();
+        let SizingOutcome::Decision(decision_2) =
+            size_and_reserve(&db, &balance_reader, &claimed_2)
+                .await
+                .unwrap()
+        else {
+            panic!("second buy must size down to remaining collateral");
+        };
+
+        assert_eq!(
+            decision_2.qty,
+            Decimal::new(2, 0),
+            "only 1 USDC remains after the first active 5 USDC buy reservation"
+        );
+        assert!(
+            decision_2.qty * decision_2.limit_price <= Decimal::new(1, 0),
+            "second buy notional must stay within remaining collateral"
+        );
+    }
+
+    #[tokio::test]
+    async fn replaying_the_same_receipt_after_a_simulated_crash_leaves_the_lot_unchanged_on_the_second_pass(
+    ) {
         let db = TestDb::new().await;
         seed_account_and_schedule(&db).await;
         seed_leader(&db, 1).await;
         let intent = seed_pending_intent(&db, 1, "123456", "BUY", "5", "0.50").await;
 
         let claimed = claim_or_resume_intent(&db, intent).await.unwrap().unwrap();
-        let balance_reader = FixedBalanceReader(Decimal::ZERO);
-        let SizingOutcome::Decision(decision) = size_and_reserve(&db, &balance_reader, &claimed).await.unwrap() else {
+        let balance_reader = FixedBalanceReader::new(Decimal::ZERO, Decimal::new(100, 0));
+        let SizingOutcome::Decision(decision) = size_and_reserve(&db, &balance_reader, &claimed)
+            .await
+            .unwrap()
+        else {
             panic!("must size successfully");
         };
-        let receipt = OrderReceipt::from_fak_buy_budget(decision.qty, decision.qty, decision.qty).unwrap();
+        let receipt =
+            OrderReceipt::from_fak_buy_budget(decision.qty, decision.qty, decision.qty).unwrap();
         let attempt_id = record_attempt(&db, &decision, 1, &receipt).await.unwrap();
 
         // First pass: applies the fill.
-        finalize_receipt(&db, intent, attempt_id, &receipt).await.unwrap();
+        finalize_receipt(&db, intent, attempt_id, &receipt)
+            .await
+            .unwrap();
         assert_eq!(lot_qty(&db, 1, "123456").await, Decimal::new(5, 0));
 
         // Second pass over the identical receipt (as if the process crashed
         // between the venue response and the first commit, and this is a
         // recovery replay): must not double-apply.
-        finalize_receipt(&db, intent, attempt_id, &receipt).await.unwrap();
-        assert_eq!(lot_qty(&db, 1, "123456").await, Decimal::new(5, 0), "a replayed receipt must not double-apply");
+        finalize_receipt(&db, intent, attempt_id, &receipt)
+            .await
+            .unwrap();
+        assert_eq!(
+            lot_qty(&db, 1, "123456").await,
+            Decimal::new(5, 0),
+            "a replayed receipt must not double-apply"
+        );
     }
 
     #[tokio::test]
@@ -931,7 +1353,10 @@ mod tests {
         let intent = seed_pending_intent(&db, 1, "123456", "BUY", "5", "0.50").await;
 
         let first_claim = claim_or_resume_intent(&db, intent).await.unwrap();
-        assert!(first_claim.is_some(), "the first claim of a pending intent must succeed");
+        assert!(
+            first_claim.is_some(),
+            "the first claim of a pending intent must succeed"
+        );
 
         // A second, independent claim attempt (simulating a second lane, or
         // a misrouted duplicate dispatch) against the now-in_progress
@@ -940,8 +1365,12 @@ mod tests {
         // not recompute a second, possibly-different reservation.
         let second_claim = claim_or_resume_intent(&db, intent).await.unwrap().unwrap();
 
-        let balance_reader = FixedBalanceReader(Decimal::ZERO);
-        let SizingOutcome::Decision(decision) = size_and_reserve(&db, &balance_reader, &second_claim).await.unwrap() else {
+        let balance_reader = FixedBalanceReader::new(Decimal::ZERO, Decimal::new(100, 0));
+        let SizingOutcome::Decision(decision) =
+            size_and_reserve(&db, &balance_reader, &second_claim)
+                .await
+                .unwrap()
+        else {
             panic!("resuming an in_progress intent must size successfully");
         };
 
@@ -951,7 +1380,10 @@ mod tests {
             .await
             .unwrap()
             .get(0);
-        assert_eq!(reserved, "5", "resuming must reuse the one persisted decision, not compute a second reservation");
+        assert_eq!(
+            reserved, "5",
+            "resuming must reuse the one persisted decision, not compute a second reservation"
+        );
         assert_eq!(decision.qty, Decimal::new(5, 0));
     }
 
@@ -966,9 +1398,17 @@ mod tests {
             .unwrap();
         let intent = seed_pending_intent(&db, 1, "123456", "SELL", "20", "0.50").await;
 
-        let balance_reader = FixedBalanceReader(Decimal::new(7, 0));
-        let outcome = execute_intent(&db, &balance_reader, &FullFillSubmitter, intent).await.unwrap().unwrap();
+        let balance_reader = FixedBalanceReader::new(Decimal::new(7, 0), Decimal::new(100, 0));
+        let outcome = execute_intent(&db, &balance_reader, &FullFillSubmitter, intent)
+            .await
+            .unwrap()
+            .unwrap();
 
-        assert_eq!(outcome, ExecutionOutcome::Filled { filled_qty: Decimal::new(7, 0) });
+        assert_eq!(
+            outcome,
+            ExecutionOutcome::Filled {
+                filled_qty: Decimal::new(7, 0)
+            }
+        );
     }
 }

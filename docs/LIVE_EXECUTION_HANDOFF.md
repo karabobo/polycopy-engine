@@ -1,14 +1,13 @@
 # Live execution handoff spec
 
-## Why this document exists
+> Historical handoff note: this document described the pre-writer state at
+> commit `7dfaf29`. It is retained for design history only. The current
+> implementation includes `IntlClobCopyAdapter` and bounded `copy_run`; the
+> authoritative operating boundary is now
+> [`LIVE_PROGRESSION_RUNBOOK.md`](LIVE_PROGRESSION_RUNBOOK.md). Do not use the
+> statements below that say the writer is missing as current deployment advice.
 
-Every phase of this project through Phase 6 was built and reviewed under one
-fixed rule: the assistant that wrote this codebase will never author or run
-the code that places a real order. That rule does not change with
-authorization, and it does not change because the account owner cannot write
-Rust themselves. It is documented here so a hired developer understands why
-this one piece was deliberately left out of an otherwise complete, tested
-system, and not because it was forgotten or deprioritized.
+## Why this document exists
 
 This document is the handoff: what exists, what is missing, and exactly what
 "done" looks like, so the account owner can verify delivered work without

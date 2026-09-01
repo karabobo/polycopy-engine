@@ -3,10 +3,9 @@
 //! `docs/COPY_ENGINE_BLUEPRINT.md`.
 //!
 //! Schema covers every table blueprint section 6 lists.
-//! `reconcile::CopyExecution` (Phase 5) and `execute::OrderSubmitter`
-//! (Phase 4) both have no implementation anywhere in this crate outside
-//! test code: neither this project nor its assistant ever submits a live
-//! order.
+//! Live venue writes live behind `CopyExecution` / `execute_one_intent` and
+//! the `copy_run` binary, gated by `POLYCOPY_ENGINE_EXECUTE=yes`. Tests use
+//! fakes and never contact the venue.
 
 pub mod control_tower;
 pub mod db;
@@ -14,6 +13,12 @@ pub mod plan;
 
 #[cfg(feature = "execute")]
 pub mod execute;
+
+#[cfg(all(feature = "execute", feature = "intl_clob"))]
+pub mod prepare;
+
+#[cfg(feature = "execute")]
+pub mod orchestrate;
 
 #[cfg(feature = "execute")]
 pub mod reconcile;
@@ -27,18 +32,30 @@ pub use control_tower::{
     IntentSummary, LeaderStatus, LotSummary, ReconciliationCaseSummary, SignalStatus,
 };
 pub use db::{open, open_and_migrate, DbError};
-pub use plan::{plan_next_batch, plan_next_batch_with_limit, PlanError, PlanSummary, PolicySnapshot};
+pub use plan::{
+    plan_next_batch, plan_next_batch_with_limit, verify_schedule_compatible_with_pending_work,
+    PlanError, PlanSummary, PolicySnapshot,
+};
 
 #[cfg(feature = "execute")]
-pub use execute::{execute_intent, finalize_receipt, ExecuteError, ExecutionOutcome, OrderSubmitter, Side, SizedDecision};
+pub use execute::{
+    execute_intent, finalize_receipt, ExecuteError, ExecutionOutcome, OrderSubmitter, Side,
+    SizedDecision,
+};
 
 #[cfg(feature = "execute")]
 pub use reconcile::{
-    attempts_in_window, load_or_prepare_attempt, mark_attempt_submitting,
+    attempts_in_window, load_or_prepare_attempt, mark_attempt_rejected, mark_attempt_submitting,
     mark_attempt_uncertain_after_submission_error, open_reconciliation_case,
     permitted_recovery_action, recover_fak_taker_order_from_trades,
     recover_lost_submission_response, CopyExecution, LostSubmissionRecoveryOutcome, OrderId,
-    PreparedOrderEnvelope, ReconcileError, RecoveryAction, TradeHistoryLookup,
-    TradeHistoryRecoveryError, TradeHistoryWindow, VenueOrderState,
-    MAX_ATTEMPTS_PER_WINDOW, RETRY_WINDOW_SECONDS,
+    PreparedOrderEnvelope, ReconcileError, RecoveryAction, SubmitError, TradeHistoryLookup,
+    TradeHistoryRecoveryError, TradeHistoryWindow, VenueOrderState, MAX_ATTEMPTS_PER_WINDOW,
+    RETRY_WINDOW_SECONDS,
+};
+
+#[cfg(feature = "execute")]
+pub use orchestrate::{
+    execute_one_intent, list_runnable_intents, live_execute_enabled, EnvelopeFactory,
+    OrchestrateError, OrchestrateOutcome,
 };

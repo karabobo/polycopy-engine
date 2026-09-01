@@ -20,6 +20,8 @@
 //! POLYCOPY_CANARY_SIZE=<decimal, positive>
 //! POLYCOPY_CANARY_CONFIRM_SUBMIT=yes      # only this exact value submits the first order
 //! POLYCOPY_CANARY_CONFIRM_DUPLICATE=yes   # only this exact value also submits the duplicate
+//! POLYCOPY_CANARY_VERIFY_TRADE_LOOKUP=yes # read-only exact taker_order_id check; never submits
+//! POLYCOPY_CANARY_EXPECTED_ORDER_ID=[persisted expected order ID for lookup mode]
 //! ```
 //!
 //! The order is always Fill-And-Kill: this project has no cancel-order
@@ -33,12 +35,11 @@
 async fn main() {
     use std::path::PathBuf;
 
-    use polycopy_engine::canary::{
-        write_new_record, CanaryLookupRecord, CanarySubmissionRecord,
-    };
+    use polycopy_engine::canary::{write_new_record, CanaryLookupRecord, CanarySubmissionRecord};
     use polycopy_engine::canary_run::{
         build_signable_order, expected_order_id, lookup_by_id, sign_twice, submit, CanaryRunConfig,
     };
+    use polycopy_engine::venue::intl_clob::{IntlClobReadAdapter, OutcomeTokenId};
     use polycopy_engine::venue::order_hash::format_order_id;
     use polymarket_client_sdk_v2::{clob::types::request::OrdersRequest, types::U256};
     use std::str::FromStr as _;
@@ -61,8 +62,74 @@ async fn main() {
             .authenticated_client()
             .await
             .map_err(|error| error.to_string())?;
-        let signer = config.signer().map_err(|error| error.to_string())?;
 
+        // This branch constructs no signer and no order. It is intentionally
+        // usable after a response-loss canary to prove whether the only
+        // documented read-only recovery key can find that exact FAK.
+        if std::env::var("POLYCOPY_CANARY_VERIFY_TRADE_LOOKUP").as_deref() == Ok("yes") {
+            let expected = std::env::var("POLYCOPY_CANARY_EXPECTED_ORDER_ID")
+                .map_err(|_| "missing POLYCOPY_CANARY_EXPECTED_ORDER_ID for read-only trade lookup")?;
+            if expected.trim().is_empty() {
+                return Err("POLYCOPY_CANARY_EXPECTED_ORDER_ID must not be empty".into());
+            }
+            let token = OutcomeTokenId::from_str(config.spec.token_id())
+                .map_err(|error| error.to_string())?;
+            let reader = IntlClobReadAdapter::new(client.clone());
+            let now = chrono::Utc::now();
+            let record = match reader
+                .trades_for_token_between(&token, now - chrono::Duration::hours(24), now)
+                .await
+            {
+                Ok(trades) => {
+                    let matches: Vec<_> = trades
+                        .iter()
+                        .filter(|trade| trade.taker_order_id == expected)
+                        .collect();
+                    match matches.as_slice() {
+                        [trade] => CanaryLookupRecord::found(
+                            &config.label,
+                            &now_utc(),
+                            "trade_history_taker_order_id",
+                            trade.taker_order_id.clone(),
+                            format!("{:?}", trade.status),
+                            trade.size.to_string(),
+                        ),
+                        [] => CanaryLookupRecord::not_found(
+                            &config.label,
+                            &now_utc(),
+                            "trade_history_taker_order_id",
+                        ),
+                        _ => CanaryLookupRecord::query_failed(
+                            &config.label,
+                            &now_utc(),
+                            "trade_history_taker_order_id",
+                            format!("ambiguous: {} exact taker_order_id matches", matches.len()),
+                        ),
+                    }
+                }
+                Err(error) => CanaryLookupRecord::query_failed(
+                    &config.label,
+                    &now_utc(),
+                    "trade_history_taker_order_id",
+                    error,
+                ),
+            };
+            let lookup_path = artifacts_dir.join("trade_history_taker_order_id.json");
+            write_new_record(
+                &lookup_path,
+                &serde_json::to_string_pretty(&record)
+                    .map_err(|error| format!("unable to serialize trade lookup: {error}"))?,
+            )
+            .map_err(|error| error.to_string())?;
+            println!(
+                "READ-ONLY trade-history lookup persisted: {} found={}",
+                lookup_path.display(),
+                record.found_order_id.as_deref() == Some(expected.as_str())
+            );
+            return Ok(());
+        }
+
+        let signer = config.signer().map_err(|error| error.to_string())?;
         let signable = build_signable_order(&client, &config.spec)
             .await
             .map_err(|error| error.to_string())?;

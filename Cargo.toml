@@ -34,6 +34,12 @@ ingest = [
 execute = [
     "db",
     "intl_clob",
+    "tokio/rt-multi-thread",
+    "tokio/time",
+]
+copy_run = [
+    "execute",
+    "ingest",
 ]
 
 [dependencies]

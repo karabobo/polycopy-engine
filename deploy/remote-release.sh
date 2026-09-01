@@ -89,7 +89,9 @@ git archive --format=tar "$commit" | "${ssh_args[@]}" "tar -x -C '$release_dir'"
     export PATH=\"\$(dirname \"\$cargo_bin\"):\$PATH\"
     \"\$cargo_bin\" build --release --all-features --locked
     test -x target/release/ghost_verify
+    test -x target/release/ghost_drift_report
     test -x target/release/canary_probe
+    test -x target/release/copy_run
     test -x target/release/lock_probe"
 
 # A symlink replacement is atomic on the same filesystem. No running process

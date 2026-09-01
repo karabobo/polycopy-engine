@@ -21,6 +21,22 @@ async fn main() {
             );
         }
 
+        // One structured, greppable line per run. A Phase 7 72-hour GHOST
+        // run is many separate invocations of this binary (e.g. one every
+        // few minutes via cron/systemd timer, the operator's own choice of
+        // scheduler -- this binary itself still runs exactly once and
+        // exits, same as always); the operator's wrapper appends this line
+        // to a log, and `ghost_drift_report` reads that log afterward to
+        // check the whole window for any mismatch, query failure, or gap
+        // wide enough to represent unexplained event loss. Contains only
+        // comparison results, never a credential or raw response body.
+        let record =
+            polycopy_engine::ghost_to_record(&report, config.snapshot_at_utc(), &now_utc());
+        println!(
+            "GHOST_RECORD: {}",
+            serde_json::to_string(&record).unwrap_or_default()
+        );
+
         if report.is_clean() {
             println!("GHOST verification is clean; this does not authorize automated trading.");
             Ok(())
@@ -34,6 +50,21 @@ async fn main() {
         eprintln!("GHOST verification failed: {error}");
         std::process::exit(3);
     }
+}
+
+#[cfg(feature = "intl_clob")]
+fn now_utc() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use chrono::SecondsFormat;
+
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time must be after the Unix epoch")
+        .as_secs();
+    polymarket_client_sdk_v2::types::DateTime::from_timestamp(secs as i64, 0)
+        .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .unwrap_or_default()
 }
 
 #[cfg(feature = "intl_clob")]

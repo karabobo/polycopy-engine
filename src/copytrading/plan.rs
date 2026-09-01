@@ -61,7 +61,10 @@ pub async fn plan_next_batch_with_limit(
     for event in &events {
         let decision = evaluate_event(pool, account_id, event, &schedule).await?;
 
-        let mut tx = pool.begin().await.map_err(|error| PlanError::Database(error.to_string()))?;
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|error| PlanError::Database(error.to_string()))?;
 
         sqlx::query(
             "INSERT OR IGNORE INTO copy_intents \
@@ -99,7 +102,9 @@ pub async fn plan_next_batch_with_limit(
         .await
         .map_err(|error| PlanError::Database(error.to_string()))?;
 
-        tx.commit().await.map_err(|error| PlanError::Database(error.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|error| PlanError::Database(error.to_string()))?;
 
         summary.processed += 1;
         if decision.rejection_reason.is_some() {
@@ -133,8 +138,54 @@ async fn load_execution_schedule(pool: &SqlitePool) -> Result<ExecutionSchedule,
         .fetch_optional(pool)
         .await
         .map_err(|error| PlanError::Database(error.to_string()))?
-        .map(|(shard_scheme_version, lane_count)| ExecutionSchedule { shard_scheme_version, lane_count })
+        .map(|(shard_scheme_version, lane_count)| ExecutionSchedule {
+            shard_scheme_version,
+            lane_count,
+        })
         .ok_or(PlanError::NoExecutionSchedule)
+}
+
+/// Refuses to proceed when the configured `execution_schedule` no longer
+/// matches what a non-terminal intent was originally sharded under.
+///
+/// Blueprint (section 12, "startup with a different lane count, shard
+/// algorithm, or scheme version must refuse to run while any older
+/// non-terminal intent exists"): an intent's `shard_id` is computed once,
+/// at planning time, from the `lane_count` active then
+/// (`plan_next_batch_with_limit` above). If the operator later changes
+/// `lane_count` or `shard_scheme_version` while an old intent is still
+/// `pending`/`in_progress`/`partially_filled`/`needs_reconcile`, that
+/// intent's `shard_id` no longer means what a lane worker under the new
+/// scheme would assume -- two lanes could both believe they own it, or none
+/// could. `completed`/`rejected`/`cancelled`/`dead_letter` intents are
+/// exempt: a terminal intent's shard assignment can no longer be acted on
+/// by anything, so a stale value there is inert, not a hazard.
+///
+/// This is a read-only check with no side effects; a caller (the process
+/// startup sequence, not this function) decides what "refuse to run" means.
+pub async fn verify_schedule_compatible_with_pending_work(
+    pool: &SqlitePool,
+) -> Result<(), PlanError> {
+    let schedule = load_execution_schedule(pool).await?;
+
+    let mismatched: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM copy_intents \
+         WHERE status IN ('pending', 'in_progress', 'partially_filled', 'needs_reconcile') \
+           AND (shard_scheme_version != ? OR lane_count != ?)",
+    )
+    .bind(schedule.shard_scheme_version)
+    .bind(schedule.lane_count)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| PlanError::Database(error.to_string()))?;
+
+    if mismatched > 0 {
+        return Err(PlanError::ScheduleChangedWithPendingWork {
+            stale_intent_count: mismatched,
+        });
+    }
+
+    Ok(())
 }
 
 struct Decision {
@@ -220,14 +271,17 @@ async fn evaluate_event(
         .map_err(|_| PlanError::InvalidDecimal("leader_policy snapshot"))?;
     let config_snapshot_hash = format!("{:016x}", hash_str(&config_snapshot_json));
 
-    let decision_deadline_at = observed_at + chrono::Duration::seconds(policy.decision_window_seconds);
+    let decision_deadline_at =
+        observed_at + chrono::Duration::seconds(policy.decision_window_seconds);
 
     Ok(Decision {
         config_snapshot_json,
         config_snapshot_hash,
         shard_id,
         rejection_reason: None,
-        decision_deadline_at: Some(decision_deadline_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+        decision_deadline_at: Some(
+            decision_deadline_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        ),
     })
 }
 
@@ -284,6 +338,7 @@ fn parse_rfc3339(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 pub enum PlanError {
     Database(String),
     NoExecutionSchedule,
+    ScheduleChangedWithPendingWork { stale_intent_count: i64 },
     InvalidTimestamp,
     InvalidDecimal(&'static str),
 }
@@ -296,7 +351,15 @@ impl fmt::Display for PlanError {
                 formatter,
                 "no execution_schedule row exists yet; the planner refuses to guess a lane count"
             ),
-            Self::InvalidTimestamp => write!(formatter, "a stored event timestamp is not valid RFC 3339"),
+            Self::ScheduleChangedWithPendingWork { stale_intent_count } => write!(
+                formatter,
+                "execution_schedule changed while {stale_intent_count} non-terminal intent(s) were \
+                 planned under the old lane count/shard scheme; refusing to start until they reach \
+                 a terminal status"
+            ),
+            Self::InvalidTimestamp => {
+                write!(formatter, "a stored event timestamp is not valid RFC 3339")
+            }
             Self::InvalidDecimal(field) => write!(formatter, "invalid decimal value in {field}"),
         }
     }
@@ -410,7 +473,10 @@ mod tests {
             time::{SystemTime, UNIX_EPOCH},
         };
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
         nanos.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 
@@ -435,13 +501,23 @@ mod tests {
         seed_account_and_leader(&db).await;
         insert_event(&db, "5", "2026-08-31T00:00:00.000Z").await;
 
-        let summary = plan_next_batch(&db, 1).await.expect("planning must succeed");
-        assert_eq!(summary, PlanSummary { processed: 1, pending: 0, rejected: 1 });
-
-        let reason: String = sqlx::query_scalar("SELECT rejection_reason FROM copy_intents LIMIT 1")
-            .fetch_one(&*db)
+        let summary = plan_next_batch(&db, 1)
             .await
-            .expect("intent must exist");
+            .expect("planning must succeed");
+        assert_eq!(
+            summary,
+            PlanSummary {
+                processed: 1,
+                pending: 0,
+                rejected: 1
+            }
+        );
+
+        let reason: String =
+            sqlx::query_scalar("SELECT rejection_reason FROM copy_intents LIMIT 1")
+                .fetch_one(&*db)
+                .await
+                .expect("intent must exist");
         assert_eq!(reason, "no policy configured for this leader");
     }
 
@@ -456,7 +532,9 @@ mod tests {
             .expect("leader must update");
         insert_event(&db, "5", "2026-08-31T00:00:00.000Z").await;
 
-        let summary = plan_next_batch(&db, 1).await.expect("planning must succeed");
+        let summary = plan_next_batch(&db, 1)
+            .await
+            .expect("planning must succeed");
         assert_eq!(summary.rejected, 1);
     }
 
@@ -467,7 +545,9 @@ mod tests {
         seed_policy(&db, 3600, "10").await;
         insert_event(&db, "5", &chrono::Utc::now().to_rfc3339()).await;
 
-        let summary = plan_next_batch(&db, 1).await.expect("planning must succeed");
+        let summary = plan_next_batch(&db, 1)
+            .await
+            .expect("planning must succeed");
         assert_eq!(summary.rejected, 1);
     }
 
@@ -479,13 +559,16 @@ mod tests {
         let ancient = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
         insert_event(&db, "5", &ancient).await;
 
-        let summary = plan_next_batch(&db, 1).await.expect("planning must succeed");
+        let summary = plan_next_batch(&db, 1)
+            .await
+            .expect("planning must succeed");
         assert_eq!(summary.rejected, 1);
 
-        let reason: String = sqlx::query_scalar("SELECT rejection_reason FROM copy_intents LIMIT 1")
-            .fetch_one(&*db)
-            .await
-            .expect("intent must exist");
+        let reason: String =
+            sqlx::query_scalar("SELECT rejection_reason FROM copy_intents LIMIT 1")
+                .fetch_one(&*db)
+                .await
+                .expect("intent must exist");
         assert_eq!(reason, "signal age exceeds policy");
     }
 
@@ -496,8 +579,17 @@ mod tests {
         seed_policy(&db, 3600, "1").await;
         insert_event(&db, "5", &chrono::Utc::now().to_rfc3339()).await;
 
-        let summary = plan_next_batch(&db, 1).await.expect("planning must succeed");
-        assert_eq!(summary, PlanSummary { processed: 1, pending: 1, rejected: 0 });
+        let summary = plan_next_batch(&db, 1)
+            .await
+            .expect("planning must succeed");
+        assert_eq!(
+            summary,
+            PlanSummary {
+                processed: 1,
+                pending: 1,
+                rejected: 0
+            }
+        );
 
         let (status, deadline): (String, Option<String>) =
             sqlx::query_as("SELECT status, decision_deadline_at FROM copy_intents LIMIT 1")
@@ -505,7 +597,10 @@ mod tests {
                 .await
                 .expect("intent must exist");
         assert_eq!(status, "pending");
-        assert!(deadline.is_some(), "a pending intent must have a decision deadline");
+        assert!(
+            deadline.is_some(),
+            "a pending intent must have a decision deadline"
+        );
     }
 
     #[tokio::test]
@@ -519,7 +614,9 @@ mod tests {
         seed_account_and_leader(&db).await;
         seed_policy(&db, 3600, "1").await;
         insert_event(&db, "5", &chrono::Utc::now().to_rfc3339()).await;
-        plan_next_batch(&db, 1).await.expect("planning must succeed");
+        plan_next_batch(&db, 1)
+            .await
+            .expect("planning must succeed");
 
         let snapshot_json: String =
             sqlx::query_scalar("SELECT config_snapshot_json FROM copy_intents LIMIT 1")
@@ -541,10 +638,15 @@ mod tests {
         insert_event(&db, "5", &chrono::Utc::now().to_rfc3339()).await;
 
         let first = plan_next_batch(&db, 1).await.expect("first planning run");
-        let second = plan_next_batch(&db, 1).await.expect("second planning run over the same events");
+        let second = plan_next_batch(&db, 1)
+            .await
+            .expect("second planning run over the same events");
 
         assert_eq!(first.processed, 1);
-        assert_eq!(second.processed, 0, "no new events past the cursor to replan");
+        assert_eq!(
+            second.processed, 0,
+            "no new events past the cursor to replan"
+        );
 
         let intent_count: i64 = sqlx::query("SELECT COUNT(*) FROM copy_intents")
             .fetch_one(&*db)
@@ -563,7 +665,9 @@ mod tests {
             insert_event(&db, "5", &chrono::Utc::now().to_rfc3339()).await;
         }
 
-        let summary = plan_next_batch(&db, 1).await.expect("planning must succeed");
+        let summary = plan_next_batch(&db, 1)
+            .await
+            .expect("planning must succeed");
         assert_eq!(summary.processed, 3);
 
         let max_event_id: i64 = sqlx::query("SELECT MAX(id) FROM leader_events")
@@ -571,11 +675,159 @@ mod tests {
             .await
             .expect("max id must be queryable")
             .get(0);
-        let cursor: i64 = sqlx::query("SELECT last_event_id FROM planner_cursor WHERE account_id = 1")
+        let cursor: i64 =
+            sqlx::query("SELECT last_event_id FROM planner_cursor WHERE account_id = 1")
+                .fetch_one(&*db)
+                .await
+                .expect("cursor must be queryable")
+                .get(0);
+        assert_eq!(
+            cursor, max_event_id,
+            "the cursor must advance to the last processed event"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_crash_between_intent_insert_and_cursor_advance_leaves_neither_persisted() {
+        // Phase 7 required test: "cursor crash injection." `plan_next_batch`
+        // wraps the intent insert and the cursor advance for one event in a
+        // single transaction (see the loop body above) so a real process
+        // crash between the two writes cannot happen -- SQLite rolls back
+        // everything an uncommitted transaction did the moment the
+        // connection that opened it goes away, which is exactly what
+        // dropping a `Transaction` without calling `.commit()` simulates
+        // here.
+        let db = TestDb::new().await;
+        seed_account_and_leader(&db).await;
+        let event_id = insert_event(&db, "5", &chrono::Utc::now().to_rfc3339()).await;
+
+        {
+            let mut tx = db.begin().await.expect("transaction must open");
+            sqlx::query(
+                "INSERT INTO copy_intents \
+                 (event_id, account_id, leader_id, token_id, side, config_snapshot_json, \
+                  config_snapshot_hash, shard_scheme_version, lane_count, shard_id, status) \
+                 VALUES (?, 1, 1, '123', 'BUY', '{}', 'hash', 1, 1, 0, 'pending')",
+            )
+            .bind(event_id)
+            .execute(&mut *tx)
+            .await
+            .expect("intent insert must succeed inside the open transaction");
+            sqlx::query(
+                "INSERT INTO planner_cursor (account_id, last_event_id) VALUES (1, ?) \
+                 ON CONFLICT(account_id) DO UPDATE SET last_event_id = excluded.last_event_id",
+            )
+            .bind(event_id)
+            .execute(&mut *tx)
+            .await
+            .expect("cursor update must succeed inside the open transaction");
+            // No `tx.commit()` -- dropping `tx` here is the crash.
+        }
+
+        let intent_count: i64 = sqlx::query("SELECT COUNT(*) FROM copy_intents")
             .fetch_one(&*db)
             .await
-            .expect("cursor must be queryable")
+            .unwrap()
             .get(0);
-        assert_eq!(cursor, max_event_id, "the cursor must advance to the last processed event");
+        assert_eq!(
+            intent_count, 0,
+            "the uncommitted intent must not survive the crash"
+        );
+
+        let cursor: Option<i64> =
+            sqlx::query_scalar("SELECT last_event_id FROM planner_cursor WHERE account_id = 1")
+                .fetch_optional(&*db)
+                .await
+                .unwrap();
+        assert_eq!(
+            cursor, None,
+            "the uncommitted cursor advance must not survive the crash"
+        );
+
+        // Recovery: a fresh plan_next_batch call sees the event as still
+        // unprocessed (cursor never advanced past it) and processes it
+        // exactly once, from scratch -- no manual repair needed.
+        seed_policy(&db, 3600, "1").await;
+        let summary = plan_next_batch(&db, 1)
+            .await
+            .expect("planning must succeed after the crash");
+        assert_eq!(summary.processed, 1);
+        let intent_count: i64 = sqlx::query("SELECT COUNT(*) FROM copy_intents")
+            .fetch_one(&*db)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            intent_count, 1,
+            "recovery must produce exactly one intent, not zero or two"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_to_start_when_a_non_terminal_intent_was_planned_under_a_different_lane_count()
+    {
+        let db = TestDb::new().await;
+        seed_account_and_leader(&db).await;
+        seed_policy(&db, 3600, "1").await;
+        insert_event(&db, "5", &chrono::Utc::now().to_rfc3339()).await;
+        plan_next_batch(&db, 1)
+            .await
+            .expect("planning must succeed");
+
+        // The operator changes lane_count while the intent above is still
+        // pending -- its stamped shard_id was computed under lane_count=1
+        // and no longer means what a lane worker under the new scheme
+        // would assume.
+        sqlx::query("UPDATE execution_schedule SET lane_count = 4 WHERE id = 1")
+            .execute(&*db)
+            .await
+            .unwrap();
+
+        let result = verify_schedule_compatible_with_pending_work(&db).await;
+        assert!(matches!(
+            result,
+            Err(PlanError::ScheduleChangedWithPendingWork {
+                stale_intent_count: 1
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn allows_starting_once_the_stale_intent_reaches_a_terminal_status() {
+        let db = TestDb::new().await;
+        seed_account_and_leader(&db).await;
+        seed_policy(&db, 3600, "1").await;
+        insert_event(&db, "5", &chrono::Utc::now().to_rfc3339()).await;
+        plan_next_batch(&db, 1)
+            .await
+            .expect("planning must succeed");
+
+        sqlx::query("UPDATE copy_intents SET status = 'completed'")
+            .execute(&*db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE execution_schedule SET lane_count = 4 WHERE id = 1")
+            .execute(&*db)
+            .await
+            .unwrap();
+
+        verify_schedule_compatible_with_pending_work(&db)
+            .await
+            .expect("a terminal intent's stale shard stamp is inert, not a hazard");
+    }
+
+    #[tokio::test]
+    async fn allows_starting_when_the_schedule_never_changed() {
+        let db = TestDb::new().await;
+        seed_account_and_leader(&db).await;
+        seed_policy(&db, 3600, "1").await;
+        insert_event(&db, "5", &chrono::Utc::now().to_rfc3339()).await;
+        plan_next_batch(&db, 1)
+            .await
+            .expect("planning must succeed");
+
+        verify_schedule_compatible_with_pending_work(&db)
+            .await
+            .expect("an unchanged schedule must never block startup");
     }
 }

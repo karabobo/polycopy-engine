@@ -18,7 +18,10 @@ use std::{fmt, str::FromStr as _};
 use chrono::SecondsFormat;
 use polymarket_client_sdk_v2::{
     data::{
-        types::{request::ActivityRequest, response::Activity, ActivitySortBy, ActivityType, Side, SortDirection},
+        types::{
+            request::ActivityRequest, response::Activity, ActivitySortBy, ActivityType, Side,
+            SortDirection,
+        },
         Client,
     },
     types::Address,
@@ -105,7 +108,15 @@ pub async fn backfill_leader(
         // path's observations. Still a faithful record for audit purposes.
         let raw_payload = format!("{activity:?}");
         let transaction_hash = trade.transaction_hash.clone();
-        let outcome = apply_trade(pool, resolver, &trade, "activity_backfill", &transaction_hash, &raw_payload).await;
+        let outcome = apply_trade(
+            pool,
+            resolver,
+            &trade,
+            "activity_backfill",
+            &transaction_hash,
+            &raw_payload,
+        )
+        .await;
         match outcome {
             ProcessOutcome::Ingested { .. } => summary.ingested += 1,
             ProcessOutcome::NotWatched => summary.skipped_not_watched += 1,
@@ -171,7 +182,10 @@ impl fmt::Display for BackfillError {
         match self {
             Self::Database(error) => write!(formatter, "database error: {error}"),
             Self::InvalidWatermark(value) => {
-                write!(formatter, "stored high-water mark is not valid RFC 3339: {value}")
+                write!(
+                    formatter,
+                    "stored high-water mark is not valid RFC 3339: {value}"
+                )
             }
             Self::InvalidAddress(value) => write!(formatter, "invalid leader address: {value}"),
             Self::InvalidLimit => write!(formatter, "invalid page limit"),
@@ -211,7 +225,10 @@ mod tests {
         assert_eq!(trade.outcome_index, 0);
         assert_eq!(trade.price, "0.5");
         assert_eq!(trade.size, "5");
-        assert_eq!(trade.trader_address, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(
+            trade.trader_address,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
     }
 
     #[test]
