@@ -22,6 +22,7 @@
 //! POLYCOPY_CANARY_CONFIRM_DUPLICATE=yes   # only this exact value also submits the duplicate
 //! POLYCOPY_CANARY_VERIFY_TRADE_LOOKUP=yes # read-only exact taker_order_id check; never submits
 //! POLYCOPY_CANARY_EXPECTED_ORDER_ID=[persisted expected order ID for lookup mode]
+//! POLYCOPY_CANARY_ARTIFACTS_DIR=/var/lib/polycopy-engine/canary-artifacts
 //! ```
 //!
 //! The order is always Fill-And-Kill: this project has no cancel-order
@@ -46,7 +47,10 @@ async fn main() {
 
     let result: Result<(), String> = async {
         let config = CanaryRunConfig::from_env().map_err(|error| error.to_string())?;
-        let artifacts_dir = PathBuf::from("canary-artifacts").join(&config.label);
+        let artifacts_root = std::env::var_os("POLYCOPY_CANARY_ARTIFACTS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("canary-artifacts"));
+        let artifacts_dir = artifacts_root.join(&config.label);
         let spec_path = artifacts_dir.join("spec.json");
 
         println!("== Phase 0.5 canary probe: {} ==", config.label);

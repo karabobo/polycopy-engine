@@ -14,7 +14,7 @@
 //! a shared refactor, so this new, higher-risk code path cannot regress the
 //! already-verified Phase 0 GHOST tool.
 
-use std::{error::Error, fmt, str::FromStr};
+use std::{collections::HashMap, env, error::Error, fmt, fs, path::PathBuf, str::FromStr};
 
 use polymarket_client_sdk_v2::{
     auth::{state::Authenticated, Credentials, LocalSigner, Normal, Signer},
@@ -51,6 +51,8 @@ const SIDE_ENV: &str = "POLYCOPY_CANARY_SIDE";
 const PRICE_ENV: &str = "POLYCOPY_CANARY_PRICE";
 const SIZE_ENV: &str = "POLYCOPY_CANARY_SIZE";
 const LABEL_ENV: &str = "POLYCOPY_CANARY_LABEL";
+const SYSTEMD_CREDENTIALS_DIRECTORY_ENV: &str = "CREDENTIALS_DIRECTORY";
+const SYSTEMD_SECRET_CREDENTIAL_NAME: &str = "polycopy-canary-secrets";
 
 /// Set to exactly `yes` to allow the one live `post_order` call. Any other
 /// value, including unset, keeps the probe a dry run.
@@ -72,7 +74,14 @@ pub struct CanaryRunConfig {
 
 impl CanaryRunConfig {
     pub fn from_env() -> Result<Self, CanaryRunConfigError> {
-        Self::from_lookup(|name| std::env::var(name).ok())
+        let systemd_secrets = load_systemd_secret_credential()?;
+        Self::from_lookup(|name| match &systemd_secrets {
+            // A systemd invocation has an explicit credential directory. In
+            // that mode signing/L2 material is accepted only from the
+            // credential file, never from the process environment.
+            Some(secrets) if secret_environment_name(name).is_some() => secrets.get(name).cloned(),
+            _ => env::var(name).ok(),
+        })
     }
 
     fn from_lookup<F>(lookup: F) -> Result<Self, CanaryRunConfigError>
@@ -387,12 +396,32 @@ fn parse_decimal(raw: &str, name: &'static str) -> Result<Decimal, CanaryRunConf
 
 #[derive(Debug)]
 pub enum CanaryRunConfigError {
-    MissingEnvironment { name: &'static str },
+    MissingEnvironment {
+        name: &'static str,
+    },
+    EmptySystemdCredentialsDirectory,
+    SystemdCredentialRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    InvalidSystemdCredentialEntry {
+        line: usize,
+    },
+    UnexpectedSystemdCredentialName {
+        line: usize,
+        name: String,
+    },
+    DuplicateSystemdCredentialName {
+        line: usize,
+        name: &'static str,
+    },
     InvalidFunderAddress,
     UnexpectedFunder,
     MissingFunder,
     InvalidSignatureType,
-    InvalidDecimal { name: &'static str },
+    InvalidDecimal {
+        name: &'static str,
+    },
     InvalidSide,
     IncompleteL2Credentials,
     InvalidL2Nonce,
@@ -404,6 +433,27 @@ impl fmt::Display for CanaryRunConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingEnvironment { name } => write!(formatter, "missing required {name}"),
+            Self::EmptySystemdCredentialsDirectory => write!(
+                formatter,
+                "CREDENTIALS_DIRECTORY is set but empty; systemd secret credential cannot be read"
+            ),
+            Self::SystemdCredentialRead { path, source } => write!(
+                formatter,
+                "unable to read systemd secret credential at {}: {source}",
+                path.display()
+            ),
+            Self::InvalidSystemdCredentialEntry { line } => write!(
+                formatter,
+                "systemd secret credential line {line} must use NAME=VALUE"
+            ),
+            Self::UnexpectedSystemdCredentialName { line, name } => write!(
+                formatter,
+                "systemd secret credential line {line} has unsupported name {name}"
+            ),
+            Self::DuplicateSystemdCredentialName { line, name } => write!(
+                formatter,
+                "systemd secret credential line {line} repeats {name}"
+            ),
             Self::InvalidFunderAddress => write!(formatter, "invalid CLOB funder address"),
             Self::UnexpectedFunder => write!(formatter, "EOA mode must not set a funder"),
             Self::MissingFunder => write!(formatter, "Poly1271 mode requires a funder"),
@@ -430,9 +480,76 @@ impl fmt::Display for CanaryRunConfigError {
 impl Error for CanaryRunConfigError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::SystemdCredentialRead { source, .. } => Some(source),
             Self::Spec(source) => Some(source),
             _ => None,
         }
+    }
+}
+
+type SystemdSecretValues = HashMap<&'static str, String>;
+
+/// Reads the one systemd credential file when launched by the static canary
+/// unit. Returning `None` retains the explicit local CLI workflow.
+fn load_systemd_secret_credential() -> Result<Option<SystemdSecretValues>, CanaryRunConfigError> {
+    let Some(directory) = env::var_os(SYSTEMD_CREDENTIALS_DIRECTORY_ENV) else {
+        return Ok(None);
+    };
+    if directory.is_empty() {
+        return Err(CanaryRunConfigError::EmptySystemdCredentialsDirectory);
+    }
+
+    let path = PathBuf::from(directory).join(SYSTEMD_SECRET_CREDENTIAL_NAME);
+    let contents = fs::read_to_string(&path).map_err(|source| {
+        CanaryRunConfigError::SystemdCredentialRead {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    parse_systemd_secret_credential(&contents).map(Some)
+}
+
+/// Parses only signing/L2 fields. Canary settings and both live-submit gates
+/// must remain in the public EnvironmentFile and cannot be smuggled through
+/// systemd credentials.
+fn parse_systemd_secret_credential(
+    contents: &str,
+) -> Result<SystemdSecretValues, CanaryRunConfigError> {
+    let mut values = SystemdSecretValues::new();
+
+    for (index, raw_line) in contents.lines().enumerate() {
+        let line = index + 1;
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let (raw_name, raw_value) = raw_line
+            .split_once('=')
+            .ok_or(CanaryRunConfigError::InvalidSystemdCredentialEntry { line })?;
+        let raw_name = raw_name.trim();
+        let name = secret_environment_name(raw_name).ok_or_else(|| {
+            CanaryRunConfigError::UnexpectedSystemdCredentialName {
+                line,
+                name: raw_name.to_owned(),
+            }
+        })?;
+        if values.insert(name, raw_value.to_owned()).is_some() {
+            return Err(CanaryRunConfigError::DuplicateSystemdCredentialName { line, name });
+        }
+    }
+
+    Ok(values)
+}
+
+fn secret_environment_name(name: &str) -> Option<&'static str> {
+    match name {
+        PRIVATE_KEY_ENV => Some(PRIVATE_KEY_ENV),
+        API_KEY_ENV => Some(API_KEY_ENV),
+        API_SECRET_ENV => Some(API_SECRET_ENV),
+        API_PASSPHRASE_ENV => Some(API_PASSPHRASE_ENV),
+        API_NONCE_ENV => Some(API_NONCE_ENV),
+        _ => None,
     }
 }
 
@@ -506,5 +623,49 @@ impl Error for CanaryRunError {
             | Self::NegRiskQuery(source) => Some(source),
             Self::OrderHash(source) => Some(source),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn systemd_secret_credential_accepts_only_signing_and_l2_material() {
+        let values = parse_systemd_secret_credential(
+            "# canary settings do not belong here\n\
+             POLYCOPY_CLOB_PRIVATE_KEY=0xtest\n\
+             POLYCOPY_CLOB_L2_API_KEY=key\n\
+             POLYCOPY_CLOB_L2_API_SECRET=secret=with=equals\n\
+             POLYCOPY_CLOB_L2_API_PASSPHRASE=passphrase\n",
+        )
+        .expect("recognized secret fields are accepted");
+
+        assert_eq!(
+            values.get(PRIVATE_KEY_ENV).map(String::as_str),
+            Some("0xtest")
+        );
+        assert_eq!(
+            values.get(API_SECRET_ENV).map(String::as_str),
+            Some("secret=with=equals")
+        );
+    }
+
+    #[test]
+    fn systemd_secret_credential_rejects_public_and_duplicate_fields() {
+        assert!(matches!(
+            parse_systemd_secret_credential("POLYCOPY_CANARY_CONFIRM_SUBMIT=yes\n"),
+            Err(CanaryRunConfigError::UnexpectedSystemdCredentialName { .. })
+        ));
+        assert!(matches!(
+            parse_systemd_secret_credential(
+                "POLYCOPY_CLOB_PRIVATE_KEY=first\nPOLYCOPY_CLOB_PRIVATE_KEY=second\n"
+            ),
+            Err(CanaryRunConfigError::DuplicateSystemdCredentialName { .. })
+        ));
+        assert!(matches!(
+            parse_systemd_secret_credential("POLYCOPY_CLOB_PRIVATE_KEY\n"),
+            Err(CanaryRunConfigError::InvalidSystemdCredentialEntry { line: 1 })
+        ));
     }
 }

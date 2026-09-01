@@ -131,6 +131,39 @@ All deployment scripts are hard-locked to the SSH alias
 `aliyun-8-220-180-39` and use key-only, strict-host-key SSH options. Supplying
 a different `POLYCOPY_DEPLOY_HOST` is rejected.
 
+## Phase 0.5 signing dry run
+
+The server also supports one manually started, static canary unit. Its default
+path authenticates, constructs an FAK order, signs it twice, and records the
+locally precomputed order ID. It makes no `POST /order` call. Install it after
+a release with:
+
+```sh
+deploy/install-canary-unit.sh
+```
+
+Create `/etc/polycopy-engine/canary-public.env` as root with mode `0600`. It
+contains only the wallet mode, funder, one currently tradable outcome token,
+FAK fields, an artifact directory, and a unique label. Do not set either
+`POLYCOPY_CANARY_CONFIRM_SUBMIT` or
+`POLYCOPY_CANARY_CONFIRM_DUPLICATE` for a dry run. The existing root-only
+`ghost-secrets.env` is loaded as a service-private systemd credential; the
+canary process accepts only signing/L2 fields from it.
+
+Run and inspect the dry run:
+
+```sh
+systemctl start polycopy-engine-canary.service
+systemctl status --no-pager polycopy-engine-canary.service
+journalctl -u polycopy-engine-canary.service --since '-10 min' --no-pager
+```
+
+Success must explicitly include `DRY RUN: no order was submitted to
+Polymarket.` plus a byte-identical-signature result and an expected order ID.
+The unit has no `[Install]` section, so it cannot be enabled as a timer. A
+successful signing dry run does not pass Phase 0.5 and does not authorize a
+real order.
+
 ## Evidence, backups, and production promotion
 
 Keep raw canary artifacts and the future SQLite database only on the server,

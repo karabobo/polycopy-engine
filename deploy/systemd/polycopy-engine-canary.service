@@ -1,0 +1,29 @@
+[Unit]
+Description=polycopy-engine Phase 0.5 CLOB canary probe (dry run by default)
+Documentation=file:/opt/polycopy-engine/current/docs/PHASE_0_5_CANARY_REPORT.md
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/polycopy-engine/canary-public.env
+ConditionPathExists=/etc/polycopy-engine/credentials/ghost-secrets.env
+ConditionPathExists=/opt/polycopy-engine/current/target/release/canary_probe
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/opt/polycopy-engine/current
+EnvironmentFile=/etc/polycopy-engine/canary-public.env
+LoadCredential=polycopy-canary-secrets:/etc/polycopy-engine/credentials/ghost-secrets.env
+ExecStart=/opt/polycopy-engine/current/target/release/canary_probe
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/polycopy-engine /var/log/polycopy-engine
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# There is intentionally no [Install] section: the unit is static and must be
+# started manually. It does not submit unless the public config contains the
+# separate exact confirmation gate, which this repository never writes.
