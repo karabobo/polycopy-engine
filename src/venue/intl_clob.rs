@@ -25,6 +25,16 @@ use polymarket_client_sdk_v2::{
     types::{Decimal, U256},
 };
 
+/// CLOB balance-allowance responses use the collateral/token's six-decimal
+/// atomic units even though the SDK deserializes them into `Decimal`. Every
+/// ledger, policy, and GHOST value in this project is expressed in human
+/// units, so this conversion belongs at the venue boundary.
+const CLOB_BALANCE_ATOMIC_SCALE: i64 = 1_000_000;
+
+fn from_clob_atomic_units(raw: Decimal) -> Decimal {
+    raw / Decimal::from(CLOB_BALANCE_ATOMIC_SCALE)
+}
+
 /// An outcome-token ID, not a market-wide condition ID.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OutcomeTokenId(U256);
@@ -296,7 +306,7 @@ impl StrictTokenBalanceReader for IntlClobReadAdapter {
         self.client
             .balance_allowance(request)
             .await
-            .map(|response| response.balance)
+            .map(|response| from_clob_atomic_units(response.balance))
             .map_err(|source| StrictPositionError::Query {
                 token_id: token_id.clone(),
                 source,
@@ -314,7 +324,7 @@ impl StrictAccountBalanceReader for IntlClobReadAdapter {
         self.client
             .balance_allowance(request)
             .await
-            .map(|response| response.balance)
+            .map(|response| from_clob_atomic_units(response.balance))
             .map_err(|source| StrictCollateralError::Query { source })
     }
 
@@ -334,6 +344,7 @@ impl StrictAccountBalanceReader for IntlClobReadAdapter {
             .into_values()
             .map(|raw| {
                 raw.parse::<Decimal>()
+                    .map(from_clob_atomic_units)
                     .map_err(|_| StrictCollateralError::InvalidAllowance { raw })
             })
             .collect::<Result<Vec<_>, _>>()?
@@ -405,5 +416,22 @@ impl Error for StrictCollateralError {
             Self::Query { source } => Some(source),
             Self::MissingAllowance | Self::InvalidAllowance { .. } => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn balance_allowance_atomic_units_are_normalized_before_entering_the_ledger() {
+        assert_eq!(
+            from_clob_atomic_units(Decimal::from(4_125_747_i64)),
+            Decimal::new(4_125_747, 6)
+        );
+        assert_eq!(
+            from_clob_atomic_units(Decimal::from(10_000_000_i64)),
+            Decimal::from(10_i64)
+        );
     }
 }
