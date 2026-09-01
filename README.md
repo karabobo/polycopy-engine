@@ -61,6 +61,11 @@ produce the evidence required by the Phase 0.5 gate. See
 status and [`docs/PHASE_0_5_CANARY_REPORT.md`](docs/PHASE_0_5_CANARY_REPORT.md)
 for the required real-order safety evidence template.
 
+The execution host's release, GHOST-only systemd unit, secret boundary, and
+production-promotion gates are documented in
+[`docs/SERVER_DEPLOYMENT.md`](docs/SERVER_DEPLOYMENT.md). The deployment
+scripts do not install or start a copy-trading service.
+
 The optional `intl_clob` feature enables **read-only**, strict per-outcome
 token balances and authenticated account-trade-history reads. It has no
 order-writing API; see

@@ -1,0 +1,26 @@
+[Unit]
+Description=polycopy-engine authenticated GHOST verification (read-only)
+Documentation=file:/opt/polycopy-engine/current/docs/SERVER_DEPLOYMENT.md
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/polycopy-engine/ghost.env
+ConditionPathExists=/opt/polycopy-engine/current/target/release/ghost_verify
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/opt/polycopy-engine/current
+EnvironmentFile=/etc/polycopy-engine/ghost.env
+ExecStart=/opt/polycopy-engine/current/target/release/ghost_verify
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/polycopy-engine /var/log/polycopy-engine
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# There is intentionally no [Install] section: the unit remains disabled and
+# must be started manually for one timestamped GHOST snapshot.
