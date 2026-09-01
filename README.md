@@ -368,7 +368,9 @@ venue. It defines a generic `CopyExecution` trait —
 Phase 4's `OrderSubmitter`, **`CopyExecution` has no implementation
 anywhere in this crate outside test code.** `submit_exact_envelope` is the
 one call that would write a live order; this project's assistant will
-never write or run it.
+never write or run it. See
+[`docs/LIVE_EXECUTION_HANDOFF.md`](docs/LIVE_EXECUTION_HANDOFF.md) for the
+handoff spec a hired developer would need to close this specific gap.
 
 What Phase 5 does implement, and test without ever calling a real venue,
 is the logic around that seam:
