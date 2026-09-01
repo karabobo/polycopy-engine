@@ -105,9 +105,10 @@ systemctl status --no-pager polycopy-engine-ghost.service
 journalctl -u polycopy-engine-ghost.service --since '-10 min' --no-pager
 ```
 
-The unit has no `[Install]` section and therefore cannot be enabled for
-automatic execution. A passing GHOST check is evidence only of a matching
-read-only snapshot; it never authorizes trading.
+The unit has no `[Install]` section and therefore its systemd state is
+`static`, not enabled: it cannot be enabled for automatic execution. A passing
+GHOST check is evidence only of a matching read-only snapshot; it never
+authorizes trading.
 
 All deployment scripts are hard-locked to the SSH alias
 `aliyun-8-220-180-39` and use key-only, strict-host-key SSH options. Supplying
