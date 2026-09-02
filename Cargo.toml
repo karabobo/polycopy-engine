@@ -59,7 +59,10 @@ async-trait = { version = "0.1", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 fs2 = "0.4.3"
 futures-util = { version = "0.3", default-features = false, optional = true }
-polymarket_client_sdk_v2 = { version = "=0.7.0", default-features = false, optional = true }
+# Fixed official 0.7.0 source (commit 222143d).  The local patch only makes
+# optional trade-fee metadata resilient to the venue's documented-in-practice
+# empty-string response; execution-critical fields remain strict.
+polymarket_client_sdk_v2 = { path = "vendor/polymarket_client_sdk_v2_source", default-features = false, optional = true }
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
 # Only needed to call CryptoProvider::install_default() once at startup:
 # rustls 0.23+ no longer picks a default crypto backend on its own, and

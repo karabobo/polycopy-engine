@@ -28,3 +28,9 @@
 /canary-artifacts/
 /ghost-artifacts/
 .DS_Store
+
+# Bootstrap clone used only to create the fixed, archive-only official SDK
+# source below. The source directory itself is deliberately tracked.
+/vendor/polymarket_client_sdk_v2/
+# Build products from an occasional standalone vendored-SDK test run.
+/vendor/polymarket_client_sdk_v2_source/target/
