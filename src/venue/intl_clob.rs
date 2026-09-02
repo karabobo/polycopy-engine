@@ -421,7 +421,77 @@ impl Error for StrictCollateralError {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{Read as _, Write as _},
+        net::TcpListener,
+        thread,
+    };
+
+    use chrono::TimeZone as _;
+    use polymarket_client_sdk_v2::{
+        auth::{Credentials, LocalSigner, Signer as _},
+        clob::{types::SignatureType, Client, Config},
+        POLYGON,
+    };
+
     use super::*;
+
+    fn trade_history_server(
+        responses: [(&'static str, &'static str); 3],
+    ) -> (String, thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener must bind");
+        let host = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let worker = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().expect("test client must connect");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut buffer).expect("request must be readable");
+                    assert!(read > 0, "request must contain complete headers");
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8(request).expect("request must be UTF-8"));
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                )
+                .expect("test response must be writable");
+            }
+            requests
+        });
+        (host, worker)
+    }
+
+    async fn authenticated_test_client(host: &str) -> Client<Authenticated<Normal>> {
+        let signer = LocalSigner::from_str(
+            "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8417e4edc86cb4f5d5",
+        )
+        .expect("test signing key must parse")
+        .with_chain_id(Some(POLYGON));
+        let client = Client::new(host, Config::default()).expect("test client must initialize");
+        client
+            .authentication_builder(&signer)
+            .credentials(Credentials::new(
+                "ffffffff-ffff-ffff-ffff-ffffffffffff"
+                    .parse()
+                    .expect("test API key must parse"),
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            ))
+            .signature_type(SignatureType::Eoa)
+            .authenticate()
+            .await
+            .expect("test client must authenticate locally")
+    }
 
     #[test]
     fn balance_allowance_atomic_units_are_normalized_before_entering_the_ledger() {
@@ -433,5 +503,56 @@ mod tests {
             from_clob_atomic_units(Decimal::from(10_000_000_i64)),
             Decimal::from(10_i64)
         );
+    }
+
+    #[tokio::test]
+    async fn delayed_trade_history_page_with_empty_fee_metadata_is_strictly_readable() {
+        const NOT_FOUND: &str = r#"{"error":"order not found"}"#;
+        const EMPTY_PAGE: &str = r#"{"data":[],"limit":100,"count":0,"next_cursor":"LTE="}"#;
+        const MATCHED_PAGE: &str = r#"{"data":[{"id":"trade-a","taker_order_id":"order-a","market":"0x000000000000000000000000000000000000000000000000000000006d61726b","asset_id":"123456","side":"BUY","size":"5.288460","fee_rate_bps":"","price":"0.20","status":"MATCHED","match_time":"1788264001","last_update":"1788264002","outcome":"YES","bucket_index":0,"owner":"ffffffff-ffff-ffff-ffff-ffffffffffff","maker_address":"0x2222222222222222222222222222222222222222","maker_orders":[{"order_id":"maker-a","owner":"ffffffff-ffff-ffff-ffff-ffffffffffff","maker_address":"0x4444444444444444444444444444444444444444","matched_amount":"5.288460","price":"0.20","fee_rate_bps":"","asset_id":"123456","outcome":"YES","side":"SELL"}],"transaction_hash":"","trader_side":"TAKER"}],"limit":100,"count":1,"next_cursor":"LTE="}"#;
+
+        let (host, server) = trade_history_server([
+            ("404 Not Found", NOT_FOUND),
+            ("200 OK", EMPTY_PAGE),
+            ("200 OK", MATCHED_PAGE),
+        ]);
+        let client = authenticated_test_client(&host).await;
+        assert!(
+            client.order("order-a").await.is_err(),
+            "an absent immediate by-ID record must remain a strict failure, not an empty receipt"
+        );
+        let reader = IntlClobReadAdapter::new(client);
+        let token = OutcomeTokenId::from_str("123456").expect("valid fixture token");
+        let after = Utc
+            .with_ymd_and_hms(2026, 9, 1, 12, 0, 0)
+            .single()
+            .expect("valid start time");
+        let before = Utc
+            .with_ymd_and_hms(2026, 9, 1, 12, 1, 0)
+            .single()
+            .expect("valid end time");
+
+        assert!(reader
+            .trades_for_token_between(&token, after, before)
+            .await
+            .expect("initial delayed page must be a successful empty read")
+            .is_empty());
+        let recovered = reader
+            .trades_for_token_between(&token, after, before)
+            .await
+            .expect("later matched page must deserialize despite empty fee metadata");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].taker_order_id, "order-a");
+        assert_eq!(recovered[0].size, Decimal::new(5_288_460, 6));
+
+        let requests = server.join().expect("test server must complete");
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].starts_with("GET /data/order/order-a "));
+        assert!(requests[1..]
+            .iter()
+            .all(|request| request.starts_with("GET /data/trades?")));
+        assert!(requests[1..]
+            .iter()
+            .all(|request| request.contains("asset_id=123456")));
     }
 }

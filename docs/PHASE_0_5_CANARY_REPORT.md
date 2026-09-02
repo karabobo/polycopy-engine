@@ -278,32 +278,35 @@ venue's matched-order submission ID and the authenticated trade-history
       `making_amount`/`taking_amount` are precise and matched the observed
       balance change exactly, **provided `filled_qty` is read from
       `taking_amount`, not from the requested `size`** (see Result 3).
-- [~] The exact lookup and recovery rule has a regression test. **Partial.**
+- [x] The exact lookup and recovery rule has a regression test.
       `CanaryLookupRecord::{found, not_found, query_failed}` in `canary.rs`
-      now encode the three outcomes discovered live (found; completed but
-      empty; the call itself failed), with unit tests
-      (`canary::tests::a_lookup_query_failure_is_recorded_not_a_reason_to_abort`
-      and its siblings) pinning that a lookup failure always produces a
-      persistable record instead of aborting the probe. This locks in the
-      *safety property* (never crash-and-lose-the-report on a failed lookup).
-      It does **not** replay the actual discovered venue sequence
-      (404-then-succeeds-later, empty-listing-for-a-matched-order) against a
-      mock server — doing that would need the CLOB host and authentication to
-      be injectable for tests, which is not yet built. That remains open.
+      retains separate records for found, completed-but-empty, and query-failed
+      outcomes. In addition, the local HTTP regression
+      `delayed_trade_history_page_with_empty_fee_metadata_is_strictly_readable`
+      now reproduces the observed sequence: by-ID order lookup returns 404,
+      the first authenticated trade-history page is a successful empty page,
+      and the later page carries the exact `taker_order_id`. It also uses the
+      empty top-level and maker-order fee metadata returned by the venue. The
+      test proves that only the optional fee fields are normalized; the order
+      ID and matched size remain precise inputs to strict recovery.
 
 The probe now also has a separate, read-only
 `POLYCOPY_CANARY_VERIFY_TRADE_LOOKUP=yes` mode. Given a persisted expected
 order ID and the token, it queries authenticated trade history over a bounded
 24-hour window and writes an exact `taker_order_id` match/miss/failure record.
-It never builds, signs, submits, retries, or duplicates an order. Running this
-against a known matched canary is the remaining live-only evidence required by
-the first checkbox; until its record exists and is independently reviewed, the
-gate remains not passed.
+It never builds, signs, submits, retries, or duplicates an order. Result 5
+provides the required known-matched live evidence; independent review remains
+the final gate.
 
-Decision: **not passed until every box is checked and independently reviewed.**
-The exact `taker_order_id` recovery fact is now live-proven. The remaining
-open item is the mock-server regression that reproduces the venue's
-404-then-later-history sequence, plus independent review. The known
-limitation remains: an order ID lost before durable persistence is not
-recoverable by the open-order listing, so automatic recovery must continue to
-depend on the persisted precomputed ID and fail closed otherwise.
+Decision: **passed after independent review on 2026-09-02.** The reviewer found
+no blocker: the mock makes GET requests only, the optional-fee normalization
+does not extend to accounting fields, and the exact-ID/no-resubmission recovery
+rules remain intact. All Phase 0.5 implementation and live-evidence checkboxes
+are complete.
+
+This decision validates the narrow Phase 0.5 canary gate only. It does not
+enable automated trading. The known limitation remains: an order ID lost before
+durable persistence is not recoverable by the open-order listing, so automatic
+recovery must continue to depend on the persisted precomputed ID and fail
+closed otherwise. Production copy execution remains subject to every later
+financial-correctness gate in the blueprint.
