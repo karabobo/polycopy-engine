@@ -35,7 +35,7 @@ pub use ghost::{
 };
 
 #[cfg(feature = "intl_clob")]
-pub use ghost_drift::{build_drift_report, DriftGap, DriftReport};
+pub use ghost_drift::{build_drift_report, DriftGap, DriftReport, MIN_GHOST_WINDOW_SECONDS};
 
 #[cfg(feature = "intl_clob")]
 pub use venue::intl_clob::{

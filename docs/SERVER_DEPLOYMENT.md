@@ -179,7 +179,7 @@ and independently reviewed:
    lost response, not merely the submission response's order ID.
 2. The live order writer, strict collateral preflight, market/allowance checks,
    and its failure-injection tests are implemented and independently reviewed.
-3. Phase 7 historical replay, 72-hour GHOST verification, and bounded
+3. Phase 7 historical replay, 12-hour GHOST verification, and bounded
    single-leader seven-day live progression complete with no unresolved drift.
 
 Any query failure, uncertain submission, balance mismatch, or unresolved

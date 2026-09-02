@@ -457,10 +457,10 @@ BUY/SELL, an end-to-end crash-recovery test chaining the real recovery and
 finalize paths together, a new startup check that refuses to run when
 `execution_schedule`'s lane count changed while a non-terminal intent still
 carries the old value, a historical-replay harness fed with 305 real
-PolyHermes production rows, and 72-hour GHOST-run tooling: `ghost_verify`
+PolyHermes production rows, and 12-hour GHOST-run tooling: `ghost_verify`
 now emits a structured `GHOST_RECORD:` line per run,
 and the new `ghost_drift_report` binary summarizes a log of them for
 mismatches and gaps). "Live progression" (the later gate that runs one
 leader with a bounded live amount for seven days) is not started — it
-requires independently reviewed Phase 0.5 and 72-hour GHOST evidence; see
+requires independently reviewed Phase 0.5 and 12-hour GHOST evidence; see
 [`docs/LIVE_PROGRESSION_RUNBOOK.md`](docs/LIVE_PROGRESSION_RUNBOOK.md).

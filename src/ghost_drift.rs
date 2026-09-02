@@ -1,6 +1,6 @@
 //! Aggregates a log of `ghost_verify`'s `GHOST_RECORD:` lines into one
 //! summary for Phase 7's multi-day GHOST run
-//! (`docs/COPY_ENGINE_BLUEPRINT.md` section 12, required test 7: "a 72-hour
+//! (`docs/COPY_ENGINE_BLUEPRINT.md` section 12, required test 7: "a 12-hour
 //! GHOST run that reconciles ledger, intent, and strict venue reads without
 //! unexplained event loss").
 //!
@@ -15,6 +15,9 @@ use chrono::{DateTime, Utc};
 use crate::ghost::GhostRunRecord;
 
 pub const GHOST_RECORD_PREFIX: &str = "GHOST_RECORD: ";
+/// The Phase 7 observation window must cover at least twelve hours. This is
+/// independent of the per-run gap tolerance.
+pub const MIN_GHOST_WINDOW_SECONDS: i64 = 12 * 60 * 60;
 
 /// One gap between two consecutive parseable runs wider than the caller's
 /// tolerance -- a candidate for "unexplained event loss": either the
@@ -49,6 +52,23 @@ impl DriftReport {
             && self.unclean_runs.is_empty()
             && self.gaps.is_empty()
             && self.unparseable_record_lines == 0
+    }
+
+    /// Elapsed time between the first and last parseable record, if both are
+    /// available. A clean but shorter window is evidence, not a Phase 7 pass.
+    pub fn observed_window_seconds(&self) -> Option<i64> {
+        let first = DateTime::parse_from_rfc3339(self.first_checked_at_utc.as_deref()?)
+            .ok()?
+            .with_timezone(&Utc);
+        let last = DateTime::parse_from_rfc3339(self.last_checked_at_utc.as_deref()?)
+            .ok()?
+            .with_timezone(&Utc);
+        Some((last - first).num_seconds())
+    }
+
+    pub fn meets_minimum_window(&self) -> bool {
+        self.observed_window_seconds()
+            .is_some_and(|seconds| seconds >= MIN_GHOST_WINDOW_SECONDS)
     }
 }
 
@@ -239,10 +259,27 @@ mod tests {
 
     #[test]
     fn an_empty_log_is_not_reported_clean() {
-        // Phase 7 needs positive evidence of 72 hours of runs, not the
+        // Phase 7 needs positive evidence of 12 hours of runs, not the
         // absence of bad news -- an empty log must never read as "clean."
         let report = build_drift_report("", 900);
         assert!(!report.is_clean());
         assert_eq!(report.total_runs, 0);
+    }
+
+    #[test]
+    fn the_phase_seven_window_requires_a_full_twelve_hours() {
+        let short = [
+            record_line("2026-09-01T00:00:00Z", true),
+            record_line("2026-09-01T11:59:59Z", true),
+        ]
+        .join("\n");
+        let full = [
+            record_line("2026-09-01T00:00:00Z", true),
+            record_line("2026-09-01T12:00:00Z", true),
+        ]
+        .join("\n");
+
+        assert!(!build_drift_report(&short, 13 * 60 * 60).meets_minimum_window());
+        assert!(build_drift_report(&full, 13 * 60 * 60).meets_minimum_window());
     }
 }

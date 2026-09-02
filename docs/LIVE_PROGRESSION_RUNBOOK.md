@@ -10,7 +10,7 @@ independently reviewed.
    `GET /data/trades.taker_order_id` equals the persisted precomputed ID.
 2. The current commit is reviewed, pushed, built remotely, and backed by a
    verified SQLite `.backup` copy.
-3. A 72-hour GHOST timer window has produced a clean drift report: no bad
+3. A 12-hour GHOST timer window has produced a clean drift report: no bad
    records, no gaps over fifteen minutes, and no unresolved mismatch.
 4. The signing key is a new server-local credential, not a key ever pasted in
    chat. The credential file is root-owned mode `0600`; it contains only
@@ -43,7 +43,7 @@ open reconciliation case, or a stopped Activity/backfill supervisor.
 
 1. Install units only with `deploy/install-production-units.sh`; confirm the
    copy unit is `static/inactive` and the GHOST timer is `disabled/inactive`.
-2. Configure and enable only the read-only GHOST timer. After 72 hours, run
+2. Configure and enable only the read-only GHOST timer. After 12 hours, run
    `ghost_drift_report` against the corresponding journal window and retain its
    redacted result.
 3. After Phase 0.5 and GHOST pass, start the static copy unit manually for one

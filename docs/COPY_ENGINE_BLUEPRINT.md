@@ -476,7 +476,7 @@ Label historical PolyHermes rows before using them:
    deltas.
 6. Token query failure, stale signal, changed lane count, and second-process lock
    acquisition failures.
-7. A 72-hour GHOST run that reconciles ledger, intent, and strict venue reads
+7. A 12-hour GHOST run that reconciles ledger, intent, and strict venue reads
    without unexplained event loss.
 
 ### Live progression

@@ -21,7 +21,7 @@ async fn main() {
             );
         }
 
-        // One structured, greppable line per run. A Phase 7 72-hour GHOST
+        // One structured, greppable line per run. A Phase 7 12-hour GHOST
         // run is many separate invocations of this binary (e.g. one every
         // few minutes via cron/systemd timer, the operator's own choice of
         // scheduler -- this binary itself still runs exactly once and

@@ -1,5 +1,5 @@
 //! Summarizes a log of `ghost_verify`'s `GHOST_RECORD:` lines for Phase 7's
-//! 72-hour GHOST run. Reads only a local log file; never contacts the venue,
+//! 12-hour GHOST run. Reads only a local log file; never contacts the venue,
 //! never opens a database, never reads a credential.
 //!
 //! ```text
@@ -9,7 +9,7 @@
 //! `max-gap-seconds` (default 1200 = 20 minutes) is the longest acceptable
 //! time between two consecutive runs' `checked_at_utc` before it counts as
 //! a gap; pick this to comfortably exceed the operator's own chosen run
-//! cadence (e.g. 4x a 5-minute cron interval), not the blueprint's 72-hour
+//! cadence (e.g. 4x a 5-minute cron interval), not the blueprint's 12-hour
 //! window itself.
 //!
 //! Exit code 0: every run in the log was clean, with no gap and no
@@ -21,7 +21,7 @@
 fn main() {
     use std::{fs, process};
 
-    use polycopy_engine::build_drift_report;
+    use polycopy_engine::{build_drift_report, MIN_GHOST_WINDOW_SECONDS};
 
     let mut args = std::env::args().skip(1);
     let Some(log_path) = args.next() else {
@@ -56,6 +56,14 @@ fn main() {
         report.first_checked_at_utc.as_deref().unwrap_or("(none)"),
         report.last_checked_at_utc.as_deref().unwrap_or("(none)")
     );
+    match report.observed_window_seconds() {
+        Some(seconds) => {
+            println!("window duration: {seconds}s (minimum required: {MIN_GHOST_WINDOW_SECONDS}s)")
+        }
+        None => {
+            println!("window duration: unavailable (minimum required: {MIN_GHOST_WINDOW_SECONDS}s)")
+        }
+    }
     if report.unparseable_record_lines > 0 {
         println!(
             "WARNING: {} GHOST_RECORD line(s) failed to parse as JSON -- the log itself may be truncated or corrupted",
@@ -75,12 +83,17 @@ fn main() {
         );
     }
 
-    if report.is_clean() {
+    if report.is_clean() && report.meets_minimum_window() {
         println!(
             "clean: {} run(s) covering the window above, no gap, no malformed record",
             report.total_runs
         );
     } else {
+        if report.is_clean() {
+            eprintln!(
+                "GHOST drift report is clean but has not yet covered the required 12-hour window"
+            );
+        }
         eprintln!("GHOST drift report is not clean; see above");
         process::exit(3);
     }

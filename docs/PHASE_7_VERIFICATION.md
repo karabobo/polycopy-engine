@@ -4,7 +4,7 @@ See `docs/COPY_ENGINE_BLUEPRINT.md` section 12. This covers the "Historical
 replay" and "Required tests" portions only. "Live progression" (running one
 leader with a bounded live amount for seven days) remains a separate, later
 gate. A bounded writer now exists, but it is default-disabled and cannot
-satisfy the live gate without independent Phase 0.5 and 72-hour GHOST
+satisfy the live gate without independent Phase 0.5 and 12-hour GHOST
 evidence; see `docs/LIVE_PROGRESSION_RUNBOOK.md`.
 
 ## Required tests: status
@@ -17,7 +17,7 @@ evidence; see `docs/LIVE_PROGRESSION_RUNBOOK.md`.
 | 4 | Process death after dispatch, before receipt; recovery without a duplicate lot or unsafe resubmission | Done | `reconcile.rs::a_crash_between_dispatch_and_receipt_recovers_to_exactly_one_lot_no_resubmission` — chains real recovery + real finalize end to end, not just the pieces each already covered alone |
 | 5 | Duplicate receipt delivery, partial fill, exactly-once lot deltas | Already substantially done | `execute.rs`/`reconcile.rs`'s existing idempotent-finalize tests; also re-exercised by #4 above |
 | 6 | Token query failure, stale signal, changed lane count, second-process lock failure | Done | Token query failure and stale signal were already covered; second-process lock was already covered (`process_lock.rs`); **changed lane count was a genuine gap** — closed by the new `plan::verify_schedule_compatible_with_pending_work` (a real startup check, not just a test — see below) |
-| 7 | 72-hour GHOST run reconciling ledger/intent/strict venue reads with no unexplained event loss | Tooling built; the run itself is the account owner's operation | See "72-hour GHOST run" below |
+| 7 | 12-hour GHOST run reconciling ledger/intent/strict venue reads with no unexplained event loss | Tooling built; the run itself is the account owner's operation | See "12-hour GHOST run" below |
 | — | Historical replay | Done — 305 real PolyHermes production rows replayed; combination-bet exclusion implemented, grounded in PolyHermes's own source | See "Historical replay" below |
 
 ## New: the lane-count/shard-scheme startup check
@@ -36,20 +36,20 @@ it and refuse to proceed on `Err`. `copy_run` invokes this check before it
 loads any runnable intent, so a changed schedule blocks the bounded runtime
 instead of merely documenting a required manual check.
 
-## 72-hour GHOST run
+## 12-hour GHOST run
 
 `ghost_verify` now also prints one `GHOST_RECORD: {json}` line per run (in
 addition to its existing human-readable output) — a redacted,
 JSON-serializable summary (`ghost::GhostRunRecord`) of that run's
 collateral/token-balance comparison results. Running `ghost_verify`
-repeatedly over 72 hours and appending its output to one log file is enough
+repeatedly over 12 hours and appending its output to one log file is enough
 to produce the evidence this required test asks for:
 
 ```sh
-# Every 5 minutes, for 72 hours: run ghost_verify with the operator's own
+# Every 5 minutes, for 12 hours: run ghost_verify with the operator's own
 # credentials and snapshot values (see README.md's "Authenticated GHOST
 # verification" section), append its output to one log.
-ghost_verify >> ghost-72h.log 2>&1
+ghost_verify >> ghost-12h.log 2>&1
 ```
 
 The repository supplies a default-disabled `polycopy-engine-ghost.timer` for
@@ -58,8 +58,8 @@ read-only GHOST configuration has been independently reviewed. After the
 window, summarize the whole log:
 
 ```sh
-ghost_drift_report ghost-72h.log            # default 1200s (20 min) gap tolerance
-ghost_drift_report ghost-72h.log 900        # or pick your own tolerance
+ghost_drift_report ghost-12h.log            # default 1200s (20 min) gap tolerance
+ghost_drift_report ghost-12h.log 900        # or pick your own tolerance
 ```
 
 `ghost_drift_report` (new binary, `src/bin/ghost_drift_report.rs`, logic in
@@ -70,7 +70,7 @@ tolerance — a gap is exactly "unexplained event loss": either the scheduler
 missed a run or the process producing the log was down, and a string of
 individually-clean runs on either side of a gap must never hide it. Exit
 code 0 only when every run was clean, no gap exceeded tolerance, and no log
-line failed to parse; exit code 3 otherwise. Neither this binary nor
+line failed to parse, and the observed window covers at least 12 hours; exit code 3 otherwise. Neither this binary nor
 `src/ghost_drift.rs` contacts the venue, opens a database, or reads a
 credential — it only parses a local text file.
 

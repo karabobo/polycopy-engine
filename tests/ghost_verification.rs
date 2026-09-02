@@ -211,7 +211,7 @@ impl StrictAccountBalanceReader for StubReader {
     }
 }
 
-// Phase 7's 72-hour GHOST run needs one persistable record per run so a
+// Phase 7's 12-hour GHOST run needs one persistable record per run so a
 // later pass can reconcile the whole window without holding a venue
 // connection open the entire time -- these tests lock in that the record
 // faithfully reflects a real GhostVerification produced by the exact same
