@@ -532,6 +532,7 @@ pub struct UserInfo {
 }
 
 #[non_exhaustive]
+#[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize, Builder, PartialEq)]
 #[builder(on(String, into))]
 pub struct MakerOrder {
@@ -540,6 +541,10 @@ pub struct MakerOrder {
     pub maker_address: Address,
     pub matched_amount: Decimal,
     pub price: Decimal,
+    // Maker fee is optional metadata for a counterparty's order.  The venue
+    // sometimes serializes it as an empty string; it is not copy-engine
+    // accounting input. Keep matched_amount and price strict.
+    #[serde_as(deserialize_as = "DefaultOnError")]
     pub fee_rate_bps: Decimal,
     pub asset_id: U256,
     pub outcome: String,

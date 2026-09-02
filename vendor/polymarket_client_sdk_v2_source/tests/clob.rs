@@ -1736,10 +1736,22 @@ mod authenticated {
     fn trade_response_accepts_empty_optional_fee_metadata() -> anyhow::Result<()> {
         let mut raw = trade_json("trade-empty-fee", "MATCHED", "");
         raw["fee_rate_bps"] = json!("");
+        raw["maker_orders"] = json!([{
+            "order_id": "maker-empty-fee",
+            "owner": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            "maker_address": "0x4444444444444444444444444444444444444444",
+            "matched_amount": "12.5",
+            "price": "0.42",
+            "fee_rate_bps": "",
+            "asset_id": token_1(),
+            "outcome": "YES",
+            "side": "SELL"
+        }]);
         let parsed: polymarket_client_sdk_v2::clob::types::response::TradeResponse =
             serde_json::from_value(raw)?;
 
         assert_eq!(parsed.fee_rate_bps, Decimal::ZERO);
+        assert_eq!(parsed.maker_orders[0].fee_rate_bps, Decimal::ZERO);
         assert_eq!(parsed.price, dec!(0.42));
         assert_eq!(parsed.size, dec!(12.5));
         Ok(())
