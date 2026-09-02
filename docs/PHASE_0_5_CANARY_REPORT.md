@@ -218,15 +218,27 @@ retry automatically or on a timer.
   true`. That closes the practical question of whether this project's
   offline computation identifies a real order regardless of whether it
   matches or is killed.
-  What remains technically unobserved is narrower: neither run called the
-  authenticated `GET /data/trades` endpoint itself, so the equivalence of
-  its specific `taker_order_id` field (rather than the order-submission
-  response's `order_id` field) to this same value has not been directly
-  witnessed — only inferred, since both fields should identify the same
-  order. `reconcile.rs`'s `recover_fak_taker_order_from_trades` reads that
-  endpoint, not the submission response, so a fully rigorous close of this
-  gap would query it once for a known-matched order and confirm the field
-  name and value both match.
+
+## Result 5: authenticated trade-history exact-ID lookup
+
+On 2026-09-02, the read-only canary mode queried the authenticated bounded
+`GET /data/trades` history for the token used by the matched 1-USDC-maximum
+FAK in Result 4. It found exactly the previously persisted precomputed ID in
+the response's `taker_order_id` field and recorded status `Confirmed`.
+
+This was deliberately a separate execution from the submission: the public
+configuration contained `POLYCOPY_CANARY_VERIFY_TRADE_LOOKUP=yes` and the
+expected ID, but neither order-submission confirmation key. The read-only
+branch does not construct, sign, submit, retry, or duplicate an order.
+
+The first attempt exposed two venue response-shape defects: empty strings in
+the top-level and maker-order `fee_rate_bps` fields prevented the official
+SDK from deserializing the trade page. Commit `b060ed7` vendors the official
+0.7.0 SDK source at its documented upstream revision and narrowly defaults
+only those optional fee metadata fields. Price, size, matched amount, order
+IDs, status, and timestamps remain strict. The second read-only lookup then
+succeeded. The deployed artifact is retained under the canary-artifacts
+directory with the recovery-lookup-2 label.
 
 ## Gate decision
 
@@ -242,26 +254,18 @@ accounting. An empty or delayed history, error, unknown status, malformed
 fingerprint, or contradictory duplicate data opens `needs_reconcile`; no path
 resubmits an uncertain order.
 
-Result 4 above live-proved that the precomputed identifier equals the
-venue's own assigned order ID, for the order-submission response, for both a
-rejected and a matched order. What remains **not directly observed** is the
-specific field `recover_fak_taker_order_from_trades` actually reads
-(`GET /data/trades`'s `taker_order_id`) — inferred to carry the same value,
-but not yet queried and checked in a live run.
+Results 4 and 5 live-prove that the precomputed identifier equals both the
+venue's matched-order submission ID and the authenticated trade-history
+`taker_order_id` the recovery code actually reads.
 
-- [ ] Lookup is deterministic from persisted envelope data. **Not proven —
-      and now partially disproven, partially strengthened.** By-ID lookup
+- [x] Lookup is deterministic from persisted envelope data. **Proven for the
+      exact precomputed-ID path in Result 5.** By-ID lookup
       works, but only after an unmeasured indexing delay (confirmed clear by
       ~6 hours; confirmed absent immediately after matching, and reconfirmed
       on 2026-09-01). The field-based fallback for a truly lost order ID
       (asset_id-filtered listing) does **not** find a matched order at all —
       it only lists open orders. A crash before the order ID is durably
-      recorded is not currently recoverable by either lookup path alone. On
-      the other hand, Result 4 now proves the order ID itself *can* be
-      computed deterministically offline, before any submission, for both a
-      rejected and a matched order — the remaining gap is specifically
-      whether `GET /data/trades`'s `taker_order_id` field carries the same
-      value, not the ID computation itself.
+      recorded is not currently recoverable by either lookup path alone.
 - [x] Byte-identical duplicate behavior is safe for the intended retry
       policy. **Tested live on 2026-09-01** (Result 2, "Live result"):
       resubmitting the identical signed bytes for an already-matched order
@@ -297,18 +301,9 @@ the first checkbox; until its record exists and is independently reviewed, the
 gate remains not passed.
 
 Decision: **not passed until every box is checked and independently reviewed.**
-Three of the four boxes now have a live-tested answer; two of those three are
-positive. Confirmed in the negative: the field-based fallback lookup does not
-recover a matched order, so a lost order ID before durable persistence is
-currently an unrecoverable gap, not just an untested one — later phases must
-close it with a different mechanism before relying on automatic recovery.
-Confirmed in the positive: Result 4 proves this project's offline order-ID
-computation matches the venue's own assigned ID, for both a rejected and a
-matched order, and Result 2's live result proves a byte-identical duplicate
-submission is rejected deterministically, never silently double-filled. What
-remains open is narrower than before: whether `GET /data/trades`'s
-`taker_order_id` field specifically (not just the submission response's
-`order_id`) carries the same value, and the regression-test-against-a-mock
-item, which was already only partial. Those, and independent review of the
-two now-positive results, are what this gate still needs before it can be
-marked passed.
+The exact `taker_order_id` recovery fact is now live-proven. The remaining
+open item is the mock-server regression that reproduces the venue's
+404-then-later-history sequence, plus independent review. The known
+limitation remains: an order ID lost before durable persistence is not
+recoverable by the open-order listing, so automatic recovery must continue to
+depend on the persisted precomputed ID and fail closed otherwise.
