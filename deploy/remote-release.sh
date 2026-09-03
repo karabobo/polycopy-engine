@@ -93,6 +93,7 @@ git archive --format=tar "$commit" | "${ssh_args[@]}" "tar -x -C '$release_dir'"
     test -x target/release/canary_probe
     test -x target/release/copy_run
     test -x target/release/copy_setup
+    test -x target/release/copy_policy_setup
     test -x target/release/lock_probe"
 
 # A symlink replacement is atomic on the same filesystem. No running process

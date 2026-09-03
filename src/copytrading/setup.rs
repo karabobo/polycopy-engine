@@ -28,6 +28,47 @@ pub struct InitialCopySetupResult {
     pub activation_at: String,
 }
 
+/// Applies the short-deadline policy only before the account has observed an
+/// event or created execution work. This makes a timing-policy change an
+/// explicit, auditable operation instead of a hand edit to the live ledger.
+pub async fn configure_fresh_high_frequency_policy(pool: &SqlitePool) -> Result<(), SetupError> {
+    let mut tx = pool.begin().await.map_err(SetupError::Database)?;
+    let account_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(SetupError::Database)?;
+    let leader_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM leader_config WHERE enabled = 1")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(SetupError::Database)?;
+    let policy_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM leader_policy")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(SetupError::Database)?;
+    let work_count: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM leader_events) + (SELECT COUNT(*) FROM copy_intents) \
+         + (SELECT COUNT(*) FROM order_attempts) + (SELECT COUNT(*) FROM reconciliation_cases)",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(SetupError::Database)?;
+    if (account_count, leader_count, policy_count, work_count) != (1, 1, 1, 0) {
+        return Err(SetupError::UnsafePolicyReconfiguration);
+    }
+    let result = sqlx::query(
+        "UPDATE leader_policy SET max_signal_age_seconds = 3, decision_window_seconds = 3 \
+         WHERE leader_id = 1",
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(SetupError::Database)?;
+    if result.rows_affected() != 1 {
+        return Err(SetupError::UnsafePolicyReconfiguration);
+    }
+    tx.commit().await.map_err(SetupError::Database)
+}
+
 /// Creates exactly one test account, one enabled leader, its policy, and a
 /// one-lane execution schedule in one transaction.
 pub async fn initialize_fresh_test_copy_setup(
@@ -146,6 +187,7 @@ pub enum SetupError {
     InvalidActivationTimestamp,
     InvalidMaxOrderNotional,
     UnsupportedSignatureType,
+    UnsafePolicyReconfiguration,
 }
 
 impl fmt::Display for SetupError {
@@ -168,6 +210,10 @@ impl fmt::Display for SetupError {
             Self::UnsupportedSignatureType => {
                 write!(formatter, "test setup currently requires gnosis_safe")
             }
+            Self::UnsafePolicyReconfiguration => write!(
+                formatter,
+                "high-frequency policy may only be set before any event, intent, order attempt, or reconciliation case exists"
+            ),
         }
     }
 }
@@ -214,6 +260,17 @@ mod tests {
             initialize_fresh_test_copy_setup(&pool, &setup).await,
             Err(SetupError::AlreadyConfigured)
         ));
+
+        configure_fresh_high_frequency_policy(&pool)
+            .await
+            .expect("empty initialized ledger may receive the short policy");
+        let policy: (i64, i64) = sqlx::query_as(
+            "SELECT max_signal_age_seconds, decision_window_seconds FROM leader_policy WHERE leader_id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("policy must exist");
+        assert_eq!(policy, (3, 3));
 
         drop(pool);
         let _ = std::fs::remove_file(&path);

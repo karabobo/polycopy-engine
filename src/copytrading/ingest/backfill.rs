@@ -15,7 +15,7 @@
 
 use std::{fmt, str::FromStr as _};
 
-use chrono::SecondsFormat;
+use chrono::{DateTime, SecondsFormat, Utc};
 use polymarket_client_sdk_v2::{
     data::{
         types::{
@@ -35,6 +35,7 @@ use super::{
 };
 
 const PAGE_LIMIT: i32 = 500;
+const MAX_PAGE_OFFSET: i32 = 10_000;
 /// A small overlap before the high-water mark, so a trade landing right at
 /// the boundary of the previous run is never missed by an exclusive cursor.
 const OVERLAP_SECONDS: i64 = 30;
@@ -49,9 +50,11 @@ pub struct BackfillSummary {
 }
 
 /// Fetches and applies every trade `leader_address` (the leader identified
-/// by `leader_id`) has made since this leader's high-water mark (the latest
-/// `occurred_at` already recorded for it, or the beginning of time if none
-/// yet), minus a small overlap.
+/// by `leader_id`) since activation or its high-water mark, minus a small
+/// overlap. The first page is deliberately newest-first: a high-frequency
+/// leader must not be starved behind historical rows. All pages are fetched
+/// before any row is applied, so an API pagination ceiling cannot silently
+/// advance the durable high-water mark past missing activity.
 pub async fn backfill_leader(
     pool: &SqlitePool,
     resolver: &AddressResolver,
@@ -59,6 +62,15 @@ pub async fn backfill_leader(
     leader_id: i64,
     leader_address: &str,
 ) -> Result<BackfillSummary, BackfillError> {
+    let activation_at: Option<String> =
+        sqlx::query_scalar("SELECT activation_at FROM leader_config WHERE id = ?")
+            .bind(leader_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| BackfillError::Database(error.to_string()))?
+            .flatten();
+    let activation_at = activation_at.ok_or(BackfillError::LeaderNotActivated(leader_id))?;
+    let activation_at = parse_cursor(&activation_at, BackfillError::InvalidActivationTimestamp)?;
     let high_water_mark: Option<String> =
         sqlx::query_scalar("SELECT MAX(occurred_at) FROM leader_events WHERE leader_id = ?")
             .bind(leader_id)
@@ -66,32 +78,46 @@ pub async fn backfill_leader(
             .await
             .map_err(|error| BackfillError::Database(error.to_string()))?;
 
-    let start_unix: u64 = match high_water_mark {
-        Some(watermark) => {
-            let parsed = chrono::DateTime::parse_from_rfc3339(&watermark)
-                .map_err(|_| BackfillError::InvalidWatermark(watermark.clone()))?;
-            (parsed.timestamp() - OVERLAP_SECONDS).max(0) as u64
-        }
-        None => 0,
-    };
+    let start_unix = backfill_start_unix(activation_at, high_water_mark.as_deref())?;
+    // Freeze the request range. Without a fixed end, offset pagination can
+    // shift underneath a high-frequency account and skip a row.
+    let end_unix = Utc::now().timestamp().max(0) as u64;
 
     let user = Address::from_str(leader_address)
         .map_err(|_| BackfillError::InvalidAddress(leader_address.to_owned()))?;
 
-    let request = ActivityRequest::builder()
-        .user(user)
-        .activity_types(vec![ActivityType::Trade])
-        .start(start_unix)
-        .sort_by(ActivitySortBy::Timestamp)
-        .sort_direction(SortDirection::Asc)
-        .limit(PAGE_LIMIT)
-        .map_err(|_| BackfillError::InvalidLimit)?
-        .build();
-
-    let activities = client
-        .activity(&request)
-        .await
-        .map_err(|error| BackfillError::Fetch(error.to_string()))?;
+    let mut activities = Vec::new();
+    let mut offset = 0;
+    loop {
+        let request = ActivityRequest::builder()
+            .user(user)
+            .activity_types(vec![ActivityType::Trade])
+            .start(start_unix)
+            .end(end_unix)
+            .sort_by(ActivitySortBy::Timestamp)
+            .sort_direction(SortDirection::Desc)
+            .limit(PAGE_LIMIT)
+            .map_err(|_| BackfillError::InvalidLimit)?
+            .offset(offset)
+            .map_err(|_| BackfillError::InvalidOffset)?
+            .build();
+        let page = client
+            .activity(&request)
+            .await
+            .map_err(|error| BackfillError::Fetch(error.to_string()))?;
+        let page_len = page.len();
+        activities.extend(page);
+        if page_len < PAGE_LIMIT as usize {
+            break;
+        }
+        if offset >= MAX_PAGE_OFFSET {
+            return Err(BackfillError::PaginationLimit {
+                start_unix,
+                end_unix,
+            });
+        }
+        offset += PAGE_LIMIT;
+    }
 
     let mut summary = BackfillSummary {
         fetched: activities.len(),
@@ -129,6 +155,29 @@ pub async fn backfill_leader(
     }
 
     Ok(summary)
+}
+
+fn parse_cursor(
+    raw: &str,
+    error: impl FnOnce(String) -> BackfillError,
+) -> Result<DateTime<Utc>, BackfillError> {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| error(raw.to_owned()))
+}
+
+fn backfill_start_unix(
+    activation_at: DateTime<Utc>,
+    high_water_mark: Option<&str>,
+) -> Result<u64, BackfillError> {
+    let cursor = match high_water_mark {
+        Some(watermark) => parse_cursor(watermark, BackfillError::InvalidWatermark)?,
+        None => activation_at,
+    };
+    Ok((cursor - chrono::Duration::seconds(OVERLAP_SECONDS))
+        .max(activation_at)
+        .timestamp()
+        .max(0) as u64)
 }
 
 /// Pure conversion from the Data API's strongly-typed `Activity` row into
@@ -172,8 +221,12 @@ fn normalize_rest_activity(activity: &Activity) -> Option<NormalizedTrade> {
 pub enum BackfillError {
     Database(String),
     InvalidWatermark(String),
+    InvalidActivationTimestamp(String),
+    LeaderNotActivated(i64),
     InvalidAddress(String),
     InvalidLimit,
+    InvalidOffset,
+    PaginationLimit { start_unix: u64, end_unix: u64 },
     Fetch(String),
 }
 
@@ -187,8 +240,25 @@ impl fmt::Display for BackfillError {
                     "stored high-water mark is not valid RFC 3339: {value}"
                 )
             }
+            Self::InvalidActivationTimestamp(value) => {
+                write!(
+                    formatter,
+                    "leader activation timestamp is not valid RFC 3339: {value}"
+                )
+            }
+            Self::LeaderNotActivated(leader_id) => {
+                write!(formatter, "leader {leader_id} has no activation timestamp")
+            }
             Self::InvalidAddress(value) => write!(formatter, "invalid leader address: {value}"),
             Self::InvalidLimit => write!(formatter, "invalid page limit"),
+            Self::InvalidOffset => write!(formatter, "invalid activity pagination offset"),
+            Self::PaginationLimit {
+                start_unix,
+                end_unix,
+            } => write!(
+                formatter,
+                "activity pagination exceeded the safe limit for {start_unix}..{end_unix}"
+            ),
             Self::Fetch(error) => write!(formatter, "unable to fetch activity: {error}"),
         }
     }
@@ -228,6 +298,28 @@ mod tests {
         assert_eq!(
             trade.trader_address,
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
+
+    #[test]
+    fn initial_backfill_starts_at_activation_not_the_beginning_of_history() {
+        let activation = DateTime::parse_from_rfc3339("2026-09-03T07:12:30Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            backfill_start_unix(activation, None).unwrap(),
+            1_788_419_550
+        );
+    }
+
+    #[test]
+    fn overlap_never_precedes_activation() {
+        let activation = DateTime::parse_from_rfc3339("2026-09-03T07:12:30Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            backfill_start_unix(activation, Some("2026-09-03T07:12:45Z")).unwrap(),
+            1_788_419_550
         );
     }
 

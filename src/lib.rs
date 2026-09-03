@@ -29,7 +29,8 @@ pub use venue::{OrderReceipt, ReceiptError};
 
 #[cfg(feature = "db")]
 pub use copytrading::{
-    initialize_fresh_test_copy_setup, InitialCopySetup, InitialCopySetupResult, SetupError,
+    configure_fresh_high_frequency_policy, initialize_fresh_test_copy_setup, InitialCopySetup,
+    InitialCopySetupResult, SetupError,
 };
 
 #[cfg(feature = "intl_clob")]
