@@ -55,8 +55,15 @@ async fn main() {
     }
 
     fn log_observe_event(kind: ObserveEventKind, detail: impl Into<String>) {
-        let event = ObserveEvent { at_utc: now_utc(), kind, detail: detail.into() };
-        println!("{OBSERVE_EVENT_PREFIX}{}", serde_json::to_string(&event).unwrap_or_default());
+        let event = ObserveEvent {
+            at_utc: now_utc(),
+            kind,
+            detail: detail.into(),
+        };
+        println!(
+            "{OBSERVE_EVENT_PREFIX}{}",
+            serde_json::to_string(&event).unwrap_or_default()
+        );
     }
 
     let result: Result<(), String> = async {
@@ -159,11 +166,14 @@ async fn main() {
         enabled: Vec<(i64, String)>,
         every: Duration,
     ) {
-        use polycopy_engine::copytrading::ingest::{ObserveEvent, ObserveEventKind, OBSERVE_EVENT_PREFIX};
+        use polycopy_engine::copytrading::ingest::{
+            ObserveEvent, ObserveEventKind, OBSERVE_EVENT_PREFIX,
+        };
 
         loop {
             for (leader_id, address) in &enabled {
-                match backfill_leader(&pool, resolver.as_ref(), &client, *leader_id, address).await {
+                match backfill_leader(&pool, resolver.as_ref(), &client, *leader_id, address).await
+                {
                     Ok(summary) => println!(
                         "backfill leader {leader_id}: fetched={} ingested={} rejected={}",
                         summary.fetched, summary.ingested, summary.rejected
@@ -171,11 +181,15 @@ async fn main() {
                     Err(error) => {
                         eprintln!("backfill leader {leader_id} failed: {error}");
                         let event = ObserveEvent {
-                            at_utc: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                            at_utc: chrono::Utc::now()
+                                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                             kind: ObserveEventKind::BackfillFailure,
                             detail: format!("leader {leader_id}: {error}"),
                         };
-                        println!("{OBSERVE_EVENT_PREFIX}{}", serde_json::to_string(&event).unwrap_or_default());
+                        println!(
+                            "{OBSERVE_EVENT_PREFIX}{}",
+                            serde_json::to_string(&event).unwrap_or_default()
+                        );
                     }
                 }
             }

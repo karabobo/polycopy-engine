@@ -87,7 +87,10 @@ pub enum WsConnectionEventKind {
 pub const WS_EVENT_PREFIX: &str = "WS_EVENT: ";
 
 fn log_ws_event(event: &WsConnectionEvent) {
-    println!("{WS_EVENT_PREFIX}{}", serde_json::to_string(event).unwrap_or_default());
+    println!(
+        "{WS_EVENT_PREFIX}{}",
+        serde_json::to_string(event).unwrap_or_default()
+    );
 }
 
 fn now_utc() -> String {

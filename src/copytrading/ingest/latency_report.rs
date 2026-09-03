@@ -121,7 +121,9 @@ pub async fn query_observation_rows(
 pub fn build_report(rows: &[ObservationRow]) -> LatencyReport {
     let mut by_event: BTreeMap<i64, (&str, BTreeMap<&str, &str>)> = BTreeMap::new();
     for (event_id, occurred_at, source, observed_at) in rows {
-        let entry = by_event.entry(*event_id).or_insert_with(|| (occurred_at.as_str(), BTreeMap::new()));
+        let entry = by_event
+            .entry(*event_id)
+            .or_insert_with(|| (occurred_at.as_str(), BTreeMap::new()));
         entry
             .1
             .entry(source.as_str())
@@ -149,9 +151,15 @@ pub fn build_report(rows: &[ObservationRow]) -> LatencyReport {
                 .ok()
                 .map(|observed| (observed - occurred).num_milliseconds())
         };
-        let ws_latency = sources.get(WS_SOURCE).and_then(|observed_at| latency_ms(observed_at));
-        let rest_latency = sources.get(REST_SOURCE).and_then(|observed_at| latency_ms(observed_at));
-        let recognized_other = sources.keys().any(|source| *source != WS_SOURCE && *source != REST_SOURCE);
+        let ws_latency = sources
+            .get(WS_SOURCE)
+            .and_then(|observed_at| latency_ms(observed_at));
+        let rest_latency = sources
+            .get(REST_SOURCE)
+            .and_then(|observed_at| latency_ms(observed_at));
+        let recognized_other = sources
+            .keys()
+            .any(|source| *source != WS_SOURCE && *source != REST_SOURCE);
 
         match (ws_latency, rest_latency) {
             (Some(ws), Some(rest)) => {
@@ -234,8 +242,11 @@ pub fn build_connection_health_report(log: &str, as_of: Option<&str>) -> Connect
                 report.connected_events += 1;
                 if let Some(disconnected) = disconnected_at.take() {
                     let downtime = (at - disconnected).num_milliseconds();
-                    report.longest_downtime_ms =
-                        Some(report.longest_downtime_ms.map_or(downtime, |current| current.max(downtime)));
+                    report.longest_downtime_ms = Some(
+                        report
+                            .longest_downtime_ms
+                            .map_or(downtime, |current| current.max(downtime)),
+                    );
                 }
                 connected_at = Some(at);
             }
@@ -364,12 +375,22 @@ mod tests {
     use super::*;
 
     fn row(event_id: i64, occurred_at: &str, source: &str, observed_at: &str) -> ObservationRow {
-        (event_id, occurred_at.to_owned(), source.to_owned(), observed_at.to_owned())
+        (
+            event_id,
+            occurred_at.to_owned(),
+            source.to_owned(),
+            observed_at.to_owned(),
+        )
     }
 
     #[test]
     fn a_ws_only_event_is_counted_and_latency_measured() {
-        let rows = vec![row(1, "2026-09-04T00:00:00.000Z", WS_SOURCE, "2026-09-04T00:00:01.500Z")];
+        let rows = vec![row(
+            1,
+            "2026-09-04T00:00:00.000Z",
+            WS_SOURCE,
+            "2026-09-04T00:00:01.500Z",
+        )];
         let report = build_report(&rows);
 
         assert_eq!(report.total_events, 1);
@@ -382,8 +403,18 @@ mod tests {
     #[test]
     fn an_event_observed_by_both_sources_counts_the_race_winner() {
         let rows = vec![
-            row(1, "2026-09-04T00:00:00.000Z", WS_SOURCE, "2026-09-04T00:00:01.000Z"),
-            row(1, "2026-09-04T00:00:00.000Z", REST_SOURCE, "2026-09-04T00:01:00.000Z"),
+            row(
+                1,
+                "2026-09-04T00:00:00.000Z",
+                WS_SOURCE,
+                "2026-09-04T00:00:01.000Z",
+            ),
+            row(
+                1,
+                "2026-09-04T00:00:00.000Z",
+                REST_SOURCE,
+                "2026-09-04T00:01:00.000Z",
+            ),
         ];
         let report = build_report(&rows);
 
@@ -398,18 +429,40 @@ mod tests {
     #[test]
     fn a_reconnect_replaying_the_same_source_twice_keeps_only_the_earliest_observation() {
         let rows = vec![
-            row(1, "2026-09-04T00:00:00.000Z", WS_SOURCE, "2026-09-04T00:00:05.000Z"),
-            row(1, "2026-09-04T00:00:00.000Z", WS_SOURCE, "2026-09-04T00:00:01.000Z"),
+            row(
+                1,
+                "2026-09-04T00:00:00.000Z",
+                WS_SOURCE,
+                "2026-09-04T00:00:05.000Z",
+            ),
+            row(
+                1,
+                "2026-09-04T00:00:00.000Z",
+                WS_SOURCE,
+                "2026-09-04T00:00:01.000Z",
+            ),
         ];
         let report = build_report(&rows);
 
-        assert_eq!(report.ws_stats.count, 1, "one event, one source -- not two samples");
-        assert_eq!(report.ws_stats.min_latency_ms, Some(1_000), "the earliest observation wins");
+        assert_eq!(
+            report.ws_stats.count, 1,
+            "one event, one source -- not two samples"
+        );
+        assert_eq!(
+            report.ws_stats.min_latency_ms,
+            Some(1_000),
+            "the earliest observation wins"
+        );
     }
 
     #[test]
     fn an_unrecognized_source_is_counted_not_silently_dropped() {
-        let rows = vec![row(1, "2026-09-04T00:00:00.000Z", "onchain_ws", "2026-09-04T00:00:01.000Z")];
+        let rows = vec![row(
+            1,
+            "2026-09-04T00:00:00.000Z",
+            "onchain_ws",
+            "2026-09-04T00:00:01.000Z",
+        )];
         let report = build_report(&rows);
 
         assert_eq!(report.total_events, 1);
@@ -425,16 +478,25 @@ mod tests {
             detail: String::new(),
             next_reconnect_delay_ms: None,
         };
-        format!("{WS_EVENT_PREFIX}{}", serde_json::to_string(&event).unwrap())
+        format!(
+            "{WS_EVENT_PREFIX}{}",
+            serde_json::to_string(&event).unwrap()
+        )
     }
 
     #[test]
     fn connection_health_measures_uptime_and_the_longest_downtime() {
         let log = [
             ws_event_line("2026-09-04T00:00:00.000Z", WsConnectionEventKind::Connected),
-            ws_event_line("2026-09-04T00:01:00.000Z", WsConnectionEventKind::Disconnected),
+            ws_event_line(
+                "2026-09-04T00:01:00.000Z",
+                WsConnectionEventKind::Disconnected,
+            ),
             ws_event_line("2026-09-04T00:01:10.000Z", WsConnectionEventKind::Connected),
-            ws_event_line("2026-09-04T00:05:10.000Z", WsConnectionEventKind::Disconnected),
+            ws_event_line(
+                "2026-09-04T00:05:10.000Z",
+                WsConnectionEventKind::Disconnected,
+            ),
         ]
         .join("\n");
 
@@ -477,22 +539,38 @@ mod tests {
     }
 
     fn observe_event_line(at_utc: &str, kind: ObserveEventKind) -> String {
-        let event = ObserveEvent { at_utc: at_utc.to_owned(), kind, detail: String::new() };
-        format!("{OBSERVE_EVENT_PREFIX}{}", serde_json::to_string(&event).unwrap())
+        let event = ObserveEvent {
+            at_utc: at_utc.to_owned(),
+            kind,
+            detail: String::new(),
+        };
+        format!(
+            "{OBSERVE_EVENT_PREFIX}{}",
+            serde_json::to_string(&event).unwrap()
+        )
     }
 
     #[test]
     fn parse_observe_window_finds_the_start_and_stop_and_counts_backfill_failures() {
         let log = [
             observe_event_line("2026-09-04T00:00:00.000Z", ObserveEventKind::Started),
-            observe_event_line("2026-09-04T00:02:00.000Z", ObserveEventKind::BackfillFailure),
+            observe_event_line(
+                "2026-09-04T00:02:00.000Z",
+                ObserveEventKind::BackfillFailure,
+            ),
             observe_event_line("2026-09-04T01:00:00.000Z", ObserveEventKind::Stopped),
         ]
         .join("\n");
 
         let window = parse_observe_window(&log);
-        assert_eq!(window.started_at.as_deref(), Some("2026-09-04T00:00:00.000Z"));
-        assert_eq!(window.stopped_at.as_deref(), Some("2026-09-04T01:00:00.000Z"));
+        assert_eq!(
+            window.started_at.as_deref(),
+            Some("2026-09-04T00:00:00.000Z")
+        );
+        assert_eq!(
+            window.stopped_at.as_deref(),
+            Some("2026-09-04T01:00:00.000Z")
+        );
         assert_eq!(window.backfill_failure_count, 1);
         assert_eq!(
             window.as_query_window(),
@@ -561,9 +639,16 @@ mod tests {
         .join("\n");
 
         let window = parse_observe_window(&log);
-        assert_eq!(window.started_at, None, "the malformed timestamp must never become the window start");
+        assert_eq!(
+            window.started_at, None,
+            "the malformed timestamp must never become the window start"
+        );
         assert_eq!(window.unparseable_lines, 1);
-        assert_eq!(window.as_query_window(), None, "half a window is not a usable window");
+        assert_eq!(
+            window.as_query_window(),
+            None,
+            "half a window is not a usable window"
+        );
     }
 
     #[test]
@@ -572,8 +657,18 @@ mod tests {
         // REST-only event must not appear in a later, differently-scoped
         // report.
         let all_rows = vec![
-            row(1, "2026-09-01T00:00:00.000Z", REST_SOURCE, "2026-09-01T00:00:05.000Z"), // earlier run
-            row(2, "2026-09-04T00:00:00.000Z", WS_SOURCE, "2026-09-04T00:00:01.000Z"),   // this run
+            row(
+                1,
+                "2026-09-01T00:00:00.000Z",
+                REST_SOURCE,
+                "2026-09-01T00:00:05.000Z",
+            ), // earlier run
+            row(
+                2,
+                "2026-09-04T00:00:00.000Z",
+                WS_SOURCE,
+                "2026-09-04T00:00:01.000Z",
+            ), // this run
         ];
         let window_start = "2026-09-04T00:00:00.000Z";
         let window_end = "2026-09-04T01:00:00.000Z";
