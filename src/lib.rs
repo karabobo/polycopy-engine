@@ -27,6 +27,11 @@ pub mod ghost_run;
 pub use engine_lock::{EngineLock, EngineLockError};
 pub use venue::{OrderReceipt, ReceiptError};
 
+#[cfg(feature = "db")]
+pub use copytrading::{
+    initialize_fresh_test_copy_setup, InitialCopySetup, InitialCopySetupResult, SetupError,
+};
+
 #[cfg(feature = "intl_clob")]
 pub use ghost::{
     to_record as ghost_to_record, BalanceRecord, BalanceRecordStatus, BalanceVerification,

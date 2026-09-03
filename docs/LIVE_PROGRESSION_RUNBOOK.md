@@ -39,6 +39,17 @@ The service rejects more than one enabled leader, more than one attempt, a
 policy snapshot above the 5-USDC ceiling, an incompatible shard schedule, an
 open reconciliation case, or a stopped Activity/backfill supervisor.
 
+## One-time test database setup
+
+`copy_setup` is the only supported initializer for a fresh bounded test-copy
+database. It first performs derive-only CLOB authentication using the protected
+server credential, then records one Safe account, one enabled leader, its
+policy, and the one-lane schedule in a single database transaction. It never
+creates credentials or prepares, signs, submits, cancels, or changes an order.
+It refuses to run if any copy account, leader, schedule, or intent already
+exists, so it cannot overwrite an initialized ledger. For the first controlled
+test, the initializer accepts a maximum order notional of no more than 1 USDC.
+
 ## Evidence sequence
 
 1. Install units only with `deploy/install-production-units.sh`; confirm the

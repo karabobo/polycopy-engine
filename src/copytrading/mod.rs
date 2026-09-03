@@ -10,6 +10,7 @@
 pub mod control_tower;
 pub mod db;
 pub mod plan;
+pub mod setup;
 
 #[cfg(feature = "execute")]
 pub mod execute;
@@ -35,6 +36,9 @@ pub use db::{open, open_and_migrate, DbError};
 pub use plan::{
     plan_next_batch, plan_next_batch_with_limit, verify_schedule_compatible_with_pending_work,
     PlanError, PlanSummary, PolicySnapshot,
+};
+pub use setup::{
+    initialize_fresh_test_copy_setup, InitialCopySetup, InitialCopySetupResult, SetupError,
 };
 
 #[cfg(feature = "execute")]
