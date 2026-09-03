@@ -32,7 +32,7 @@ pub use control_tower::{
     AccountSummary, AttemptTrace, ControlTowerError, CopyStrategyStatusShim, EventSummary,
     IntentSummary, LeaderStatus, LotSummary, ReconciliationCaseSummary, SignalStatus,
 };
-pub use db::{open, open_and_migrate, DbError};
+pub use db::{open, open_and_migrate, open_read_only, DbError};
 pub use plan::{
     plan_next_batch, plan_next_batch_with_limit, verify_schedule_compatible_with_pending_work,
     PlanError, PlanSummary, PolicySnapshot,

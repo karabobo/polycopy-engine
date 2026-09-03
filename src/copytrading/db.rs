@@ -56,6 +56,24 @@ pub async fn open(database_path: impl AsRef<Path>) -> Result<SqlitePool, DbError
         .map_err(DbError::Connect)
 }
 
+/// Opens a connection strictly read-only: no migration, no PRAGMA that
+/// could write to the file, and no implicit creation -- a missing database
+/// is an error, never an empty one silently created. For analysis/report
+/// tools (e.g. `ingest_latency_report`) that summarize a ledger and must
+/// never be able to change it, not even via `open_and_migrate`'s own
+/// migration-bookkeeping write.
+pub async fn open_read_only(database_path: impl AsRef<Path>) -> Result<SqlitePool, DbError> {
+    let options = SqliteConnectOptions::new()
+        .filename(database_path.as_ref())
+        .read_only(true)
+        .busy_timeout(BUSY_TIMEOUT);
+
+    SqlitePoolOptions::new()
+        .connect_with(options)
+        .await
+        .map_err(DbError::Connect)
+}
+
 #[derive(Debug)]
 pub enum DbError {
     Connect(sqlx::Error),

@@ -7,7 +7,9 @@
 
 use std::{error::Error as StdError, fmt, time::Duration};
 
+use chrono::{SecondsFormat, Utc};
 use futures_util::{SinkExt as _, StreamExt as _};
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -58,6 +60,40 @@ pub async fn process_message(
     .await
 }
 
+/// One entry in the WS connection's lifecycle, for a caller to log in a
+/// greppable, parseable form -- the same `PREFIX: {json}` convention
+/// `ghost_verify`'s `GHOST_RECORD:` already uses. This project keeps no
+/// durable table for these: they are operational telemetry about the
+/// transport, not a business record like `leader_events`, so a caller that
+/// wants them retained redirects stdout to a log file and parses
+/// `WS_EVENT:` lines back out later (see `ingest_report`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WsConnectionEvent {
+    pub at_utc: String,
+    pub kind: WsConnectionEventKind,
+    pub detail: String,
+    /// Only set on a `Disconnected` event: how long `run` will wait before
+    /// the next connection attempt.
+    pub next_reconnect_delay_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WsConnectionEventKind {
+    Connected,
+    Disconnected,
+}
+
+pub const WS_EVENT_PREFIX: &str = "WS_EVENT: ";
+
+fn log_ws_event(event: &WsConnectionEvent) {
+    println!("{WS_EVENT_PREFIX}{}", serde_json::to_string(event).unwrap_or_default());
+}
+
+fn now_utc() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
 /// Runs the activity WebSocket connection forever, reconnecting with
 /// exponential backoff (3s, 6s, 12s, 24s, capped at 60s, matching the
 /// reference implementation) on any disconnect, error, or detected staleness.
@@ -67,7 +103,15 @@ pub async fn run(pool: SqlitePool, resolver: &AddressResolver) -> ! {
     let mut reconnect_delay = INITIAL_RECONNECT_DELAY;
     loop {
         match run_once(&pool, resolver).await {
-            Err(error) => eprintln!("activity ws: {error}, reconnecting in {reconnect_delay:?}"),
+            Err(error) => {
+                eprintln!("activity ws: {error}, reconnecting in {reconnect_delay:?}");
+                log_ws_event(&WsConnectionEvent {
+                    at_utc: now_utc(),
+                    kind: WsConnectionEventKind::Disconnected,
+                    detail: error.to_string(),
+                    next_reconnect_delay_ms: Some(reconnect_delay.as_millis() as u64),
+                });
+            }
             Ok(never) => match never {},
         }
         tokio::time::sleep(reconnect_delay).await;
@@ -94,6 +138,12 @@ async fn run_once(
         .send(Message::Text(SUBSCRIBE_MESSAGE.into()))
         .await
         .map_err(|error| ActivityWsError::Send(Box::new(error)))?;
+    log_ws_event(&WsConnectionEvent {
+        at_utc: now_utc(),
+        kind: WsConnectionEventKind::Connected,
+        detail: String::new(),
+        next_reconnect_delay_ms: None,
+    });
 
     let mut ping_interval = tokio::time::interval(PING_INTERVAL);
     ping_interval.tick().await; // the first tick fires immediately; skip it.
@@ -179,6 +229,25 @@ mod tests {
 
     use super::*;
     use crate::copytrading::db::open_and_migrate;
+
+    #[test]
+    fn a_ws_connection_event_round_trips_through_the_ws_event_prefixed_json_line() {
+        let event = WsConnectionEvent {
+            at_utc: "2026-09-04T00:00:00.000Z".to_owned(),
+            kind: WsConnectionEventKind::Disconnected,
+            detail: "connection closed".to_owned(),
+            next_reconnect_delay_ms: Some(3_000),
+        };
+
+        let json = serde_json::to_string(&event).expect("event must serialize");
+        let restored: WsConnectionEvent =
+            serde_json::from_str(&json).expect("event must deserialize");
+        assert_eq!(restored, event);
+
+        // The exact prefix a log-parsing tool must match on.
+        let line = format!("{WS_EVENT_PREFIX}{json}");
+        assert!(line.starts_with("WS_EVENT: {"));
+    }
 
     // Mirrors src/copytrading/db.rs's TestDb: a migrated pool at a unique
     // temp path, cleaned up on drop. Not shared with db.rs because that
