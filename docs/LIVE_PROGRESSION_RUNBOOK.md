@@ -67,3 +67,56 @@ test, the initializer accepts a maximum order notional of no more than 1 USDC.
 Never enable the copy unit, attach a timer to it, or increase the 5-USDC
 ceiling under this runbook. Those changes require a new architecture and risk
 review.
+
+## Persistent 5-USDC/24h Test Mode
+
+`copy_persistent` is the separate always-on runner for the current controlled
+production test. Do not emulate persistence by restarting `copy_run`.
+
+The public persistent file is `/etc/polycopy-engine/persistent-public.env`.
+For the current test wallet it must keep the same one account, one enabled
+leader, one-USDC order cap, and five-USDC rolling 24-hour budget:
+
+```text
+POLYCOPY_ENGINE_EXECUTE=yes
+POLYCOPY_PERSISTENT_EXECUTE=yes
+POLYCOPY_DB_PATH=/var/lib/polycopy-engine/polycopy.sqlite
+POLYCOPY_PERSISTENT_ACCOUNT_ID=1
+POLYCOPY_PERSISTENT_ALLOWED_LEADER_IDS=1
+POLYCOPY_PERSISTENT_MAX_ORDER_NOTIONAL=1
+POLYCOPY_PERSISTENT_ROLLING_BUDGET_USDC=5
+POLYCOPY_PERSISTENT_BUDGET_WINDOW_SECONDS=86400
+POLYCOPY_PERSISTENT_TICK_SECONDS=1
+POLYCOPY_PERSISTENT_BACKFILL_EVERY_SECONDS=60
+POLYCOPY_CLOB_SIGNATURE_TYPE=gnosis_safe
+POLYCOPY_CLOB_FUNDER=[configured funder address]
+```
+
+Initialize the database-owned persistent config once, while the service is
+stopped:
+
+```sh
+/opt/polycopy-engine/current/target/release/persistent_control init-config
+```
+
+The runner startup then requires the runtime file to exactly match that
+database row. It refuses to start on config drift, an open account fuse, an
+unresolved reconciliation case, or any `submitting`/`uncertain` attempt. Before
+each order submit, it atomically reserves the persisted `planned_notional_usdc`
+and marks the attempt `submitting`; definitive rejections and uncertain
+submissions still count against the rolling budget until their 24-hour
+timestamp ages out.
+
+Operator controls:
+
+```sh
+/opt/polycopy-engine/current/target/release/persistent_control status
+/opt/polycopy-engine/current/target/release/persistent_control pause "operator reason"
+/opt/polycopy-engine/current/target/release/persistent_control resume "operator reason"
+```
+
+`resume` is manual and refuses while account-wide reconciliation or uncertain
+submission state remains. The static service uses exit code `20` for lock
+collision, `21` for fuse-open safe stop, `22` for config refusal, `23` for
+unresolved recovery state, and `24` for malformed budget state/budget refusal;
+systemd does not restart on those codes.

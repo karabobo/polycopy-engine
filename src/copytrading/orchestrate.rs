@@ -3,6 +3,8 @@
 //! the venue.
 
 use chrono::{DateTime, Utc};
+use std::{future::Future, pin::Pin};
+
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 
@@ -43,6 +45,35 @@ pub trait EnvelopeFactory {
     ) -> impl std::future::Future<Output = Result<PreparedOrderEnvelope, String>> + Send;
 }
 
+pub trait SubmitAttemptMarker {
+    fn mark_submitting<'a>(
+        &'a self,
+        pool: &'a SqlitePool,
+        intent_id: i64,
+        attempt_id: i64,
+        now: DateTime<Utc>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), OrchestrateError>> + Send + 'a>>;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StandardSubmitAttemptMarker;
+
+impl SubmitAttemptMarker for StandardSubmitAttemptMarker {
+    fn mark_submitting<'a>(
+        &'a self,
+        pool: &'a SqlitePool,
+        intent_id: i64,
+        attempt_id: i64,
+        now: DateTime<Utc>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), OrchestrateError>> + Send + 'a>> {
+        Box::pin(async move {
+            mark_attempt_submitting(pool, intent_id, attempt_id, now)
+                .await
+                .map_err(OrchestrateError::Reconcile)
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrchestrateOutcome {
     Filled { filled_qty: Decimal },
@@ -58,6 +89,7 @@ pub enum OrchestrateOutcome {
 pub enum OrchestrateError {
     Execute(ExecuteError),
     Reconcile(ReconcileError),
+    Persistent(crate::copytrading::persistent::PersistentError),
     Prepare(String),
     Submit(SubmitError),
     Receipt(String),
@@ -68,6 +100,7 @@ impl std::fmt::Display for OrchestrateError {
         match self {
             Self::Execute(error) => write!(formatter, "{error}"),
             Self::Reconcile(error) => write!(formatter, "{error}"),
+            Self::Persistent(error) => write!(formatter, "{error}"),
             Self::Prepare(error) => write!(formatter, "envelope prepare failed: {error}"),
             Self::Submit(error) => write!(formatter, "{error}"),
             Self::Receipt(error) => write!(formatter, "receipt mapping failed: {error}"),
@@ -139,6 +172,37 @@ where
     F: EnvelopeFactory,
     H: StrictTradeHistoryReader,
 {
+    execute_one_intent_with_marker(
+        pool,
+        balance_reader,
+        execution,
+        envelopes,
+        trade_history,
+        &StandardSubmitAttemptMarker,
+        intent_id,
+        now,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_one_intent_with_marker<B, E, F, H, M>(
+    pool: &SqlitePool,
+    balance_reader: &B,
+    execution: &E,
+    envelopes: &F,
+    trade_history: &H,
+    marker: &M,
+    intent_id: i64,
+    now: DateTime<Utc>,
+) -> Result<OrchestrateOutcome, OrchestrateError>
+where
+    B: StrictAccountBalanceReader,
+    E: CopyExecution,
+    F: EnvelopeFactory,
+    H: StrictTradeHistoryReader,
+    M: SubmitAttemptMarker,
+{
     if token_has_open_reconciliation_lock(pool, intent_id).await? {
         return Ok(OrchestrateOutcome::Blocked(
             "account/token needs reconciliation",
@@ -156,6 +220,7 @@ where
             execution,
             envelopes,
             trade_history,
+            marker,
             &claimed,
             attempt,
             now,
@@ -187,16 +252,17 @@ where
         ))
     })?;
     persist_expected_venue_order_id(pool, intent_id, attempt.id, &attempt.envelope).await?;
-    submit_prepared(pool, execution, intent_id, attempt, now).await
+    submit_prepared(pool, execution, marker, intent_id, attempt, now).await
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn walk_existing_attempt<B, E, F, H>(
+async fn walk_existing_attempt<B, E, F, H, M>(
     pool: &SqlitePool,
     balance_reader: &B,
     execution: &E,
     envelopes: &F,
     trade_history: &H,
+    marker: &M,
     claimed: &ClaimedIntent,
     attempt: AttemptRow,
     now: DateTime<Utc>,
@@ -206,11 +272,12 @@ where
     E: CopyExecution,
     F: EnvelopeFactory,
     H: StrictTradeHistoryReader,
+    M: SubmitAttemptMarker,
 {
     let window_count = attempts_in_window(pool, claimed.intent_id).await?;
     match permitted_recovery_action(&attempt.status, true, window_count) {
         RecoveryAction::MarkSubmittingThenSubmit => {
-            submit_prepared(pool, execution, claimed.intent_id, attempt, now).await
+            submit_prepared(pool, execution, marker, claimed.intent_id, attempt, now).await
         }
         RecoveryAction::QueryFirst => {
             query_first(
@@ -237,7 +304,7 @@ where
                 })?;
             persist_expected_venue_order_id(pool, claimed.intent_id, attempt.id, &attempt.envelope)
                 .await?;
-            submit_prepared(pool, execution, claimed.intent_id, attempt, now).await
+            submit_prepared(pool, execution, marker, claimed.intent_id, attempt, now).await
         }
         RecoveryAction::Blocked(reason) => {
             open_reconciliation_case(
@@ -290,6 +357,7 @@ where
 async fn submit_prepared<E>(
     pool: &SqlitePool,
     execution: &E,
+    marker: &impl SubmitAttemptMarker,
     intent_id: i64,
     attempt: AttemptRow,
     now: DateTime<Utc>,
@@ -297,7 +365,9 @@ async fn submit_prepared<E>(
 where
     E: CopyExecution,
 {
-    mark_attempt_submitting(pool, intent_id, attempt.id, now).await?;
+    marker
+        .mark_submitting(pool, intent_id, attempt.id, now)
+        .await?;
     match execution.submit_exact_envelope(&attempt.envelope).await {
         Ok(receipt) => {
             mark_attempt_accepted(pool, intent_id, attempt.id).await?;

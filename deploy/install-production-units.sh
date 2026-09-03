@@ -27,7 +27,9 @@ ssh_args=(
     test -x '$remote_root/current/target/release/ghost_verify'
     test -x '$remote_root/current/target/release/ghost_drift_report'
     test -x '$remote_root/current/target/release/copy_run'
-    for unit in polycopy-engine-copy.service polycopy-engine-ghost.timer; do
+    test -x '$remote_root/current/target/release/copy_persistent'
+    test -x '$remote_root/current/target/release/persistent_control'
+    for unit in polycopy-engine-copy.service polycopy-engine-persistent.service polycopy-engine-ghost.timer; do
         if test -e /etc/systemd/system/\"\$unit\"; then
             echo \"refusing to replace existing \$unit\" >&2
             exit 17
@@ -36,11 +38,14 @@ ssh_args=(
     install -d -m 0700 /etc/polycopy-engine /etc/polycopy-engine/credentials
     install -d -m 0750 /var/lib/polycopy-engine /var/log/polycopy-engine
     install -m 0644 '$remote_root/current/deploy/systemd/polycopy-engine-copy.service' /etc/systemd/system/polycopy-engine-copy.service
+    install -m 0644 '$remote_root/current/deploy/systemd/polycopy-engine-persistent.service' /etc/systemd/system/polycopy-engine-persistent.service
     install -m 0644 '$remote_root/current/deploy/systemd/polycopy-engine-ghost.timer' /etc/systemd/system/polycopy-engine-ghost.timer
     systemctl daemon-reload
     systemctl is-active --quiet polycopy-engine-copy && { echo 'copy unit unexpectedly active' >&2; exit 18; } || true
+    systemctl is-active --quiet polycopy-engine-persistent && { echo 'persistent unit unexpectedly active' >&2; exit 18; } || true
     systemctl is-active --quiet polycopy-engine-ghost.timer && { echo 'ghost timer unexpectedly active' >&2; exit 19; } || true
     test \"\$(systemctl show polycopy-engine-copy --property=UnitFileState --value)\" = static
-    systemctl show polycopy-engine-copy polycopy-engine-ghost.timer --property=LoadState --property=UnitFileState --property=ActiveState --no-pager"
+    test \"\$(systemctl show polycopy-engine-persistent --property=UnitFileState --value)\" = static
+    systemctl show polycopy-engine-copy polycopy-engine-persistent polycopy-engine-ghost.timer --property=LoadState --property=UnitFileState --property=ActiveState --no-pager"
 
-echo "disabled copy/GHOST operational units installed; no configuration, credential, process, or order was created"
+echo "disabled copy/persistent/GHOST operational units installed; no configuration, credential, process, or order was created"

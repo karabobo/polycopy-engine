@@ -134,7 +134,7 @@ pub struct ClaimedIntent {
     /// Set only when this claim is resuming an intent that already has a
     /// persisted decision from an earlier attempt (a crash-recovery case,
     /// blueprint: "A recovery never recalculates a persisted decision").
-    pub existing_decision: Option<(Decimal, Decimal)>,
+    pub existing_decision: Option<(Decimal, Decimal, Decimal)>,
 }
 
 /// Claims a `pending` intent (compare-and-set to `in_progress`, the
@@ -143,12 +143,13 @@ pub struct ClaimedIntent {
 /// row needed to size or reuse a decision; `None` if the intent does not
 /// exist or is in a terminal state.
 /// (account_id, leader_id, token_id, side, decision_deadline_at,
-/// planned_qty, planned_price)
+/// planned_qty, planned_price, planned_notional_usdc)
 type IntentRow = (
     i64,
     i64,
     String,
     String,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -163,7 +164,7 @@ pub async fn claim_or_resume_intent(
          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
          WHERE id = ? AND status = 'pending' \
          RETURNING account_id, leader_id, token_id, side, decision_deadline_at, \
-         planned_qty, planned_price",
+         planned_qty, planned_price, planned_notional_usdc",
     )
     .bind(intent_id)
     .fetch_optional(pool)
@@ -177,7 +178,7 @@ pub async fn claim_or_resume_intent(
             // terminal/nonexistent id (nothing to do).
             let resumable: Option<IntentRow> = sqlx::query_as(
                 "SELECT account_id, leader_id, token_id, side, decision_deadline_at, \
-                     planned_qty, planned_price \
+                     planned_qty, planned_price, planned_notional_usdc \
                      FROM copy_intents WHERE id = ? AND status = 'in_progress'",
             )
             .bind(intent_id)
@@ -191,18 +192,34 @@ pub async fn claim_or_resume_intent(
         }
     };
 
-    let (account_id, leader_id, token_id, side, decision_deadline_at, planned_qty, planned_price) =
-        row;
+    let (
+        account_id,
+        leader_id,
+        token_id,
+        side,
+        decision_deadline_at,
+        planned_qty,
+        planned_price,
+        planned_notional_usdc,
+    ) = row;
     let side = Side::from_str(&side).ok_or(ExecuteError::InvalidSide)?;
-    let existing_decision = match (planned_qty, planned_price) {
-        (Some(qty), Some(price)) => Some((
+    let existing_decision = match (planned_qty, planned_price, planned_notional_usdc) {
+        (Some(qty), Some(price), Some(notional)) => Some((
             qty.parse()
                 .map_err(|_| ExecuteError::InvalidDecimal("copy_intents.planned_qty"))?,
             price
                 .parse()
                 .map_err(|_| ExecuteError::InvalidDecimal("copy_intents.planned_price"))?,
+            notional
+                .parse()
+                .map_err(|_| ExecuteError::InvalidDecimal("copy_intents.planned_notional_usdc"))?,
         )),
-        _ => None,
+        (None, None, None) => None,
+        _ => {
+            return Err(ExecuteError::InvalidDecimal(
+                "incomplete persisted decision",
+            ))
+        }
     };
 
     Ok(Some(ClaimedIntent {
@@ -231,7 +248,7 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
     balance_reader: &B,
     claimed: &ClaimedIntent,
 ) -> Result<SizingOutcome, ExecuteError> {
-    if let Some((qty, price)) = claimed.existing_decision {
+    if let Some((qty, price, _notional)) = claimed.existing_decision {
         return Ok(SizingOutcome::Decision(SizedDecision {
             intent_id: claimed.intent_id,
             token_id: claimed.token_id.clone(),
@@ -350,19 +367,23 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
         }
     };
 
+    let planned_notional = qty * limit_price;
+
     let mut tx = pool
         .begin()
         .await
         .map_err(|error| ExecuteError::Database(error.to_string()))?;
     let updated = sqlx::query(
         "UPDATE copy_intents SET planned_qty = ?, planned_price = ?, tick_size = ?, \
-         time_in_force = 'FAK', reserved_qty = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         time_in_force = 'FAK', reserved_qty = ?, planned_notional_usdc = ?, \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
          WHERE id = ? AND status = 'in_progress'",
     )
     .bind(qty.to_string())
     .bind(limit_price.to_string())
     .bind(policy.tick_size.clone())
     .bind(qty.to_string())
+    .bind(planned_notional.to_string())
     .bind(claimed.intent_id)
     .execute(&mut *tx)
     .await
@@ -1385,6 +1406,29 @@ mod tests {
             "resuming must reuse the one persisted decision, not compute a second reservation"
         );
         assert_eq!(decision.qty, Decimal::new(5, 0));
+    }
+
+    #[tokio::test]
+    async fn a_partial_persisted_decision_is_rejected_not_resized() {
+        let db = TestDb::new().await;
+        seed_account_and_schedule(&db).await;
+        seed_leader(&db, 1).await;
+        let intent = seed_pending_intent(&db, 1, "123456", "BUY", "5", "0.50").await;
+        sqlx::query(
+            "UPDATE copy_intents SET status = 'in_progress', planned_qty = '5', planned_price = '0.50' \
+             WHERE id = ?",
+        )
+        .bind(intent)
+        .execute(&*db)
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            claim_or_resume_intent(&db, intent).await,
+            Err(ExecuteError::InvalidDecimal(
+                "incomplete persisted decision"
+            ))
+        ));
     }
 
     #[tokio::test]

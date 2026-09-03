@@ -22,6 +22,9 @@ pub mod prepare;
 pub mod orchestrate;
 
 #[cfg(feature = "execute")]
+pub mod persistent;
+
+#[cfg(feature = "execute")]
 pub mod reconcile;
 
 #[cfg(feature = "ingest")]
@@ -61,6 +64,17 @@ pub use reconcile::{
 
 #[cfg(feature = "execute")]
 pub use orchestrate::{
-    execute_one_intent, list_runnable_intents, live_execute_enabled, EnvelopeFactory,
-    OrchestrateError, OrchestrateOutcome,
+    execute_one_intent, execute_one_intent_with_marker, list_runnable_intents,
+    live_execute_enabled, EnvelopeFactory, OrchestrateError, OrchestrateOutcome,
+    StandardSubmitAttemptMarker, SubmitAttemptMarker,
+};
+
+#[cfg(feature = "execute")]
+pub use persistent::{
+    assert_startup_clear as assert_persistent_startup_clear, ensure_fuse_clear,
+    fuse_status as persistent_fuse_status, init_config as init_persistent_config,
+    pause_fuse as pause_persistent_fuse, release_pre_boundary_failure,
+    reserve_budget_and_mark_submitting, resume_fuse as resume_persistent_fuse,
+    rolling_reserved_total, PersistentError, PersistentRuntimeConfig, PersistentSubmitMarker,
+    EXIT_BUDGET_STATE, EXIT_CONFIG, EXIT_FUSE_OPEN, EXIT_LOCK_COLLISION, EXIT_UNRESOLVED_RECOVERY,
 };

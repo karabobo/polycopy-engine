@@ -127,6 +127,14 @@ requires exactly one enabled leader, exactly one attempted order per process,
 and a per-order maximum no greater than 5 USDC. Any schedule mismatch, open
 reconciliation case, Activity WS failure, or REST backfill failure stops it.
 
+The persistent runner is a separate static unit,
+`polycopy-engine-persistent.service`, using
+`/etc/polycopy-engine/persistent-public.env`. It must not replace the bounded
+`copy_run` workflow until its database config has been initialized with
+`persistent_control init-config` and reviewed. The service is restartable only
+for transient crashes; systemd is configured not to restart after lock,
+configuration, fuse, recovery, or rolling-budget safe-stop exit codes.
+
 All deployment scripts are hard-locked to the SSH alias
 `aliyun-8-220-180-39` and use key-only, strict-host-key SSH options. Supplying
 a different `POLYCOPY_DEPLOY_HOST` is rejected.

@@ -1,0 +1,31 @@
+[Unit]
+Description=polycopy-engine persistent copy-execution
+Documentation=file:/opt/polycopy-engine/current/docs/LIVE_PROGRESSION_RUNBOOK.md
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/polycopy-engine/persistent-public.env
+ConditionPathExists=/etc/polycopy-engine/credentials/copy-secrets.env
+ConditionPathExists=/opt/polycopy-engine/current/target/release/copy_persistent
+
+[Service]
+Type=exec
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/opt/polycopy-engine/current
+EnvironmentFile=/etc/polycopy-engine/persistent-public.env
+LoadCredential=polycopy-copy-secrets:/etc/polycopy-engine/credentials/copy-secrets.env
+ExecStart=/opt/polycopy-engine/current/target/release/copy_persistent
+Restart=on-failure
+RestartSec=30s
+RestartPreventExitStatus=20 21 22 23 24
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/polycopy-engine /var/log/polycopy-engine
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# There is intentionally no [Install] section. This persistent service is
+# static and must be started only after a separate live activation decision.
