@@ -11,7 +11,7 @@
 
 use std::{fmt, str::FromStr as _};
 
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use sqlx::SqlitePool;
 
 use crate::{
@@ -248,6 +248,17 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
     balance_reader: &B,
     claimed: &ClaimedIntent,
 ) -> Result<SizingOutcome, ExecuteError> {
+    // A persisted decision is immutable, but it is not exempt from the FAK
+    // deadline. A restart must never turn an expired decision into a late
+    // submission.
+    if let Some(deadline) = &claimed.decision_deadline_at {
+        if let Ok(deadline) = chrono::DateTime::parse_from_rfc3339(deadline) {
+            if chrono::Utc::now() > deadline {
+                return Ok(SizingOutcome::Expired);
+            }
+        }
+    }
+
     if let Some((qty, price, _notional)) = claimed.existing_decision {
         return Ok(SizingOutcome::Decision(SizedDecision {
             intent_id: claimed.intent_id,
@@ -256,14 +267,6 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
             qty,
             limit_price: price,
         }));
-    }
-
-    if let Some(deadline) = &claimed.decision_deadline_at {
-        if let Ok(deadline) = chrono::DateTime::parse_from_rfc3339(deadline) {
-            if chrono::Utc::now() > deadline {
-                return Ok(SizingOutcome::Expired);
-            }
-        }
     }
 
     let policy = load_policy_snapshot(pool, claimed.intent_id).await?;
@@ -299,7 +302,8 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
             )
             .await?;
             let account_sellable = (strict_available - other_reservations).max(Decimal::ZERO);
-            let sell_qty = leader_lot.min(account_sellable).max(Decimal::ZERO);
+            let sell_qty =
+                round_order_qty_down(leader_lot.min(account_sellable).max(Decimal::ZERO));
             if sell_qty <= Decimal::ZERO {
                 // Never treated as "nothing to do": blueprint section 9 --
                 // a non-positive sell result is always needs_reconcile.
@@ -357,7 +361,7 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
             } else {
                 Decimal::ZERO
             };
-            let qty = event_size.min(notional_capped_qty);
+            let qty = round_order_qty_down(event_size.min(notional_capped_qty));
             if qty <= Decimal::ZERO {
                 return Ok(SizingOutcome::NeedsReconcile(
                     "computed buy quantity is not positive",
@@ -419,6 +423,14 @@ fn apply_tolerance(event_price: Decimal, tolerance_bps: i64, side: Side) -> Deci
         // Willing to accept slightly less than the leader did.
         Side::Sell => (event_price - tolerance).max(Decimal::ZERO),
     }
+}
+
+/// CLOB orders accept at most two decimal places of outcome-token shares.
+/// Always truncate a positive candidate instead of rounding it up: a BUY
+/// must never exceed its already-persisted notional cap, and a SELL must
+/// never exceed its confirmed available position.
+fn round_order_qty_down(qty: Decimal) -> Decimal {
+    qty.round_dp_with_strategy(2, RoundingStrategy::ToZero)
 }
 
 fn round_price(price: Decimal, tick_size: Decimal, side: Side) -> Decimal {
@@ -595,15 +607,37 @@ pub async fn open_reconciliation_case(
 }
 
 pub async fn cancel_expired_intent(pool: &SqlitePool, intent_id: i64) -> Result<(), ExecuteError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| ExecuteError::Database(error.to_string()))?;
+
+    // A prepared attempt without the durable submit marker has not crossed
+    // the order-submission boundary, so expiry may close it safely. Attempts
+    // marked submitting or later remain for reconciliation.
     sqlx::query(
-        "UPDATE copy_intents SET status = 'cancelled', rejection_reason = 'decision deadline expired', \
-         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        "UPDATE order_attempts SET status = 'rejected', \
+         failure_detail = 'decision deadline expired before submission', \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE intent_id = ? AND status = 'prepared' AND submission_started_at IS NULL",
     )
     .bind(intent_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
-    .map(|_| ())
-    .map_err(|error| ExecuteError::Database(error.to_string()))
+    .map_err(|error| ExecuteError::Database(error.to_string()))?;
+
+    sqlx::query(
+        "UPDATE copy_intents SET status = 'cancelled', rejection_reason = 'decision deadline expired', \
+         reserved_qty = '0', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+    )
+    .bind(intent_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| ExecuteError::Database(error.to_string()))?;
+
+    tx.commit()
+        .await
+        .map_err(|error| ExecuteError::Database(error.to_string()))
 }
 
 pub async fn next_attempt_number(pool: &SqlitePool, intent_id: i64) -> Result<i64, ExecuteError> {
@@ -787,6 +821,19 @@ mod tests {
     use sqlx::Row as _;
 
     use super::*;
+
+    #[test]
+    fn order_quantity_is_truncated_to_two_decimals_without_exceeding_buy_budget() {
+        let price = Decimal::new(3, 1); // 0.3
+        let capped = round_order_qty_down(Decimal::ONE / price);
+        assert_eq!(capped, Decimal::new(333, 2));
+        assert!(capped * price <= Decimal::ONE);
+        assert_eq!(
+            round_order_qty_down(Decimal::new(1999, 3)),
+            Decimal::new(199, 2),
+            "a sell quantity is also truncated, never rounded above availability"
+        );
+    }
     use crate::{
         copytrading::db::open_and_migrate,
         venue::intl_clob::{StrictCollateralError, StrictPositionError, StrictTokenBalanceReader},
@@ -1406,6 +1453,47 @@ mod tests {
             "resuming must reuse the one persisted decision, not compute a second reservation"
         );
         assert_eq!(decision.qty, Decimal::new(5, 0));
+    }
+
+    #[tokio::test]
+    async fn an_expired_persisted_decision_is_never_resumed_or_left_reserved() {
+        let db = TestDb::new().await;
+        seed_account_and_schedule(&db).await;
+        seed_leader(&db, 1).await;
+        let intent = seed_pending_intent(&db, 1, "123456", "BUY", "5", "0.50").await;
+        let balance_reader = FixedBalanceReader::new(Decimal::ZERO, Decimal::new(100, 0));
+        let claimed = claim_or_resume_intent(&db, intent).await.unwrap().unwrap();
+        assert!(matches!(
+            size_and_reserve(&db, &balance_reader, &claimed)
+                .await
+                .unwrap(),
+            SizingOutcome::Decision(_)
+        ));
+        sqlx::query(
+            "UPDATE copy_intents SET decision_deadline_at = '2000-01-01T00:00:00Z' WHERE id = ?",
+        )
+        .bind(intent)
+        .execute(&*db)
+        .await
+        .unwrap();
+
+        let resumed = claim_or_resume_intent(&db, intent).await.unwrap().unwrap();
+        assert!(matches!(
+            size_and_reserve(&db, &balance_reader, &resumed)
+                .await
+                .unwrap(),
+            SizingOutcome::Expired
+        ));
+        cancel_expired_intent(&db, intent).await.unwrap();
+
+        let (status, reserved): (String, String) =
+            sqlx::query_as("SELECT status, reserved_qty FROM copy_intents WHERE id = ?")
+                .bind(intent)
+                .fetch_one(&*db)
+                .await
+                .unwrap();
+        assert_eq!(status, "cancelled");
+        assert_eq!(reserved, "0");
     }
 
     #[tokio::test]
