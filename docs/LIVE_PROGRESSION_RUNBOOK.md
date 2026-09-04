@@ -16,58 +16,6 @@ independently reviewed.
    chat. The credential file is root-owned mode `0600`; it contains only
    `POLYCOPY_CLOB_PRIVATE_KEY` and optional complete L2 fields.
 
-## Default-disabled files
-
-`copy-public.env` is public service configuration, never a secret. During the
-first seven-day progression it must contain all of the following values:
-
-```text
-POLYCOPY_ENGINE_EXECUTE=yes
-POLYCOPY_DB_PATH=/var/lib/polycopy-engine/polycopy.sqlite
-POLYCOPY_ACCOUNT_ID=1
-POLYCOPY_ALLOWED_LEADER_IDS=[one enabled leader id]
-POLYCOPY_MAX_ATTEMPTS_PER_RUN=1
-POLYCOPY_MAX_ORDER_NOTIONAL=[positive decimal no greater than 5]
-POLYCOPY_MAX_RUNTIME_SECONDS=[positive duration]
-POLYCOPY_TICK_SECONDS=5
-POLYCOPY_BACKFILL_EVERY_SECONDS=60
-POLYCOPY_CLOB_SIGNATURE_TYPE=eoa|proxy|gnosis_safe|poly1271
-POLYCOPY_CLOB_FUNDER=[only when the selected wallet type requires it]
-```
-
-The service rejects more than one enabled leader, more than one attempt, a
-policy snapshot above the 5-USDC ceiling, an incompatible shard schedule, an
-open reconciliation case, or a stopped Activity/backfill supervisor.
-
-## One-time test database setup
-
-`copy_setup` is the only supported initializer for a fresh bounded test-copy
-database. It first performs derive-only CLOB authentication using the protected
-server credential, then records one Safe account, one enabled leader, its
-policy, and the one-lane schedule in a single database transaction. It never
-creates credentials or prepares, signs, submits, cancels, or changes an order.
-It refuses to run if any copy account, leader, schedule, or intent already
-exists, so it cannot overwrite an initialized ledger. For the first controlled
-test, the initializer accepts a maximum order notional of no more than 1 USDC.
-
-## Evidence sequence
-
-1. Install units only with `deploy/install-production-units.sh`; confirm the
-   copy unit is `static/inactive` and the GHOST timer is `disabled/inactive`.
-2. Configure and enable only the read-only GHOST timer. After 12 hours, run
-   `ghost_drift_report` against the corresponding journal window and retain its
-   redacted result.
-3. After Phase 0.5 and GHOST pass, start the static copy unit manually for one
-   reviewed intent. Check its journal, Control Tower trace, lot, reservation,
-   strict balance and reconciliation state before any later start.
-4. Repeat this bounded, one-order operation with the same one leader for seven
-   days. Any uncertainty or drift freezes that account/token; resolve it before
-   another run.
-
-Never enable the copy unit, attach a timer to it, or increase the 5-USDC
-ceiling under this runbook. Those changes require a new architecture and risk
-review.
-
 ## Persistent 5-USDC/24h Test Mode
 
 `copy_persistent` is the separate always-on runner for the current controlled
@@ -92,8 +40,75 @@ POLYCOPY_CLOB_SIGNATURE_TYPE=gnosis_safe
 POLYCOPY_CLOB_FUNDER=[configured funder address]
 ```
 
-Initialize the database-owned persistent config once, while the service is
-stopped:
+`copy-public.env`, `copy_run`, and the removed `copy_setup` command are legacy
+bounded-run surfaces. They are not the initializer or configuration source for
+this persistent production-test workflow. Do not create a `copy-public.env` or
+mix its old scattered `POLYCOPY_ACCOUNT_ID` / `POLYCOPY_MAX_*` values into the
+persistent service.
+
+## Database configuration
+
+With `polycopy-engine-persistent.service` stopped, use
+`copy_config_apply` for both a fresh database and later safe configuration
+reconciliation. It replaces the former `copy_setup` and `copy_policy_setup`
+tools. The command is derive-only with respect to CLOB authentication: it
+derives the existing signer address but cannot prepare, sign, submit, cancel,
+or modify a venue order. It takes the engine lock, so it refuses to run while
+either execution runner owns the database.
+
+Store a root-owned, non-secret JSON file outside Git, for example
+`/etc/polycopy-engine/trading-config.json`:
+
+```json
+{
+  "account": {
+    "label": "controlled-test-account",
+    "signature_type": "gnosis_safe",
+    "funder_address": "0x<funded-safe-address>"
+  },
+  "leaders": [
+    {
+      "label": "leader-one",
+      "enabled": true,
+      "addresses": ["0x<leader-address>"],
+      "policy": {
+        "max_signal_age_seconds": 3,
+        "decision_window_seconds": 3,
+        "price_tolerance_bps": 0,
+        "tick_size": "0.01",
+        "min_price": "0.01",
+        "max_price": "0.99",
+        "max_order_notional": "1",
+        "min_leader_trade_size": "0"
+      }
+    }
+  ]
+}
+```
+
+Run `copy_config_apply` only through a root systemd scope that supplies the
+same protected credential file as the persistent service. Do not source the
+private-key file into an interactive shell. The invocation needs the database
+path, the JSON path, and an explicit maximum configuration ceiling:
+
+```sh
+systemd-run --wait --collect --pipe \
+  --unit=polycopy-engine-config-apply \
+  --property='EnvironmentFile=/etc/polycopy-engine/persistent-public.env' \
+  --property='LoadCredential=polycopy-copy-secrets:/etc/polycopy-engine/credentials/copy-secrets.env' \
+  --setenv=POLYCOPY_SETUP_CONFIG=/etc/polycopy-engine/trading-config.json \
+  --setenv=POLYCOPY_CONFIG_MAX_NOTIONAL_CEILING=1 \
+  /opt/polycopy-engine/current/target/release/copy_config_apply
+```
+
+The command prints `CONFIG_APPLIED:` followed by an auditable summary. It may
+add or disable leader aliases and update leader policy. Once activity exists,
+it refuses to change the account's `funder_address` or `signature_type`; add a
+new account instead. It never deletes historical configuration or ledger rows.
+
+After `copy_config_apply` succeeds, initialize the database-owned persistent
+runtime configuration once, using exactly the values in
+`persistent-public.env`:
 
 ```sh
 /opt/polycopy-engine/current/target/release/persistent_control init-config
