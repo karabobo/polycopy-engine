@@ -12,9 +12,10 @@ use crate::{
     copytrading::{
         execute::{
             cancel_expired_intent, claim_or_resume_intent, finalize_receipt, next_attempt_number,
-            open_reconciliation_case as open_execute_case, size_and_reserve, ClaimedIntent,
-            ExecuteError, SizedDecision, SizingOutcome,
+            open_reconciliation_case as open_execute_case, reject_pre_submit_intent,
+            size_and_reserve, ClaimedIntent, ExecuteError, SizedDecision, SizingOutcome,
         },
+        persistent::release_pre_boundary_failure,
         reconcile::{
             attempts_in_window, load_or_prepare_attempt, mark_attempt_rejected,
             mark_attempt_submitting, mark_attempt_uncertain_after_submission_error,
@@ -119,6 +120,12 @@ impl From<ExecuteError> for OrchestrateError {
 impl From<ReconcileError> for OrchestrateError {
     fn from(error: ReconcileError) -> Self {
         Self::Reconcile(error)
+    }
+}
+
+impl From<crate::copytrading::persistent::PersistentError> for OrchestrateError {
+    fn from(error: crate::copytrading::persistent::PersistentError) -> Self {
+        Self::Persistent(error)
     }
 }
 
@@ -238,6 +245,10 @@ where
             cancel_expired_intent(pool, claimed.intent_id).await?;
             return Ok(OrchestrateOutcome::Expired);
         }
+        SizingOutcome::Rejected(reason) => {
+            reject_pre_submit_intent(pool, claimed.intent_id, reason).await?;
+            return Ok(OrchestrateOutcome::Rejected);
+        }
     };
 
     let envelope = envelopes
@@ -294,7 +305,11 @@ where
             reconcile_or_finalize(pool, execution, claimed.intent_id, attempt).await
         }
         RecoveryAction::MayPrepareNewAttempt => {
-            prepare_new_attempt(pool, balance_reader, envelopes, claimed).await?;
+            match prepare_new_attempt(pool, balance_reader, envelopes, claimed).await? {
+                RetryPreparation::Prepared => {}
+                RetryPreparation::Expired => return Ok(OrchestrateOutcome::Expired),
+                RetryPreparation::Rejected => return Ok(OrchestrateOutcome::Rejected),
+            }
             let attempt = load_latest_attempt(pool, claimed.intent_id)
                 .await?
                 .ok_or_else(|| {
@@ -320,12 +335,18 @@ where
     }
 }
 
+enum RetryPreparation {
+    Prepared,
+    Expired,
+    Rejected,
+}
+
 async fn prepare_new_attempt<B, F>(
     pool: &SqlitePool,
     balance_reader: &B,
     envelopes: &F,
     claimed: &ClaimedIntent,
-) -> Result<(), OrchestrateError>
+) -> Result<RetryPreparation, OrchestrateError>
 where
     B: StrictAccountBalanceReader,
     F: EnvelopeFactory,
@@ -340,9 +361,11 @@ where
         }
         SizingOutcome::Expired => {
             cancel_expired_intent(pool, claimed.intent_id).await?;
-            return Err(OrchestrateError::Execute(ExecuteError::Database(
-                "intent expired before retry prepare".into(),
-            )));
+            return Ok(RetryPreparation::Expired);
+        }
+        SizingOutcome::Rejected(reason) => {
+            reject_pre_submit_intent(pool, claimed.intent_id, reason).await?;
+            return Ok(RetryPreparation::Rejected);
         }
     };
     let envelope = envelopes
@@ -351,7 +374,7 @@ where
         .map_err(OrchestrateError::Prepare)?;
     let attempt_number = next_attempt_number(pool, claimed.intent_id).await?;
     load_or_prepare_attempt(pool, claimed.intent_id, attempt_number, &envelope).await?;
-    Ok(())
+    Ok(RetryPreparation::Prepared)
 }
 
 async fn submit_prepared<E>(
@@ -384,6 +407,8 @@ where
         }
         Err(SubmitError::Rejected(detail)) => {
             mark_attempt_rejected(pool, intent_id, attempt.id, &detail).await?;
+            release_pre_boundary_failure(pool, attempt.id, "venue definitively rejected order")
+                .await?;
             Ok(OrchestrateOutcome::Rejected)
         }
         Err(SubmitError::Local(detail)) => {

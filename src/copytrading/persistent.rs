@@ -1006,7 +1006,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn five_rejections_still_block_a_sixth_until_the_window_ages_out() {
+    async fn definitive_rejections_release_their_budget_reservation() {
         let db = TestDb::new().await;
         seed_base(&db).await;
         let config = cfg();
@@ -1027,6 +1027,9 @@ mod tests {
                 .execute(&db.pool)
                 .await
                 .expect("mark rejected");
+            release_pre_boundary_failure(&db, attempt_id, "definitive venue rejection")
+                .await
+                .expect("release rejected attempt");
         }
         let (sixth_intent, sixth_attempt) = seed_attempt(
             &db,
@@ -1035,21 +1038,9 @@ mod tests {
             now + chrono::Duration::seconds(86_500),
         )
         .await;
-        assert!(matches!(
-            reserve_budget_and_mark_submitting(&db, &config, sixth_intent, sixth_attempt, now)
-                .await,
-            Err(PersistentError::BudgetExceeded { .. })
-        ));
-
-        reserve_budget_and_mark_submitting(
-            &db,
-            &config,
-            sixth_intent,
-            sixth_attempt,
-            now + chrono::Duration::seconds(86_401),
-        )
-        .await
-        .expect("aged-out reservations free capacity");
+        reserve_budget_and_mark_submitting(&db, &config, sixth_intent, sixth_attempt, now)
+            .await
+            .expect("released rejections must free budget immediately");
     }
 
     #[tokio::test]

@@ -101,6 +101,10 @@ where
             cancel_expired_intent(pool, claimed.intent_id).await?;
             return Ok(Some(ExecutionOutcome::Expired));
         }
+        SizingOutcome::Rejected(reason) => {
+            reject_pre_submit_intent(pool, claimed.intent_id, reason).await?;
+            return Ok(Some(ExecutionOutcome::Rejected(reason)));
+        }
     };
 
     let receipt = submitter
@@ -122,6 +126,7 @@ pub enum ExecutionOutcome {
     Filled { filled_qty: Decimal },
     NeedsReconcile(&'static str),
     Expired,
+    Rejected(&'static str),
 }
 
 pub struct ClaimedIntent {
@@ -237,6 +242,7 @@ pub enum SizingOutcome {
     Decision(SizedDecision),
     NeedsReconcile(&'static str),
     Expired,
+    Rejected(&'static str),
 }
 
 /// Sizes (or reuses an already-persisted decision for) one claimed intent.
@@ -372,6 +378,15 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
     };
 
     let planned_notional = qty * limit_price;
+    // The CLOB refuses a marketable BUY below one USDC. With the configured
+    // cap at exactly one USDC, quantity truncation can make a candidate such
+    // as 1.72 * 0.58 = 0.9976. It is a deterministic local policy rejection,
+    // never a reason to cross the order-submission boundary.
+    if claimed.side == Side::Buy && planned_notional < Decimal::ONE {
+        return Ok(SizingOutcome::Rejected(
+            "computed buy notional is below the CLOB minimum of 1 USDC",
+        ));
+    }
 
     let mut tx = pool
         .begin()
@@ -638,6 +653,24 @@ pub async fn cancel_expired_intent(pool: &SqlitePool, intent_id: i64) -> Result<
     tx.commit()
         .await
         .map_err(|error| ExecuteError::Database(error.to_string()))
+}
+
+pub async fn reject_pre_submit_intent(
+    pool: &SqlitePool,
+    intent_id: i64,
+    reason: &str,
+) -> Result<(), ExecuteError> {
+    sqlx::query(
+        "UPDATE copy_intents SET status = 'rejected', rejection_reason = ?, reserved_qty = '0', \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE id = ? AND status = 'in_progress'",
+    )
+    .bind(reason)
+    .bind(intent_id)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|error| ExecuteError::Database(error.to_string()))
 }
 
 /// Closes one already-overdue intent only when the database proves that no
@@ -1548,6 +1581,55 @@ mod tests {
                 .unwrap();
         assert_eq!(status, "cancelled");
         assert_eq!(reserved, "0");
+    }
+
+    #[tokio::test]
+    async fn a_buy_below_the_clob_minimum_is_rejected_before_any_attempt_exists() {
+        let db = TestDb::new().await;
+        seed_account_and_schedule(&db).await;
+        seed_leader(&db, 1).await;
+        let intent = seed_pending_intent(&db, 1, "123456", "BUY", "100", "0.58").await;
+        let snapshot = PolicySnapshot {
+            max_signal_age_seconds: 3600,
+            decision_window_seconds: 300,
+            price_tolerance_bps: 0,
+            tick_size: "0.01".to_owned(),
+            min_price: "0.01".to_owned(),
+            max_price: "0.99".to_owned(),
+            max_order_notional: "1".to_owned(),
+            min_leader_trade_size: "0".to_owned(),
+        };
+        sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
+            .bind(serde_json::to_string(&snapshot).unwrap())
+            .bind(intent)
+            .execute(&*db)
+            .await
+            .unwrap();
+        let balance_reader = FixedBalanceReader::new(Decimal::ZERO, Decimal::new(100, 0));
+        let claimed = claim_or_resume_intent(&db, intent).await.unwrap().unwrap();
+        assert!(matches!(
+            size_and_reserve(&db, &balance_reader, &claimed)
+                .await
+                .unwrap(),
+            SizingOutcome::Rejected("computed buy notional is below the CLOB minimum of 1 USDC")
+        ));
+        reject_pre_submit_intent(
+            &db,
+            intent,
+            "computed buy notional is below the CLOB minimum of 1 USDC",
+        )
+        .await
+        .unwrap();
+        let (status, attempts): (String, i64) = sqlx::query_as(
+            "SELECT ci.status, COUNT(oa.id) FROM copy_intents ci LEFT JOIN order_attempts oa \
+             ON oa.intent_id = ci.id WHERE ci.id = ? GROUP BY ci.id",
+        )
+        .bind(intent)
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        assert_eq!(status, "rejected");
+        assert_eq!(attempts, 0);
     }
 
     #[tokio::test]
