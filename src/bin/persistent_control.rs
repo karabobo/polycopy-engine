@@ -10,10 +10,12 @@ async fn main() {
 
     use polycopy_engine::copytrading::{
         init_persistent_config, open_and_migrate, pause_persistent_fuse, persistent_fuse_status,
-        resolve_pre_submit_balance_case, resume_persistent_fuse, PersistentRuntimeConfig,
+        reconfigure_persistent_config, resolve_pre_submit_balance_case, resume_persistent_fuse,
+        PersistentRuntimeConfig,
     };
     use polycopy_engine::{
-        venue::intl_clob::StrictAccountBalanceReader, venue::intl_clob_exec::IntlClobCopyAdapter,
+        engine_lock::EngineLock, venue::intl_clob::StrictAccountBalanceReader,
+        venue::intl_clob_exec::IntlClobCopyAdapter,
     };
 
     let result: Result<(), polycopy_engine::copytrading::PersistentError> = async {
@@ -24,21 +26,42 @@ async fn main() {
         })?;
         let command = std::env::args().nth(1).ok_or_else(|| {
             polycopy_engine::copytrading::PersistentError::Config(
-                "usage: persistent_control init-config|status|pause|resume [reason]|reconcile-preflight"
+                "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|reconcile-preflight"
                     .to_owned(),
             )
         })?;
-        let pool = open_and_migrate(db_path)
+        let pool = open_and_migrate(&db_path)
             .await
             .map_err(|error| {
                 polycopy_engine::copytrading::PersistentError::Database(error.to_string())
             })?;
         match command.as_str() {
             "init-config" => {
+                let _lock = EngineLock::acquire_for_database(&db_path).map_err(|error| {
+                    polycopy_engine::copytrading::PersistentError::Config(format!(
+                        "cannot initialize persistent config while an engine owns the database: {error}"
+                    ))
+                })?;
                 let config = PersistentRuntimeConfig::from_env()?;
                 init_persistent_config(&pool, &config).await?;
                 println!(
                     "persistent config initialized: account_id={} allowed_leaders={} max_order={} rolling_24h={}",
+                    config.account_id,
+                    config.allowed_leaders_text(),
+                    config.max_order_notional,
+                    config.rolling_budget
+                );
+            }
+            "reconfigure" => {
+                let _lock = EngineLock::acquire_for_database(&db_path).map_err(|error| {
+                    polycopy_engine::copytrading::PersistentError::Config(format!(
+                        "cannot reconfigure persistent mode while an engine owns the database: {error}"
+                    ))
+                })?;
+                let config = PersistentRuntimeConfig::from_env()?;
+                reconfigure_persistent_config(&pool, &config).await?;
+                println!(
+                    "persistent config reconfigured: account_id={} allowed_leaders={} max_order={} rolling_24h={}",
                     config.account_id,
                     config.allowed_leaders_text(),
                     config.max_order_notional,
@@ -108,7 +131,7 @@ async fn main() {
             }
             _ => {
                 return Err(polycopy_engine::copytrading::PersistentError::Config(
-                    "usage: persistent_control init-config|status|pause|resume [reason]|reconcile-preflight"
+                    "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|reconcile-preflight"
                         .to_owned(),
                 ));
             }

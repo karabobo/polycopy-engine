@@ -16,23 +16,26 @@ independently reviewed.
    chat. The credential file is root-owned mode `0600`; it contains only
    `POLYCOPY_CLOB_PRIVATE_KEY` and optional complete L2 fields.
 
-## Persistent 5-USDC/24h Test Mode
+## Persistent production-test mode
 
 `copy_persistent` is the separate always-on runner for the current controlled
 production test. Do not emulate persistence by restarting `copy_run`.
 
 The public persistent file is `/etc/polycopy-engine/persistent-public.env`.
-For the current test wallet it must keep the same one account, one enabled
-leader, one-USDC order cap, and five-USDC rolling 24-hour budget:
+The file defines the complete enabled leader set, a one-USDC per-order cap,
+and the operator-selected rolling 24-hour budget. The budget is an explicit
+positive decimal, persisted in the database, and is not silently capped by
+the binary. Raising it is a risk decision; it does not bypass the separate
+strict balance/allowance check before every order.
 
 ```text
 POLYCOPY_ENGINE_EXECUTE=yes
 POLYCOPY_PERSISTENT_EXECUTE=yes
 POLYCOPY_DB_PATH=/var/lib/polycopy-engine/polycopy.sqlite
 POLYCOPY_PERSISTENT_ACCOUNT_ID=1
-POLYCOPY_PERSISTENT_ALLOWED_LEADER_IDS=1
+POLYCOPY_PERSISTENT_ALLOWED_LEADER_IDS=1,2,3
 POLYCOPY_PERSISTENT_MAX_ORDER_NOTIONAL=1
-POLYCOPY_PERSISTENT_ROLLING_BUDGET_USDC=5
+POLYCOPY_PERSISTENT_ROLLING_BUDGET_USDC=[positive decimal, for example 50]
 POLYCOPY_PERSISTENT_BUDGET_WINDOW_SECONDS=86400
 POLYCOPY_PERSISTENT_TICK_SECONDS=1
 POLYCOPY_PERSISTENT_BACKFILL_EVERY_SECONDS=60
@@ -113,6 +116,20 @@ runtime configuration once, using exactly the values in
 ```sh
 /opt/polycopy-engine/current/target/release/persistent_control init-config
 ```
+
+For a later leader-set or budget change, stop the persistent service, back up
+the database, update both the Trading Config and `persistent-public.env`, then
+run the code-owned reconfiguration command:
+
+```sh
+/opt/polycopy-engine/current/target/release/persistent_control reconfigure
+```
+
+`reconfigure` takes the engine lock, verifies that the enabled leader set
+exactly matches the requested IDs, refuses unresolved reconciliation or
+uncertain submissions, and refuses a lower budget when existing rolling
+reservations already exceed it. It is the only supported way to alter the
+database-owned persistent runtime configuration; never edit SQLite directly.
 
 The runner startup then requires the runtime file to exactly match that
 database row. It refuses to start on config drift, an open account fuse, an

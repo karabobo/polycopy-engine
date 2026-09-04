@@ -81,11 +81,6 @@ impl PersistentRuntimeConfig {
             ));
         }
         let allowed_leader_ids = parse_allowed_leaders(allowed_leaders)?;
-        if allowed_leader_ids.len() != 1 {
-            return Err(PersistentError::Config(
-                "persistent mode currently requires exactly one allowed leader".to_owned(),
-            ));
-        }
         let max_order_notional = parse_decimal(max_order_notional, MAX_ORDER_NOTIONAL_ENV)?;
         if !(max_order_notional > Decimal::ZERO && max_order_notional <= Decimal::ONE) {
             return Err(PersistentError::Config(
@@ -93,9 +88,9 @@ impl PersistentRuntimeConfig {
             ));
         }
         let rolling_budget = parse_decimal(rolling_budget, ROLLING_BUDGET_ENV)?;
-        if !(rolling_budget > Decimal::ZERO && rolling_budget <= Decimal::new(5, 0)) {
+        if rolling_budget <= Decimal::ZERO {
             return Err(PersistentError::Config(
-                "persistent rolling budget must be > 0 and <= 5 USDC".to_owned(),
+                "persistent rolling budget must be greater than 0 USDC".to_owned(),
             ));
         }
         if budget_window_seconds != 86_400 {
@@ -182,6 +177,50 @@ pub async fn init_config(
     .await
     .map_err(db_err)?;
     tx.commit().await.map_err(db_err)
+}
+
+/// Replaces the database-owned persistent runtime configuration while no
+/// execution process owns the database.  This is deliberately a code path,
+/// not a manual SQLite edit: the incoming leader set must exactly equal the
+/// enabled leaders, recovery must be clean, and an operator cannot lower the
+/// rolling ceiling below reservations that are still inside its own window.
+pub async fn reconfigure_config(
+    pool: &SqlitePool,
+    config: &PersistentRuntimeConfig,
+) -> Result<(), PersistentError> {
+    assert_startup_clear(pool, config.account_id).await?;
+    validate_account_and_leaders(pool, config).await?;
+
+    let reserved =
+        rolling_reserved_total(pool, config.account_id, config.budget_window, Utc::now()).await?;
+    if reserved > config.rolling_budget {
+        return Err(PersistentError::BudgetExceeded {
+            used: reserved,
+            requested: Decimal::ZERO,
+            cap: config.rolling_budget,
+        });
+    }
+
+    let changed = sqlx::query(
+        "UPDATE persistent_execution_config SET account_id = ?, enabled = ?, \
+         allowed_leader_ids = ?, max_order_notional_usdc = ?, rolling_budget_usdc = ?, \
+         budget_window_seconds = ?, tick_seconds = ?, backfill_every_seconds = ? WHERE id = 1",
+    )
+    .bind(config.account_id)
+    .bind(if config.enabled { 1 } else { 0 })
+    .bind(config.allowed_leaders_text())
+    .bind(config.max_order_notional.to_string())
+    .bind(config.rolling_budget.to_string())
+    .bind(config.budget_window.as_secs() as i64)
+    .bind(config.tick.as_secs() as i64)
+    .bind(config.backfill_every.as_secs() as i64)
+    .execute(pool)
+    .await
+    .map_err(db_err)?;
+    if changed.rows_affected() != 1 {
+        return Err(PersistentError::MissingConfig);
+    }
+    Ok(())
 }
 
 pub async fn verify_config(
@@ -893,6 +932,77 @@ mod tests {
             verify_config(&db, &mismatched).await,
             Err(PersistentError::ConfigMismatch)
         );
+    }
+
+    #[tokio::test]
+    async fn persistent_config_accepts_multiple_leaders_and_a_configured_budget() {
+        let db = TestDb::new().await;
+        seed_base(&db).await;
+        sqlx::query("INSERT INTO leader_config (id, label, enabled) VALUES (2, 'leader-two', 1)")
+            .execute(&*db)
+            .await
+            .expect("second leader");
+
+        let config = PersistentRuntimeConfig::from_values(1, true, "1,2", "1", "50", 86_400, 1, 60)
+            .expect(
+                "a non-empty multi-leader configuration and explicit positive budget are valid",
+            );
+        init_config(&db, &config)
+            .await
+            .expect("init multi-leader config");
+        verify_config(&db, &config)
+            .await
+            .expect("verify multi-leader config");
+    }
+
+    #[tokio::test]
+    async fn reconfigure_updates_the_leader_scope_and_budget_only_when_recovery_is_clear() {
+        let db = TestDb::new().await;
+        seed_base(&db).await;
+        init_config(&db, &cfg()).await.expect("initial config");
+        sqlx::query("INSERT INTO leader_config (id, label, enabled) VALUES (2, 'leader-two', 1)")
+            .execute(&*db)
+            .await
+            .expect("second leader");
+        let updated =
+            PersistentRuntimeConfig::from_values(1, true, "1,2", "1", "50", 86_400, 1, 60)
+                .expect("updated config");
+
+        reconfigure_config(&db, &updated)
+            .await
+            .expect("clear recovery state permits a configuration update");
+        verify_config(&db, &updated)
+            .await
+            .expect("updated config persisted");
+    }
+
+    #[tokio::test]
+    async fn reconfigure_refuses_to_lower_the_budget_below_active_reservations() {
+        let db = TestDb::new().await;
+        seed_base(&db).await;
+        let initial = PersistentRuntimeConfig::from_values(1, true, "1", "1", "50", 86_400, 1, 60)
+            .expect("initial config");
+        init_config(&db, &initial)
+            .await
+            .expect("initial config persisted");
+        let now = Utc::now();
+        let (intent_id, attempt_id) =
+            seed_attempt(&db, "reserved", "1", now + chrono::Duration::seconds(60)).await;
+        reserve_budget_and_mark_submitting(&db, &initial, intent_id, attempt_id, now)
+            .await
+            .expect("reserve budget");
+        sqlx::query("UPDATE order_attempts SET status = 'rejected' WHERE id = ?")
+            .bind(attempt_id)
+            .execute(&*db)
+            .await
+            .expect("mark terminal");
+        let lower = PersistentRuntimeConfig::from_values(1, true, "1", "1", "0.5", 86_400, 1, 60)
+            .expect("lower config parses");
+
+        assert!(matches!(
+            reconfigure_config(&db, &lower).await,
+            Err(PersistentError::BudgetExceeded { .. })
+        ));
     }
 
     #[tokio::test]
