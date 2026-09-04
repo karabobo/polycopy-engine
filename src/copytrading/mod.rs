@@ -50,8 +50,8 @@ pub use setup::{
 
 #[cfg(feature = "execute")]
 pub use execute::{
-    execute_intent, finalize_receipt, ExecuteError, ExecutionOutcome, OrderSubmitter, Side,
-    SizedDecision,
+    cancel_overdue_pre_submit_intent, execute_intent, finalize_receipt, ExecuteError,
+    ExecutionOutcome, OrderSubmitter, Side, SizedDecision,
 };
 
 #[cfg(feature = "execute")]

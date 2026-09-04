@@ -640,6 +640,58 @@ pub async fn cancel_expired_intent(pool: &SqlitePool, intent_id: i64) -> Result<
         .map_err(|error| ExecuteError::Database(error.to_string()))
 }
 
+/// Closes one already-overdue intent only when the database proves that no
+/// order crossed the submission boundary. This is an operator recovery for a
+/// process that stopped after sizing but before it could observe its own FAK
+/// deadline; it performs no venue I/O.
+pub async fn cancel_overdue_pre_submit_intent(
+    pool: &SqlitePool,
+    account_id: i64,
+    intent_id: i64,
+) -> Result<(), ExecuteError> {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT status, decision_deadline_at FROM copy_intents WHERE id = ? AND account_id = ?",
+    )
+    .bind(intent_id)
+    .bind(account_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| ExecuteError::Database(error.to_string()))?;
+    let Some((status, deadline)) = row else {
+        return Err(ExecuteError::Database(
+            "intent does not belong to this account".to_owned(),
+        ));
+    };
+    if status != "in_progress" {
+        return Err(ExecuteError::Database(
+            "intent is not an in-progress pre-submit intent".to_owned(),
+        ));
+    }
+    let overdue = deadline
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|value| chrono::Utc::now() > value);
+    if !overdue {
+        return Err(ExecuteError::Database(
+            "intent deadline is absent, malformed, or not yet expired".to_owned(),
+        ));
+    }
+    let unsafe_attempt: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM order_attempts WHERE intent_id = ? \
+         AND (status <> 'prepared' OR submission_started_at IS NOT NULL))",
+    )
+    .bind(intent_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| ExecuteError::Database(error.to_string()))?;
+    if unsafe_attempt != 0 {
+        return Err(ExecuteError::Database(
+            "intent has an attempt that may have crossed the submission boundary".to_owned(),
+        ));
+    }
+    cancel_expired_intent(pool, intent_id).await
+}
+
 pub async fn next_attempt_number(pool: &SqlitePool, intent_id: i64) -> Result<i64, ExecuteError> {
     let max: Option<i64> =
         sqlx::query_scalar("SELECT MAX(attempt_number) FROM order_attempts WHERE intent_id = ?")
@@ -1484,7 +1536,9 @@ mod tests {
                 .unwrap(),
             SizingOutcome::Expired
         ));
-        cancel_expired_intent(&db, intent).await.unwrap();
+        cancel_overdue_pre_submit_intent(&db, 1, intent)
+            .await
+            .unwrap();
 
         let (status, reserved): (String, String) =
             sqlx::query_as("SELECT status, reserved_qty FROM copy_intents WHERE id = ?")

@@ -9,9 +9,9 @@ async fn main() {
     use std::process;
 
     use polycopy_engine::copytrading::{
-        init_persistent_config, open_and_migrate, pause_persistent_fuse, persistent_fuse_status,
-        reconfigure_persistent_config, resolve_pre_submit_balance_case, resume_persistent_fuse,
-        PersistentRuntimeConfig,
+        cancel_overdue_pre_submit_intent, init_persistent_config, open_and_migrate,
+        pause_persistent_fuse, persistent_fuse_status, reconfigure_persistent_config,
+        resolve_pre_submit_balance_case, resume_persistent_fuse, PersistentRuntimeConfig,
     };
     use polycopy_engine::{
         engine_lock::EngineLock, venue::intl_clob::StrictAccountBalanceReader,
@@ -26,7 +26,7 @@ async fn main() {
         })?;
         let command = std::env::args().nth(1).ok_or_else(|| {
             polycopy_engine::copytrading::PersistentError::Config(
-                "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|reconcile-preflight"
+                "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|reconcile-preflight"
                     .to_owned(),
             )
         })?;
@@ -91,6 +91,37 @@ async fn main() {
                 resume_persistent_fuse(&pool, account_id, &reason).await?;
                 println!("persistent fuse resumed: account_id={account_id} reason={reason}");
             }
+            "cancel-overdue-pre-submit" => {
+                let _lock = EngineLock::acquire_for_database(&db_path).map_err(|error| {
+                    polycopy_engine::copytrading::PersistentError::Config(format!(
+                        "cannot cancel an overdue intent while an engine owns the database: {error}"
+                    ))
+                })?;
+                let account_id = account_id_from_env()?;
+                let intent_id = std::env::args()
+                    .nth(2)
+                    .ok_or_else(|| {
+                        polycopy_engine::copytrading::PersistentError::Config(
+                            "cancel-overdue-pre-submit requires an intent id".to_owned(),
+                        )
+                    })?
+                    .parse()
+                    .map_err(|_| {
+                        polycopy_engine::copytrading::PersistentError::Config(
+                            "invalid intent id".to_owned(),
+                        )
+                    })?;
+                cancel_overdue_pre_submit_intent(&pool, account_id, intent_id)
+                    .await
+                    .map_err(|error| {
+                        polycopy_engine::copytrading::PersistentError::Config(format!(
+                            "refusing overdue pre-submit cancellation: {error}"
+                        ))
+                    })?;
+                println!(
+                    "overdue pre-submit intent cancelled locally: account_id={account_id} intent_id={intent_id}"
+                );
+            }
             "reconcile-preflight" => {
                 let config = PersistentRuntimeConfig::from_env()?;
                 polycopy_engine::copytrading::persistent::verify_config(&pool, &config).await?;
@@ -131,7 +162,7 @@ async fn main() {
             }
             _ => {
                 return Err(polycopy_engine::copytrading::PersistentError::Config(
-                    "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|reconcile-preflight"
+                    "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|reconcile-preflight"
                         .to_owned(),
                 ));
             }
