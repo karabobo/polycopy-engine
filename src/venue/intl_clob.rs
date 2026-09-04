@@ -30,6 +30,13 @@ use polymarket_client_sdk_v2::{
 /// ledger, policy, and GHOST value in this project is expressed in human
 /// units, so this conversion belongs at the venue boundary.
 const CLOB_BALANCE_ATOMIC_SCALE: i64 = 1_000_000;
+/// ERC-20's conventional unlimited approval (`type(uint256).max`). The CLOB
+/// returns this exact atom-unit string for a fully approved collateral token.
+/// It cannot fit in `rust_decimal::Decimal`, but treating it as an unbounded
+/// allowance remains conservative because usable funds are still capped by
+/// the independently read collateral balance.
+const UNLIMITED_ALLOWANCE_ATOMIC: &str =
+    "115792089237316195423570985008687907853269984665640564039457584007913129639935";
 
 fn from_clob_atomic_units(raw: Decimal) -> Decimal {
     raw / Decimal::from(CLOB_BALANCE_ATOMIC_SCALE)
@@ -351,6 +358,9 @@ fn collateral_allowance_from_response(
         .into_values()
         .chain(response.allowance)
         .map(|raw| {
+            if raw == UNLIMITED_ALLOWANCE_ATOMIC {
+                return Ok(Decimal::MAX);
+            }
             raw.parse::<Decimal>()
                 .map(from_clob_atomic_units)
                 .map_err(|_| StrictCollateralError::InvalidAllowance { raw })
@@ -451,6 +461,19 @@ mod tests {
         assert_eq!(
             collateral_allowance_from_response(response).expect("scalar allowance must be usable"),
             Decimal::from(2)
+        );
+    }
+
+    #[test]
+    fn an_unlimited_erc20_allowance_is_capped_only_by_the_separate_balance_read() {
+        let response = serde_json::from_str(&format!(
+            r#"{{"balance":"1000000","allowance":"{UNLIMITED_ALLOWANCE_ATOMIC}"}}"#
+        ))
+        .expect("unlimited allowance shape must deserialize");
+
+        assert_eq!(
+            collateral_allowance_from_response(response).expect("unlimited approval is valid"),
+            Decimal::MAX
         );
     }
 
