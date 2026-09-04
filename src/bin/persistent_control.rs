@@ -11,8 +11,8 @@ async fn main() {
     use polycopy_engine::copytrading::{
         cancel_overdue_pre_submit_intent, init_persistent_config, open_and_migrate,
         pause_persistent_fuse, persistent_fuse_status, reconfigure_persistent_config,
-        release_definitive_rejection, resolve_pre_submit_balance_case, resume_persistent_fuse,
-        PersistentRuntimeConfig,
+        release_definitive_rejection, resolve_no_virtual_lot_sell_case,
+        resolve_pre_submit_balance_case, resume_persistent_fuse, PersistentRuntimeConfig,
     };
     use polycopy_engine::{
         engine_lock::EngineLock, venue::intl_clob::StrictAccountBalanceReader,
@@ -27,7 +27,7 @@ async fn main() {
         })?;
         let command = std::env::args().nth(1).ok_or_else(|| {
             polycopy_engine::copytrading::PersistentError::Config(
-                "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|reconcile-preflight"
+                "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|resolve-no-virtual-lot-sell <intent-id>|reconcile-preflight"
                     .to_owned(),
             )
         })?;
@@ -148,6 +148,31 @@ async fn main() {
                     "definitive rejection reservation released: account_id={account_id} attempt_id={attempt_id}"
                 );
             }
+            "resolve-no-virtual-lot-sell" => {
+                let _lock = EngineLock::acquire_for_database(&db_path).map_err(|error| {
+                    polycopy_engine::copytrading::PersistentError::Config(format!(
+                        "cannot resolve a sell case while an engine owns the database: {error}"
+                    ))
+                })?;
+                let account_id = account_id_from_env()?;
+                let intent_id = std::env::args()
+                    .nth(2)
+                    .ok_or_else(|| {
+                        polycopy_engine::copytrading::PersistentError::Config(
+                            "resolve-no-virtual-lot-sell requires an intent id".to_owned(),
+                        )
+                    })?
+                    .parse()
+                    .map_err(|_| {
+                        polycopy_engine::copytrading::PersistentError::Config(
+                            "invalid intent id".to_owned(),
+                        )
+                    })?;
+                let case_id = resolve_no_virtual_lot_sell_case(&pool, account_id, intent_id).await?;
+                println!(
+                    "no-virtual-lot sell case resolved locally: account_id={account_id} intent_id={intent_id} case_id={case_id}"
+                );
+            }
             "reconcile-preflight" => {
                 let config = PersistentRuntimeConfig::from_env()?;
                 polycopy_engine::copytrading::persistent::verify_config(&pool, &config).await?;
@@ -188,7 +213,7 @@ async fn main() {
             }
             _ => {
                 return Err(polycopy_engine::copytrading::PersistentError::Config(
-                    "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|reconcile-preflight"
+                    "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|resolve-no-virtual-lot-sell <intent-id>|reconcile-preflight"
                         .to_owned(),
                 ));
             }

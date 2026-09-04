@@ -648,6 +648,92 @@ pub async fn release_definitive_rejection(
     .await
 }
 
+/// Resolves a pre-submit SELL case only when the durable virtual ledger proves
+/// that this leader has no lot for the token. This is the safe recovery for an
+/// older runner that misclassified an ordinary leader exit as balance drift.
+pub async fn resolve_no_virtual_lot_sell_case(
+    pool: &SqlitePool,
+    account_id: i64,
+    intent_id: i64,
+) -> Result<i64, PersistentError> {
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    let rows: Vec<(i64, i64, String)> = sqlx::query_as(
+        "SELECT rc.id, ci.leader_id, ci.token_id FROM reconciliation_cases rc \
+         JOIN copy_intents ci ON ci.id = rc.intent_id \
+         WHERE rc.account_id = ? AND rc.intent_id = ? AND rc.resolved_at IS NULL \
+           AND rc.case_type = 'balance_drift' \
+           AND rc.detail = 'computed sell quantity is not positive' \
+           AND ci.status = 'needs_reconcile' AND ci.side = 'SELL'",
+    )
+    .bind(account_id)
+    .bind(intent_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    let [(case_id, leader_id, token_id)] = rows.as_slice() else {
+        return Err(PersistentError::UnresolvedRecovery);
+    };
+    let attempts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM order_attempts WHERE intent_id = ?")
+            .bind(intent_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    if attempts != 0 {
+        return Err(PersistentError::UnresolvedRecovery);
+    }
+    let lot: Option<String> = sqlx::query_scalar(
+        "SELECT qty FROM position_lots WHERE account_id = ? AND leader_id = ? AND token_id = ?",
+    )
+    .bind(account_id)
+    .bind(leader_id)
+    .bind(token_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    let lot_is_zero = match lot {
+        None => true,
+        Some(value) => {
+            value
+                .parse::<Decimal>()
+                .map_err(|_| PersistentError::MalformedBudgetState)?
+                <= Decimal::ZERO
+        }
+    };
+    if !lot_is_zero {
+        return Err(PersistentError::UnresolvedRecovery);
+    }
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let intent_update = sqlx::query(
+        "UPDATE copy_intents SET status = 'rejected', \
+         rejection_reason = 'no tracked virtual lot for leader sell; signal is not replayed', \
+         reserved_qty = '0', updated_at = ? WHERE id = ? AND status = 'needs_reconcile'",
+    )
+    .bind(&now)
+    .bind(intent_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if intent_update.rows_affected() != 1 {
+        return Err(PersistentError::UnresolvedRecovery);
+    }
+    let case_update = sqlx::query(
+        "UPDATE reconciliation_cases SET resolved_at = ?, \
+         resolution = 'verified no virtual lot for leader/token; no order attempt existed' \
+         WHERE id = ? AND resolved_at IS NULL",
+    )
+    .bind(&now)
+    .bind(case_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if case_update.rows_affected() != 1 {
+        return Err(PersistentError::UnresolvedRecovery);
+    }
+    tx.commit().await.map_err(db_err)?;
+    Ok(*case_id)
+}
+
 async fn validate_account_and_leaders(
     pool: &SqlitePool,
     config: &PersistentRuntimeConfig,

@@ -290,6 +290,15 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
                 &claimed.token_id,
             )
             .await?;
+            // A leader can sell a token that this follower never mirrored.
+            // That is an expected no-op, not evidence that a strict venue
+            // balance read returned a false zero. Do not issue a balance read
+            // or open a reconciliation case when no virtual lot exists.
+            if leader_lot <= Decimal::ZERO {
+                return Ok(SizingOutcome::Rejected(
+                    "no tracked virtual lot for leader sell",
+                ));
+            }
             let token = OutcomeTokenId::from_str(&claimed.token_id)
                 .map_err(|_| ExecuteError::InvalidTokenId)?;
             let strict_available = match balance_reader.position_for_token_strict(&token).await {
@@ -311,8 +320,9 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
             let sell_qty =
                 round_order_qty_down(leader_lot.min(account_sellable).max(Decimal::ZERO));
             if sell_qty <= Decimal::ZERO {
-                // Never treated as "nothing to do": blueprint section 9 --
-                // a non-positive sell result is always needs_reconcile.
+                // A nonzero tracked lot but no strict sellable balance is a
+                // genuine discrepancy. Unlike a missing virtual lot above,
+                // it must remain blocked for reconciliation.
                 return Ok(SizingOutcome::NeedsReconcile(
                     "computed sell quantity is not positive",
                 ));
@@ -1317,7 +1327,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_non_positive_sell_result_becomes_needs_reconcile_never_a_zero_balance_no_op() {
+    async fn a_sell_without_a_tracked_virtual_lot_is_rejected_without_balance_reconciliation() {
         let db = TestDb::new().await;
         seed_account_and_schedule(&db).await;
         seed_leader(&db, 1).await;
@@ -1333,14 +1343,41 @@ mod tests {
 
         assert_eq!(
             outcome,
-            ExecutionOutcome::NeedsReconcile("computed sell quantity is not positive")
+            ExecutionOutcome::Rejected("no tracked virtual lot for leader sell")
         );
         let status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
             .bind(intent)
             .fetch_one(&*db)
             .await
             .unwrap();
-        assert_eq!(status, "needs_reconcile");
+        assert_eq!(status, "rejected");
+    }
+
+    #[tokio::test]
+    async fn a_tracked_sell_lot_with_zero_strict_balance_still_needs_reconciliation() {
+        let db = TestDb::new().await;
+        seed_account_and_schedule(&db).await;
+        seed_leader(&db, 1).await;
+        sqlx::query(
+            "INSERT INTO position_lots (account_id, leader_id, token_id, qty) VALUES (1, 1, '123456', '5')",
+        )
+        .execute(&*db)
+        .await
+        .unwrap();
+        let intent = seed_pending_intent(&db, 1, "123456", "SELL", "5", "0.50").await;
+        let outcome = execute_intent(
+            &db,
+            &FixedBalanceReader::new(Decimal::ZERO, Decimal::new(100, 0)),
+            &FullFillSubmitter,
+            intent,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            outcome,
+            ExecutionOutcome::NeedsReconcile("computed sell quantity is not positive")
+        );
     }
 
     #[tokio::test]
