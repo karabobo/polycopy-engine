@@ -52,6 +52,16 @@ copy_run = [
     "execute",
     "ingest",
 ]
+# Read-only terminal dashboard. Needs `execute` (which implies `intl_clob`)
+# solely for the same derive-only-authenticated balance read every other
+# operator tool already does (see persistent_control/ghost_verify) -- the
+# binary itself never imports orchestrate/reconcile/execute_intent, but
+# unlike redeem_detect/ingest this cannot be architecturally proven at the
+# feature-gate level, since `execute` is on regardless.
+dashboard = [
+    "execute",
+    "dep:ratatui",
+]
 
 [dependencies]
 # Version pinned to the same requirement polymarket_client_sdk_v2 itself
@@ -74,6 +84,10 @@ futures-util = { version = "0.3", default-features = false, optional = true }
 # optional trade-fee metadata resilient to the venue's documented-in-practice
 # empty-string response; execution-critical fields remain strict.
 polymarket_client_sdk_v2 = { path = "vendor/polymarket_client_sdk_v2_source", default-features = false, optional = true }
+# "crossterm" is the terminal backend; ratatui re-exports the crate as
+# `ratatui::crossterm` so this project does not also declare crossterm
+# itself as a separate top-level dependency.
+ratatui = { version = "0.30", default-features = false, features = ["std", "crossterm"], optional = true }
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
 # Only needed to call CryptoProvider::install_default() once at startup:
 # rustls 0.23+ no longer picks a default crypto backend on its own, and

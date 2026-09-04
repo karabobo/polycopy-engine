@@ -31,6 +31,13 @@ pub use venue::{OrderReceipt, ReceiptError};
 pub use copytrading::{
     apply_trading_config, AccountConfigInput, ChangeKind, ConfigApplyOptions, ConfigApplySummary,
     ConfigError, LeaderApplySummary, LeaderConfigInput, LeaderPolicyInput, TradingConfig,
+    CONFIG_APPLIED_PREFIX,
+};
+
+#[cfg(feature = "dashboard")]
+pub use copytrading::{
+    classify_log_line, collect_dashboard, draw_ui, AppState, LeaderDashboardSummary, LogLineKind,
+    LogTailer,
 };
 
 #[cfg(feature = "intl_clob")]

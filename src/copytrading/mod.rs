@@ -33,6 +33,9 @@ pub mod ingest;
 #[cfg(feature = "redeem_detect")]
 pub mod redemption;
 
+#[cfg(feature = "dashboard")]
+pub mod dashboard;
+
 pub use control_tower::{
     leader_intents, leader_lots, leader_reconciliation_cases, leader_status, trace_attempt,
     AccountSummary, AttemptTrace, ControlTowerError, CopyStrategyStatusShim, EventSummary,
@@ -46,6 +49,13 @@ pub use plan::{
 pub use setup::{
     apply_trading_config, AccountConfigInput, ChangeKind, ConfigApplyOptions, ConfigApplySummary,
     ConfigError, LeaderApplySummary, LeaderConfigInput, LeaderPolicyInput, TradingConfig,
+    CONFIG_APPLIED_PREFIX,
+};
+
+#[cfg(feature = "dashboard")]
+pub use dashboard::{
+    classify_log_line, collect_dashboard, draw_ui, AppState, LeaderDashboardSummary, LogLineKind,
+    LogTailer,
 };
 
 #[cfg(feature = "execute")]

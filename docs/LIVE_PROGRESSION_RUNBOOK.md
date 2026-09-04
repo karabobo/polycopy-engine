@@ -109,6 +109,31 @@ add or disable leader aliases and update leader policy. Once activity exists,
 it refuses to change the account's `funder_address` or `signature_type`; add a
 new account instead. It never deletes historical configuration or ledger rows.
 
+The file is the complete leader set, not a patch: leaving an existing leader
+out disables that leader (and preserves its historical lots and ledger rows).
+Keep every leader that should remain active in the JSON every time it is
+reapplied.
+
+## Read-only terminal dashboard
+
+Build with `--features dashboard` (or `--all-features`) and run through a
+credential-protected systemd scope. It reads the SQLite ledger and makes only
+strict collateral/allowance reads; it cannot prepare, submit, cancel, or alter
+an order. The log-file tail is optional because the persistent service normally
+writes to journald:
+
+```sh
+systemd-run --wait --collect --pipe --pty \
+  --unit=polycopy-engine-dashboard \
+  --property='EnvironmentFile=/etc/polycopy-engine/persistent-public.env' \
+  --property='LoadCredential=polycopy-copy-secrets:/etc/polycopy-engine/credentials/copy-secrets.env' \
+  /opt/polycopy-engine/current/target/release/copy_dashboard
+```
+
+To include an append-only operator log file, additionally set
+`POLYCOPY_DASHBOARD_LOG_PATH=/path/to/log`. Press `q` or `Esc` to exit; use
+`journalctl -u polycopy-engine-persistent.service -f` for the service journal.
+
 After `copy_config_apply` succeeds, initialize the database-owned persistent
 runtime configuration once, using exactly the values in
 `persistent-public.env`:

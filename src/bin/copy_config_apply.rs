@@ -6,6 +6,13 @@
 //! refuses the one class of change that would be unsafe to fold into an
 //! in-place update -- see that module's own doc comment.
 //!
+//! The config is declarative, not a patch: a leader already in the
+//! database but missing from this file is disabled (never deleted), same
+//! as a wallet address missing from a leader's own list -- see
+//! `docs/adr/0001-trading-config-apply-is-declarative.md`. Always pass
+//! every leader you still want followed, not just the ones you're
+//! changing.
+//!
 //! It authenticates only to derive the existing CLOB credential's signing
 //! address; it never creates an API key and never prepares, signs,
 //! submits, cancels, or changes a venue order.
@@ -34,7 +41,10 @@ async fn main() {
     use std::process;
 
     use polycopy_engine::{
-        copytrading::{apply_trading_config, open_and_migrate, ChangeKind, ConfigApplyOptions},
+        copytrading::{
+            apply_trading_config, open_and_migrate, ChangeKind, ConfigApplyOptions,
+            CONFIG_APPLIED_PREFIX,
+        },
         engine_lock::EngineLock,
         venue::intl_clob_exec::IntlClobCopyAdapter,
     };
@@ -87,7 +97,7 @@ async fn main() {
         .map_err(|error| error.to_string())?;
 
         println!(
-            "CONFIG_APPLIED: {}",
+            "{CONFIG_APPLIED_PREFIX}{}",
             serde_json::to_string(&summary).unwrap_or_default()
         );
 

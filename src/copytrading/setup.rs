@@ -11,11 +11,22 @@
 //! (acquired by the caller, e.g. `copy_config_apply`, before opening the
 //! database) already refuses to run alongside one.
 //!
-//! What may change freely, at any time, regardless of how much has already
-//! happened: `leader_config.enabled`, a leader's address book
-//! (`leader_wallet_aliases` -- a new address is an added alias, a removed
-//! one is disabled, never deleted, so history is never orphaned), and
-//! every `leader_policy` field.
+//! The Trading Config a caller supplies is declarative, not a patch (see
+//! `docs/adr/0001-trading-config-apply-is-declarative.md`): applying it
+//! makes the database's set of leaders match it exactly. A leader
+//! currently in the database but missing from this config is disabled --
+//! never deleted, so its `position_lots`/history are never orphaned --
+//! exactly like an address missing from a leader's own
+//! `leader_wallet_aliases` list is disabled rather than left alone. This
+//! applies with no extra warning even when the disabled leader still
+//! holds open lots or an unresolved reconciliation case; that trade-off
+//! is deliberate, not an oversight -- see the ADR.
+//!
+//! `leader_config.enabled`, a leader's address book, and every
+//! `leader_policy` field may all change freely, at any time, regardless
+//! of how much has already happened. A leader's `label` is the immutable
+//! key this module matches leaders by (renaming means adding a new
+//! leader, not editing one), so it has no lock of its own to worry about.
 //!
 //! What is locked once the account has any real activity
 //! (`copy_intents`, `reconciliation_cases`, or `position_lots`): the
@@ -23,11 +34,10 @@
 //! Changing it after that would silently re-describe already-recorded
 //! history as belonging to a different wallet. Before any of that exists,
 //! the account is still just a draft and its identity may be corrected
-//! freely. A leader has no equivalent lock at all: `label` is the
-//! immutable key this module matches leaders by (renaming means adding a
-//! new leader, not editing one -- disable the old one instead), and there
-//! is no other leader identity field to protect; its address book lives
-//! entirely in the always-safely-reconcilable `leader_wallet_aliases`.
+//! freely. There is deliberately no equivalent guard against a *label*
+//! mismatch creating an unintended second account: this project runs
+//! exactly one account, so a mismatched label can only be an operator
+//! typo, and the operator owns catching it.
 //!
 //! `max_order_notional` additionally has a caller-supplied ceiling
 //! ([`ConfigApplyOptions::max_notional_ceiling`], default 1 USDC): raising
@@ -46,6 +56,8 @@ use chrono::{SecondsFormat, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::{Sqlite, SqlitePool, Transaction};
+
+pub const CONFIG_APPLIED_PREFIX: &str = "CONFIG_APPLIED: ";
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct TradingConfig {
@@ -251,6 +263,45 @@ pub async fn apply_trading_config(
     for (label, enabled, addresses, policy) in normalized_leaders {
         leader_summaries
             .push(apply_one_leader(&mut tx, &label, enabled, &addresses, &policy).await?);
+    }
+
+    // A Trading Config is declarative (docs/adr/0001-trading-config-apply-is-declarative.md):
+    // any leader already in the database but not named in this config is
+    // disabled, not left alone -- matching how its own wallet-alias list
+    // already behaved. Never deleted, and its position_lots/history are
+    // untouched either way; disabling carries no warning even if it
+    // still holds open lots, by deliberate choice.
+    let existing_leaders: Vec<(i64, String, bool)> =
+        sqlx::query_as("SELECT id, label, enabled FROM leader_config")
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(ConfigError::Database)?;
+    for (leader_id, label, enabled) in existing_leaders {
+        if seen_labels.contains(label.as_str()) {
+            continue;
+        }
+        if enabled {
+            sqlx::query(
+                "UPDATE leader_config SET enabled = 0, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+            )
+            .bind(leader_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(ConfigError::Database)?;
+        }
+        leader_summaries.push(LeaderApplySummary {
+            leader_id,
+            label,
+            change: if enabled {
+                ChangeKind::Updated
+            } else {
+                ChangeKind::Unchanged
+            },
+            aliases_added: 0,
+            aliases_disabled: 0,
+            policy_changed: false,
+        });
     }
 
     tx.commit().await.map_err(ConfigError::Database)?;
@@ -830,6 +881,115 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(leader_count, 2);
+    }
+
+    #[tokio::test]
+    async fn a_leader_omitted_from_a_later_config_is_disabled_not_deleted() {
+        let db = TestDb::new().await;
+        let mut config = config_with_one_leader("1");
+        config.leaders.push(LeaderConfigInput {
+            label: "leader-b".to_owned(),
+            enabled: true,
+            addresses: vec!["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned()],
+            policy: policy("1"),
+        });
+        let first = apply_trading_config(
+            &db,
+            &config,
+            SIGNING_ADDRESS,
+            &ConfigApplyOptions::default(),
+        )
+        .await
+        .unwrap();
+        let leader_b_id = first.leaders[1].leader_id;
+
+        // leader-b still has a real open lot -- Q1's answer was that
+        // omission disables it anyway, with no extra warning.
+        sqlx::query(
+            "INSERT INTO position_lots (account_id, leader_id, token_id, qty) \
+             VALUES (?, ?, 'token-1', '5')",
+        )
+        .bind(first.account_id)
+        .bind(leader_b_id)
+        .execute(&*db)
+        .await
+        .unwrap();
+
+        config.leaders.pop(); // drop leader-b from the config
+        let summary = apply_trading_config(
+            &db,
+            &config,
+            SIGNING_ADDRESS,
+            &ConfigApplyOptions::default(),
+        )
+        .await
+        .expect("omitting a leader must still succeed, not error");
+
+        let disabled = summary
+            .leaders
+            .iter()
+            .find(|leader| leader.leader_id == leader_b_id)
+            .expect("the omitted leader must still appear in the summary");
+        assert_eq!(disabled.change, ChangeKind::Updated);
+
+        let (enabled, leader_count): (bool, i64) = (
+            sqlx::query_scalar("SELECT enabled FROM leader_config WHERE id = ?")
+                .bind(leader_b_id)
+                .fetch_one(&*db)
+                .await
+                .unwrap(),
+            sqlx::query_scalar("SELECT COUNT(*) FROM leader_config")
+                .fetch_one(&*db)
+                .await
+                .unwrap(),
+        );
+        assert!(!enabled, "leader-b must be disabled, not left alone");
+        assert_eq!(leader_count, 2, "leader-b must still exist, not be deleted");
+
+        let lot_qty: String =
+            sqlx::query_scalar("SELECT qty FROM position_lots WHERE leader_id = ?")
+                .bind(leader_b_id)
+                .fetch_one(&*db)
+                .await
+                .unwrap();
+        assert_eq!(lot_qty, "5", "disabling must never touch existing lots");
+    }
+
+    #[tokio::test]
+    async fn an_already_disabled_omitted_leader_is_reported_unchanged() {
+        let db = TestDb::new().await;
+        let mut config = config_with_one_leader("1");
+        config.leaders.push(LeaderConfigInput {
+            label: "leader-b".to_owned(),
+            enabled: false,
+            addresses: vec!["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned()],
+            policy: policy("1"),
+        });
+        apply_trading_config(
+            &db,
+            &config,
+            SIGNING_ADDRESS,
+            &ConfigApplyOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        config.leaders.pop();
+        let summary = apply_trading_config(
+            &db,
+            &config,
+            SIGNING_ADDRESS,
+            &ConfigApplyOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let leader_b = summary
+            .leaders
+            .iter()
+            .find(|leader| leader.label == "leader-b")
+            .unwrap();
+        assert_eq!(leader_b.change, ChangeKind::Unchanged);
     }
 
     #[tokio::test]
