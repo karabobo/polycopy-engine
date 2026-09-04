@@ -292,6 +292,75 @@ pub async fn resume_fuse(
     Ok(())
 }
 
+/// Resolves exactly one account-level reconciliation case that was opened
+/// before an order attempt existed. This is deliberately narrower than a
+/// general reconciliation control: it cannot resolve a case with any attempt,
+/// so it can never bless an order that might have crossed the venue boundary.
+/// The caller must first complete a fresh strict collateral/allowance read.
+pub async fn resolve_pre_submit_balance_case(
+    pool: &SqlitePool,
+    account_id: i64,
+) -> Result<i64, PersistentError> {
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    let rows: Vec<(i64, i64, String)> = sqlx::query_as(
+        "SELECT rc.id, rc.intent_id, ci.status \
+         FROM reconciliation_cases rc \
+         JOIN copy_intents ci ON ci.id = rc.intent_id \
+         WHERE rc.account_id = ? AND rc.resolved_at IS NULL \
+           AND rc.case_type = 'balance_drift' \
+           AND rc.detail = 'strict collateral allowance query failed'",
+    )
+    .bind(account_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    let [(case_id, intent_id, status)] = rows.as_slice() else {
+        return Err(PersistentError::UnresolvedRecovery);
+    };
+    if status != "needs_reconcile" {
+        return Err(PersistentError::UnresolvedRecovery);
+    }
+    let attempts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM order_attempts WHERE intent_id = ?")
+            .bind(intent_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    if attempts != 0 {
+        return Err(PersistentError::UnresolvedRecovery);
+    }
+
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let intent_update = sqlx::query(
+        "UPDATE copy_intents SET status = 'rejected', \
+         rejection_reason = 'pre-submission allowance failure reconciled; signal is not replayed', \
+         updated_at = ? WHERE id = ? AND status = 'needs_reconcile'",
+    )
+    .bind(&now)
+    .bind(intent_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if intent_update.rows_affected() != 1 {
+        return Err(PersistentError::UnresolvedRecovery);
+    }
+    let case_update = sqlx::query(
+        "UPDATE reconciliation_cases SET resolved_at = ?, \
+         resolution = 'fresh strict collateral and allowance read passed; no order attempt existed' \
+         WHERE id = ? AND resolved_at IS NULL",
+    )
+    .bind(&now)
+    .bind(case_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if case_update.rows_affected() != 1 {
+        return Err(PersistentError::UnresolvedRecovery);
+    }
+    tx.commit().await.map_err(db_err)?;
+    Ok(*case_id)
+}
+
 pub async fn fuse_status(
     pool: &SqlitePool,
     account_id: i64,
@@ -961,6 +1030,58 @@ mod tests {
             resume_fuse(&db, 1, "resume").await,
             Err(PersistentError::UnresolvedRecovery)
         );
+    }
+
+    #[tokio::test]
+    async fn pre_submit_balance_case_can_close_only_when_no_order_attempt_exists() {
+        let db = TestDb::new().await;
+        seed_base(&db).await;
+        let event_id: i64 = sqlx::query_scalar(
+            "INSERT INTO leader_events \
+             (canonical_event_key, leader_id, condition_id, token_id, outcome_index, side, size, price, occurred_at, observed_at) \
+             VALUES ('pre-submit-case', 1, '0xcond', '123456', 0, 'BUY', '1', '1', ?, ?) RETURNING id",
+        )
+        .bind(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true))
+        .bind(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true))
+        .fetch_one(&db.pool)
+        .await
+        .expect("event");
+        let intent_id: i64 = sqlx::query_scalar(
+            "INSERT INTO copy_intents \
+             (event_id, account_id, leader_id, token_id, side, config_snapshot_json, config_snapshot_hash, \
+              shard_scheme_version, lane_count, shard_id, status) \
+             VALUES (?, 1, 1, '123456', 'BUY', '{}', 'hash', 1, 1, 0, 'needs_reconcile') RETURNING id",
+        )
+        .bind(event_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("intent");
+        sqlx::query(
+            "INSERT INTO reconciliation_cases (account_id, token_id, intent_id, case_type, detail) \
+             VALUES (1, '123456', ?, 'balance_drift', 'strict collateral allowance query failed')",
+        )
+        .bind(intent_id)
+        .execute(&db.pool)
+        .await
+        .expect("case");
+
+        resolve_pre_submit_balance_case(&db, 1)
+            .await
+            .expect("a no-attempt pre-submit case can close");
+        let status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+            .bind(intent_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("status");
+        let open_cases: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ? AND resolved_at IS NULL",
+        )
+        .bind(intent_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("case status");
+        assert_eq!(status, "rejected");
+        assert_eq!(open_cases, 0);
     }
 
     #[test]

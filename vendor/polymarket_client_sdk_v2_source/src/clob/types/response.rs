@@ -481,6 +481,11 @@ pub struct NotificationPayload {
 #[derive(Debug, Default, Clone, Deserialize, Builder, PartialEq)]
 pub struct BalanceAllowanceResponse {
     pub balance: Decimal,
+    /// Some CLOB deployments return one aggregate allowance rather than the
+    /// per-exchange allowance map. Retain both wire shapes so callers can
+    /// apply their own conservative minimum rule.
+    #[serde(default)]
+    pub allowance: Option<String>,
     #[serde(default)]
     #[builder(default)]
     pub allowances: HashMap<Address, String>,

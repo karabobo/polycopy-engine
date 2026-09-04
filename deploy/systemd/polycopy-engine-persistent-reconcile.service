@@ -1,0 +1,29 @@
+[Unit]
+Description=polycopy-engine pre-submit reconciliation
+Documentation=file:/opt/polycopy-engine/current/docs/LIVE_PROGRESSION_RUNBOOK.md
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/polycopy-engine/persistent-public.env
+ConditionPathExists=/etc/polycopy-engine/credentials/copy-secrets.env
+ConditionPathExists=/opt/polycopy-engine/current/target/release/persistent_control
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/opt/polycopy-engine/current
+EnvironmentFile=/etc/polycopy-engine/persistent-public.env
+LoadCredential=polycopy-copy-secrets:/etc/polycopy-engine/credentials/copy-secrets.env
+ExecStart=/opt/polycopy-engine/current/target/release/persistent_control reconcile-preflight
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/polycopy-engine /var/log/polycopy-engine
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# This unit cannot submit, prepare, or retry an order. It only performs a
+# fresh strict collateral/allowance read, then can close one proven
+# pre-submission reconciliation case. It never resumes the persistent fuse.

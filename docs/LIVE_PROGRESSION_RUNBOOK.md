@@ -120,3 +120,16 @@ submission state remains. The static service uses exit code `20` for lock
 collision, `21` for fuse-open safe stop, `22` for config refusal, `23` for
 unresolved recovery state, and `24` for malformed budget state/budget refusal;
 systemd does not restart on those codes.
+
+### Proven pre-submission allowance failure
+
+When an intent fails before any `order_attempt` exists, do not resume the
+fuse directly. Run the static `polycopy-engine-persistent-reconcile.service`.
+It receives the same service-private credential, performs fresh strict
+collateral and allowance reads, requires usable collateral of at least the
+configured per-order cap, and closes exactly one matching pre-submission case.
+It cannot construct, submit, retry, or recover an order and does not resume
+the fuse. The stale signal is recorded as rejected and is never replayed.
+
+Only after that unit succeeds may the operator use the explicit `resume`
+control and start the persistent service.

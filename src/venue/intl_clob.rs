@@ -339,19 +339,26 @@ impl StrictAccountBalanceReader for IntlClobReadAdapter {
             .await
             .map_err(|source| StrictCollateralError::Query { source })?;
 
-        response
-            .allowances
-            .into_values()
-            .map(|raw| {
-                raw.parse::<Decimal>()
-                    .map(from_clob_atomic_units)
-                    .map_err(|_| StrictCollateralError::InvalidAllowance { raw })
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .min()
-            .ok_or(StrictCollateralError::MissingAllowance)
+        collateral_allowance_from_response(response)
     }
+}
+
+fn collateral_allowance_from_response(
+    response: polymarket_client_sdk_v2::clob::types::response::BalanceAllowanceResponse,
+) -> Result<Decimal, StrictCollateralError> {
+    response
+        .allowances
+        .into_values()
+        .chain(response.allowance)
+        .map(|raw| {
+            raw.parse::<Decimal>()
+                .map(from_clob_atomic_units)
+                .map_err(|_| StrictCollateralError::InvalidAllowance { raw })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .min()
+        .ok_or(StrictCollateralError::MissingAllowance)
 }
 
 #[derive(Debug)]
@@ -435,6 +442,17 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn a_scalar_collateral_allowance_is_accepted_when_the_map_is_absent() {
+        let response = serde_json::from_str(r#"{"balance":"1000000","allowance":"2000000"}"#)
+            .expect("the official scalar allowance shape must deserialize");
+
+        assert_eq!(
+            collateral_allowance_from_response(response).expect("scalar allowance must be usable"),
+            Decimal::from(2)
+        );
+    }
 
     fn trade_history_server(
         responses: [(&'static str, &'static str); 3],
