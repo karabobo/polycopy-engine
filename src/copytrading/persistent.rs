@@ -617,6 +617,37 @@ pub async fn release_pre_boundary_failure(
     .map_err(db_err)
 }
 
+/// Releases a rolling-budget reservation only for an attempt with a durable,
+/// definitive venue rejection. It is intentionally unavailable for uncertain
+/// or merely prepared attempts, which could still require reconciliation.
+pub async fn release_definitive_rejection(
+    pool: &SqlitePool,
+    account_id: i64,
+    attempt_id: i64,
+) -> Result<(), PersistentError> {
+    let definitive: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM order_attempts oa \
+         JOIN copy_intents ci ON ci.id = oa.intent_id \
+         WHERE oa.id = ? AND ci.account_id = ? AND oa.status = 'rejected' \
+           AND oa.submission_started_at IS NOT NULL \
+           AND oa.failure_detail IS NOT NULL AND trim(oa.failure_detail) <> '')",
+    )
+    .bind(attempt_id)
+    .bind(account_id)
+    .fetch_one(pool)
+    .await
+    .map_err(db_err)?;
+    if definitive == 0 {
+        return Err(PersistentError::UnresolvedRecovery);
+    }
+    release_pre_boundary_failure(
+        pool,
+        attempt_id,
+        "operator verified definitive venue rejection",
+    )
+    .await
+}
+
 async fn validate_account_and_leaders(
     pool: &SqlitePool,
     config: &PersistentRuntimeConfig,
@@ -1041,6 +1072,47 @@ mod tests {
         reserve_budget_and_mark_submitting(&db, &config, sixth_intent, sixth_attempt, now)
             .await
             .expect("released rejections must free budget immediately");
+    }
+
+    #[tokio::test]
+    async fn operator_release_requires_a_definitive_submitted_rejection() {
+        let db = TestDb::new().await;
+        seed_base(&db).await;
+        let config = cfg();
+        let now = Utc::now();
+        let (intent_id, attempt_id) = seed_attempt(
+            &db,
+            "operator-release",
+            "1",
+            now + chrono::Duration::seconds(60),
+        )
+        .await;
+        reserve_budget_and_mark_submitting(&db, &config, intent_id, attempt_id, now)
+            .await
+            .expect("reserve");
+        assert_eq!(
+            release_definitive_rejection(&db, 1, attempt_id).await,
+            Err(PersistentError::UnresolvedRecovery),
+            "a merely submitting attempt must never be released by the operator control"
+        );
+        sqlx::query(
+            "UPDATE order_attempts SET status = 'rejected', failure_detail = 'HTTP 400 definitive rejection' WHERE id = ?",
+        )
+        .bind(attempt_id)
+        .execute(&db.pool)
+        .await
+        .expect("reject");
+        release_definitive_rejection(&db, 1, attempt_id)
+            .await
+            .expect("definitive rejection releases");
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM persistent_budget_reservations WHERE order_attempt_id = ?",
+        )
+        .bind(attempt_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("reservation");
+        assert_eq!(state, "released_pre_boundary");
     }
 
     #[tokio::test]

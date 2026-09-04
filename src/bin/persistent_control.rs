@@ -11,7 +11,8 @@ async fn main() {
     use polycopy_engine::copytrading::{
         cancel_overdue_pre_submit_intent, init_persistent_config, open_and_migrate,
         pause_persistent_fuse, persistent_fuse_status, reconfigure_persistent_config,
-        resolve_pre_submit_balance_case, resume_persistent_fuse, PersistentRuntimeConfig,
+        release_definitive_rejection, resolve_pre_submit_balance_case, resume_persistent_fuse,
+        PersistentRuntimeConfig,
     };
     use polycopy_engine::{
         engine_lock::EngineLock, venue::intl_clob::StrictAccountBalanceReader,
@@ -26,7 +27,7 @@ async fn main() {
         })?;
         let command = std::env::args().nth(1).ok_or_else(|| {
             polycopy_engine::copytrading::PersistentError::Config(
-                "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|reconcile-preflight"
+                "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|reconcile-preflight"
                     .to_owned(),
             )
         })?;
@@ -122,6 +123,31 @@ async fn main() {
                     "overdue pre-submit intent cancelled locally: account_id={account_id} intent_id={intent_id}"
                 );
             }
+            "release-definitive-rejection" => {
+                let _lock = EngineLock::acquire_for_database(&db_path).map_err(|error| {
+                    polycopy_engine::copytrading::PersistentError::Config(format!(
+                        "cannot release a rejected reservation while an engine owns the database: {error}"
+                    ))
+                })?;
+                let account_id = account_id_from_env()?;
+                let attempt_id = std::env::args()
+                    .nth(2)
+                    .ok_or_else(|| {
+                        polycopy_engine::copytrading::PersistentError::Config(
+                            "release-definitive-rejection requires an attempt id".to_owned(),
+                        )
+                    })?
+                    .parse()
+                    .map_err(|_| {
+                        polycopy_engine::copytrading::PersistentError::Config(
+                            "invalid attempt id".to_owned(),
+                        )
+                    })?;
+                release_definitive_rejection(&pool, account_id, attempt_id).await?;
+                println!(
+                    "definitive rejection reservation released: account_id={account_id} attempt_id={attempt_id}"
+                );
+            }
             "reconcile-preflight" => {
                 let config = PersistentRuntimeConfig::from_env()?;
                 polycopy_engine::copytrading::persistent::verify_config(&pool, &config).await?;
@@ -162,7 +188,7 @@ async fn main() {
             }
             _ => {
                 return Err(polycopy_engine::copytrading::PersistentError::Config(
-                    "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|reconcile-preflight"
+                    "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|reconcile-preflight"
                         .to_owned(),
                 ));
             }
