@@ -37,6 +37,17 @@ execute = [
     "tokio/rt-multi-thread",
     "tokio/time",
 ]
+# Independent of both `ingest` (leader-activity ingestion) and `execute`
+# (the copy-order lifecycle): this only reads the account's own row, polls
+# Polymarket's read-only positions endpoint, and reads position_lots. No
+# signer, no order adapter, nothing from intl_clob anywhere in its import
+# graph -- see redemption.rs's module doc.
+redeem_detect = [
+    "db",
+    "dep:polymarket_client_sdk_v2",
+    "polymarket_client_sdk_v2/data",
+    "dep:rustls",
+]
 copy_run = [
     "execute",
     "ingest",

@@ -30,6 +30,9 @@ pub mod reconcile;
 #[cfg(feature = "ingest")]
 pub mod ingest;
 
+#[cfg(feature = "redeem_detect")]
+pub mod redemption;
+
 pub use control_tower::{
     leader_intents, leader_lots, leader_reconciliation_cases, leader_status, trace_attempt,
     AccountSummary, AttemptTrace, ControlTowerError, CopyStrategyStatusShim, EventSummary,
@@ -41,8 +44,8 @@ pub use plan::{
     PlanError, PlanSummary, PolicySnapshot,
 };
 pub use setup::{
-    configure_fresh_high_frequency_policy, initialize_fresh_test_copy_setup, InitialCopySetup,
-    InitialCopySetupResult, SetupError,
+    apply_trading_config, AccountConfigInput, ChangeKind, ConfigApplyOptions, ConfigApplySummary,
+    ConfigError, LeaderApplySummary, LeaderConfigInput, LeaderPolicyInput, TradingConfig,
 };
 
 #[cfg(feature = "execute")]
@@ -78,4 +81,9 @@ pub use persistent::{
     resume_fuse as resume_persistent_fuse, rolling_reserved_total, PersistentError,
     PersistentRuntimeConfig, PersistentSubmitMarker, EXIT_BUDGET_STATE, EXIT_CONFIG,
     EXIT_FUSE_OPEN, EXIT_LOCK_COLLISION, EXIT_UNRESOLVED_RECOVERY,
+};
+
+#[cfg(feature = "redeem_detect")]
+pub use redemption::{
+    detect_redeemable_positions, RedeemablePosition, RedemptionError, REDEMPTION_EVENT_PREFIX,
 };
