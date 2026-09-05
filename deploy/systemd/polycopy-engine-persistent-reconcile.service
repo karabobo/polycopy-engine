@@ -9,14 +9,16 @@ ConditionPathExists=/opt/polycopy-engine/current/target/release/persistent_contr
 
 [Service]
 Type=oneshot
-User=root
-Group=root
+User=polycopy-engine
+Group=polycopy-engine
 UMask=0077
 WorkingDirectory=/opt/polycopy-engine/current
 EnvironmentFile=/etc/polycopy-engine/persistent-public.env
 LoadCredential=polycopy-copy-secrets:/etc/polycopy-engine/credentials/copy-secrets.env
 ExecStart=/opt/polycopy-engine/current/target/release/persistent_control reconcile-preflight
 NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectHome=yes

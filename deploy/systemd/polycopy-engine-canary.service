@@ -9,14 +9,16 @@ ConditionPathExists=/opt/polycopy-engine/current/target/release/canary_probe
 
 [Service]
 Type=oneshot
-User=root
-Group=root
+User=polycopy-engine
+Group=polycopy-engine
 UMask=0077
 WorkingDirectory=/opt/polycopy-engine/current
 EnvironmentFile=/etc/polycopy-engine/canary-public.env
 LoadCredential=polycopy-canary-secrets:/etc/polycopy-engine/credentials/ghost-secrets.env
 ExecStart=/opt/polycopy-engine/current/target/release/canary_probe
 NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectHome=yes

@@ -32,6 +32,13 @@ The database must never be stored on NFS, SMB, a shared folder, or another
 host. Only one copy-engine process may use it; the database-side `EngineLock`
 is an additional guard, not a substitute for one systemd owner.
 
+Runtime services run as the fixed unprivileged `polycopy-engine` system
+account. Only `/var/lib/polycopy-engine` and `/var/log/polycopy-engine` are
+owned by that account. `/etc/polycopy-engine` and its credential sources stay
+`root:root` mode `0700`/`0600`: PID 1 reads them and supplies a per-service
+private credential through `LoadCredential`, so the runtime process never
+needs read access to the source secrets.
+
 ## Release procedure
 
 The execution server needs an isolated Rust stable toolchain once, before its

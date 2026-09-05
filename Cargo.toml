@@ -63,6 +63,73 @@ dashboard = [
     "dep:ratatui",
 ]
 
+# NEW-1 (post-P0-1 architecture review): cargo auto-builds every
+# src/bin/*.rs for every feature set. Without explicit [[bin]]
+# required-features, a bin whose main() is cfg'd out fails with "no main
+# function", and a bin importing a module its features don't enable fails
+# with E0432 — so `cargo check --features dashboard` (or any combo not
+# including that bin's needs) could not build at all. Each entry mirrors
+# the cfg gate on that binary's main (copy_run's main is gated `execute`
+# but it also imports copytrading::ingest, hence the full copy_run set).
+[[bin]]
+name = "canary_probe"
+path = "src/bin/canary_probe.rs"
+required-features = ["intl_clob"]
+
+[[bin]]
+name = "copy_config_apply"
+path = "src/bin/copy_config_apply.rs"
+required-features = ["execute"]
+
+[[bin]]
+name = "copy_dashboard"
+path = "src/bin/copy_dashboard.rs"
+required-features = ["dashboard"]
+
+[[bin]]
+name = "copy_persistent"
+path = "src/bin/copy_persistent.rs"
+required-features = ["copy_run"]
+
+[[bin]]
+name = "copy_run"
+path = "src/bin/copy_run.rs"
+required-features = ["copy_run"]
+
+[[bin]]
+name = "ghost_drift_report"
+path = "src/bin/ghost_drift_report.rs"
+required-features = ["intl_clob"]
+
+[[bin]]
+name = "ghost_verify"
+path = "src/bin/ghost_verify.rs"
+required-features = ["intl_clob"]
+
+[[bin]]
+name = "ingest_latency_report"
+path = "src/bin/ingest_latency_report.rs"
+required-features = ["ingest"]
+
+[[bin]]
+name = "ingest_observe"
+path = "src/bin/ingest_observe.rs"
+required-features = ["ingest"]
+
+[[bin]]
+name = "lock_probe"
+path = "src/bin/lock_probe.rs"
+
+[[bin]]
+name = "persistent_control"
+path = "src/bin/persistent_control.rs"
+required-features = ["execute"]
+
+[[bin]]
+name = "redeem_check"
+path = "src/bin/redeem_check.rs"
+required-features = ["redeem_detect"]
+
 [dependencies]
 # Version pinned to the same requirement polymarket_client_sdk_v2 itself
 # uses, so Cargo unifies on the one already-resolved copy instead of a

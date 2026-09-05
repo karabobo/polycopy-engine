@@ -11,10 +11,13 @@
 *.sqlite3
 *.sqlite3-*
 
-# Credentials and live-order material.  Keep documented examples tracked.
+# Credentials and live-order material. Keep documented examples tracked.
+# These patterns also protect misplaced nested deploy/test .env files.
 .env
 .env.*
-!.env.example
+*.env
+*.env.*
+!/.env.example
 /secrets/
 /keys/
 *.pem

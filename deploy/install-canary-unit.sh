@@ -40,13 +40,25 @@ ssh_args=(
 )
 
 "${ssh_args[@]}" "set -eu
+    test \"\$(id -u)\" -eq 0 || { echo 'remote installer must run as root' >&2; exit 1; }
     test -x '$remote_root/current/target/release/canary_probe'
     if test -e /etc/systemd/system/polycopy-engine-canary.service; then
         echo 'refusing to replace existing polycopy-engine-canary.service' >&2
         exit 17
     fi
+    # Fixed unprivileged service identity. Do not grant it access to
+    # /etc/polycopy-engine: PID 1 reads EnvironmentFile/LoadCredential and
+    # supplies only the service-private credential copy at exec time.
+    if ! getent group polycopy-engine >/dev/null; then
+        groupadd --system polycopy-engine
+    fi
+    if ! id -u polycopy-engine >/dev/null 2>&1; then
+        useradd --system --gid polycopy-engine --home-dir /nonexistent \
+            --shell /usr/sbin/nologin polycopy-engine
+    fi
     install -d -m 0700 /etc/polycopy-engine /etc/polycopy-engine/credentials
-    install -d -m 0750 /var/lib/polycopy-engine /var/log/polycopy-engine
+    install -d -o polycopy-engine -g polycopy-engine -m 0750 \
+        /var/lib/polycopy-engine /var/log/polycopy-engine
     install -m 0644 '$remote_root/current/deploy/systemd/polycopy-engine-canary.service' \\
         /etc/systemd/system/polycopy-engine-canary.service
     systemctl daemon-reload

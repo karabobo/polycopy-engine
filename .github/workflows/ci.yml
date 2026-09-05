@@ -1,0 +1,77 @@
+name: CI Gate
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (all features)
+        run: cargo build --all-features --tests
+
+      - name: Test (all features)
+        run: cargo test --all-features
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  security_and_unit_policy:
+    runs-on: ubuntu-latest
+    steps:
+      # Full history is deliberate: a shallow checkout only scans the current
+      # diff and can miss a secret that was already merged.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan tracked content for credentials
+        uses: gitleaks/gitleaks-action@v2
+
+      - name: Verify systemd unit syntax in an isolated root
+        run: |
+          root="$RUNNER_TEMP/polycopy-systemd-root"
+          unit_dir="$root/etc/systemd/system"
+          bin_dir="$root/opt/polycopy-engine/current/target/release"
+          mkdir -p "$unit_dir" "$bin_dir"
+          cp deploy/systemd/* "$unit_dir/"
+          # verify checks absolute ExecStart paths. Provide inert executable
+          # placeholders inside --root, never host /opt paths.
+          for bin in copy_run copy_persistent persistent_control ghost_verify canary_probe; do
+            printf '#!/bin/sh\nexit 0\n' > "$bin_dir/$bin"
+            chmod 0755 "$bin_dir/$bin"
+          done
+          systemd-analyze verify --root="$root" "$unit_dir"/*.service "$unit_dir"/*.timer
+
+      - name: Enforce unprivileged credential-unit policy
+        run: |
+          ! grep -R '^User=root\|^Group=root' deploy/systemd/*.service
+          test "$(grep -RL '^LoadCredential=' deploy/systemd/*.service | wc -l)" -eq 0
+          ! grep -RE '^Environment(File)?=.*POLYCOPY_CLOB_' deploy/systemd/*.service
+
+  blueprint_gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify blueprint exists
+        run: test -f docs/COPY_ENGINE_BLUEPRINT.md && echo "Blueprint present"
+
+      - name: Verify Phase 0 status report exists (gate evidence)
+        run: test -f docs/PHASE_0_STATUS.md && echo "Phase 0 status present"
