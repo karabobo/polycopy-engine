@@ -8,7 +8,9 @@ use chrono::Utc;
 use rust_decimal::Decimal;
 
 use super::*;
-use crate::copytrading::persistent::{init_config, PersistentRuntimeConfig, PersistentSubmitMarker};
+use crate::copytrading::persistent::{
+    init_config, PersistentRuntimeConfig, PersistentSubmitMarker,
+};
 use crate::venue::intl_clob::StrictTokenBalanceReader;
 use crate::{
     copytrading::{db::open_and_migrate, plan::PolicySnapshot, reconcile::OrderId},
@@ -144,8 +146,7 @@ struct FakeVenue {
     // reconcile_or_finalize branch), Ok(None) (the audit baseline), or
     // Err(detail) (driving the audit-baseline Err arm that maps to
     // `OrchestrateError::Submit(SubmitError::Local(_))`).
-    order_lookup_result:
-        Mutex<Option<Result<crate::venue::types::VenueOrderState, String>>>,
+    order_lookup_result: Mutex<Option<Result<crate::venue::types::VenueOrderState, String>>>,
     query_receipt_result: Mutex<Option<Result<Option<OrderReceipt>, String>>>,
     // P0-3 step 8: `None` means "use the audit baseline size_matched
     // (5)"; a `Some(_)` value is surfaced verbatim by
@@ -303,8 +304,7 @@ impl EnvelopeFactory for FakeVenue {
     fn prepare(
         &self,
         decision: &SizedDecision,
-    ) -> impl std::future::Future<Output = Result<PreparedOrderEnvelope, String>> + Send
-    {
+    ) -> impl std::future::Future<Output = Result<PreparedOrderEnvelope, String>> + Send {
         let count = self.prepare_count.fetch_add(1, Ordering::SeqCst);
         let envelope = PreparedOrderEnvelope {
             token_id: decision.token_id.clone(),
@@ -323,6 +323,7 @@ impl EnvelopeFactory for FakeVenue {
 struct FailingEnvelopeFactory;
 
 impl EnvelopeFactory for FailingEnvelopeFactory {
+    #[allow(clippy::manual_async_fn)]
     fn prepare(
         &self,
         _decision: &SizedDecision,
@@ -354,11 +355,10 @@ impl CopyExecution for FakeVenue {
             .expect("order lookup lock")
             .clone();
         let status = self.order_status.lock().expect("order status lock").clone();
-        let size_override = self
+        let size_override = *self
             .size_matched_override
             .lock()
-            .expect("size matched lock")
-            .clone();
+            .expect("size matched lock");
         async move {
             // Default behavior (no override): succeed with the current
             // `order_status`. Tests that need a failing lookup set the
@@ -381,8 +381,7 @@ impl CopyExecution for FakeVenue {
     fn query_prepared_envelope(
         &self,
         _envelope: &PreparedOrderEnvelope,
-    ) -> impl std::future::Future<Output = Result<Option<OrderReceipt>, String>> + Send
-    {
+    ) -> impl std::future::Future<Output = Result<Option<OrderReceipt>, String>> + Send {
         // P0-3 step 3 + step 7: honour the override if set, otherwise
         // fall back to the audit-baseline Ok(None). The override has
         // three meaningful shapes:
@@ -654,8 +653,7 @@ async fn open_reconciliation_for_account_token_excludes_and_blocks_later_intents
     let db = TestDb::new().await;
     seed_account_and_schedule(&db).await;
     seed_leader(&db, 1).await;
-    let blocked_intent =
-        seed_pending_buy_with_event_key(&db, "activity:1:tok:BUY:5:blocked").await;
+    let blocked_intent = seed_pending_buy_with_event_key(&db, "activity:1:tok:BUY:5:blocked").await;
     crate::copytrading::reconcile::open_reconciliation_case(
         &db,
         blocked_intent,
@@ -690,12 +688,11 @@ async fn open_reconciliation_for_account_token_excludes_and_blocks_later_intents
         OrchestrateOutcome::Blocked("account/token needs reconciliation")
     );
     assert_eq!(venue.submit_count.load(Ordering::SeqCst), 0);
-    let later_status: String =
-        sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
-            .bind(later_intent)
-            .fetch_one(&db.pool)
-            .await
-            .expect("later status");
+    let later_status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+        .bind(later_intent)
+        .fetch_one(&db.pool)
+        .await
+        .expect("later status");
     assert_eq!(later_status, "pending");
 }
 
@@ -738,12 +735,11 @@ async fn recovered_order_id_with_non_terminal_order_state_opens_reconciliation()
     );
     assert_eq!(venue.submit_count.load(Ordering::SeqCst), 1);
 
-    let intent_status: String =
-        sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
-            .bind(intent_id)
-            .fetch_one(&db.pool)
-            .await
-            .expect("intent status");
+    let intent_status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+        .bind(intent_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("intent status");
     assert_eq!(intent_status, "needs_reconcile");
     let case_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM reconciliation_cases \
@@ -906,12 +902,11 @@ async fn a_local_submission_failure_opens_a_reconciliation_case_without_a_silent
     // `Transport` at the attempt-status level is caught.
     assert_eq!(attempt_status(&db, intent_id).await, "uncertain");
 
-    let intent_status: String =
-        sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
-            .bind(intent_id)
-            .fetch_one(&db.pool)
-            .await
-            .expect("intent status");
+    let intent_status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+        .bind(intent_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("intent status");
     assert_eq!(intent_status, "needs_reconcile");
 
     // The audit-trail case carries the *class* of failure -- this
@@ -1041,12 +1036,11 @@ async fn a_strict_order_lookup_failure_opens_strict_query_failure_without_resubm
         "query_first must never re-prepare the envelope after a strict-lookup failure"
     );
 
-    let intent_status: String =
-        sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
-            .bind(intent_id)
-            .fetch_one(&db.pool)
-            .await
-            .expect("intent status");
+    let intent_status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+        .bind(intent_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("intent status");
     assert_eq!(intent_status, "needs_reconcile");
 
     // One open `strict_query_failure` case, no lots credited.
@@ -1158,12 +1152,8 @@ async fn an_accepted_attempt_with_a_recoverable_receipt_finalizes_without_resubm
     // calling `submit_exact_envelope` (the venue has already accepted
     // the order -- a second submit would create a duplicate FAK).
     let pre_accepted_venue = FakeVenue::pre_accepted_with_receipt(
-        OrderReceipt::from_fak_buy_budget(
-            Decimal::new(5, 0),
-            Decimal::new(5, 0),
-            filled,
-        )
-        .expect("receipt"),
+        OrderReceipt::from_fak_buy_budget(Decimal::new(5, 0), Decimal::new(5, 0), filled)
+            .expect("receipt"),
     );
 
     let second_outcome = execute_one_intent(
@@ -1368,7 +1358,9 @@ async fn a_local_submission_failure_releases_the_persistent_budget_reservation()
     // apply.
     let cfg = PersistentRuntimeConfig::from_values(1, true, "1", "1", "5", 86_400, 1, 60)
         .expect("valid persistent config");
-    init_config(&db, &cfg).await.expect("init persistent config");
+    init_config(&db, &cfg)
+        .await
+        .expect("init persistent config");
 
     // reserve_budget_and_mark_submitting requires the intent to be in
     // 'in_progress' status with planned_qty, planned_price, and
@@ -1389,12 +1381,11 @@ async fn a_local_submission_failure_releases_the_persistent_budget_reservation()
     // Confirm the reservation does not exist before the Local arm
     // fires -- otherwise this test would silently pass on a fixture
     // that already had one.
-    let reservations_before: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM persistent_budget_reservations",
-    )
-    .fetch_one(&db.pool)
-    .await
-    .expect("reservation count before");
+    let reservations_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM persistent_budget_reservations")
+            .fetch_one(&db.pool)
+            .await
+            .expect("reservation count before");
     assert_eq!(
         reservations_before, 0,
         "test fixture must start with zero persistent_budget_reservations rows"
@@ -1425,22 +1416,20 @@ async fn a_local_submission_failure_releases_the_persistent_budget_reservation()
     // transitioned it to `released_pre_boundary`. Without the step-3
     // release call this row would still be `reserved` and the test
     // would catch the regression.
-    let (state, release_reason): (String, Option<String>) = sqlx::query_as(
-        "SELECT state, release_reason FROM persistent_budget_reservations",
-    )
-    .fetch_one(&db.pool)
-    .await
-    .expect("reservation row");
+    let (state, release_reason): (String, Option<String>) =
+        sqlx::query_as("SELECT state, release_reason FROM persistent_budget_reservations")
+            .fetch_one(&db.pool)
+            .await
+            .expect("reservation row");
 
     // Fetch the attempt_id from the persistent-marker side-effect so the
     // subsequent reconciliation_cases and attempt_status assertions
     // can scope to it (rather than to the intent_id alone).
-    let attempt_id: i64 =
-        sqlx::query_scalar("SELECT id FROM order_attempts WHERE intent_id = ?")
-            .bind(intent_id)
-            .fetch_one(&db.pool)
-            .await
-            .expect("attempt id");
+    let attempt_id: i64 = sqlx::query_scalar("SELECT id FROM order_attempts WHERE intent_id = ?")
+        .bind(intent_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("attempt id");
 
     assert_eq!(
         state, "released_pre_boundary",
@@ -1571,10 +1560,11 @@ async fn a_query_prepared_envelope_failure_during_recovery_opens_strict_query_re
     assert_eq!(intent_status, "needs_reconcile");
     assert_eq!(case_type, "strict_query_failure");
     assert_eq!(attempt_status(&db, intent_id).await, "accepted");
-    let lot_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM position_lots WHERE account_id = 1")
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
+    let lot_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM position_lots WHERE account_id = 1")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
     assert_eq!(lot_count, 0, "lookup error cannot create a phantom fill");
 }
 
@@ -1717,12 +1707,11 @@ async fn an_attempt_in_an_unrecognized_status_opens_a_blocked_recovery_case() {
     // token) lock prevents later intents from racing while the
     // operator is reviewing. Mirrors the standard-`open_reconciliation_case`
     // behaviour at the orchestrator's other three case-opens.
-    let intent_status: String =
-        sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
-            .bind(intent_id)
-            .fetch_one(&db.pool)
-            .await
-            .expect("intent status");
+    let intent_status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+        .bind(intent_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("intent status");
     assert_eq!(intent_status, "needs_reconcile");
 
     // No phantom lot: the Blocked branch cannot have computed a
@@ -1791,8 +1780,7 @@ async fn a_terminal_status_with_zero_matched_size_opens_an_unknown_submission_ca
     // it as NeedsReconcile("strict order state not terminal")
     // -- the same `unknown_submission` case path as the
     // non-terminal-status branch.
-    let zero_matched_venue =
-        FakeVenue::succeeding(Decimal::new(5_000_000, 6));
+    let zero_matched_venue = FakeVenue::succeeding(Decimal::new(5_000_000, 6));
     zero_matched_venue.with_size_matched(Decimal::ZERO);
 
     let outcome = execute_one_intent(
@@ -1830,12 +1818,11 @@ async fn a_terminal_status_with_zero_matched_size_opens_an_unknown_submission_ca
     // The intent must be moved to needs_reconcile so the (account,
     // token) lock prevents later intents from racing while the
     // operator reviews.
-    let intent_status: String =
-        sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
-            .bind(intent_id)
-            .fetch_one(&db.pool)
-            .await
-            .expect("intent status");
+    let intent_status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+        .bind(intent_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("intent status");
     assert_eq!(intent_status, "needs_reconcile");
 
     // One open `unknown_submission` reconciliation case must
@@ -1856,8 +1843,7 @@ async fn a_terminal_status_with_zero_matched_size_opens_an_unknown_submission_ca
     .expect("case row");
     assert_eq!(case.0, "unknown_submission");
     assert!(
-        case.1.contains("zero matched size")
-            && case.1.contains("MATCHED"),
+        case.1.contains("zero matched size") && case.1.contains("MATCHED"),
         "case detail must reference the zero-matched-size path so operators can triage, got: {}",
         case.1
     );
@@ -2060,20 +2046,20 @@ async fn a_pre_submit_envelope_failure_releases_reservation_without_attempt_or_s
         OrchestrateOutcome::Rejected
     );
     assert_eq!(venue.submit_count.load(Ordering::SeqCst), 0);
-    let (status, reserved): (String, String) = sqlx::query_as(
-        "SELECT status, reserved_qty FROM copy_intents WHERE id = ?",
-    )
-    .bind(intent_id)
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
+    let (status, reserved): (String, String) =
+        sqlx::query_as("SELECT status, reserved_qty FROM copy_intents WHERE id = ?")
+            .bind(intent_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
     assert_eq!(status, "rejected");
     assert_eq!(reserved, "0");
-    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM order_attempts WHERE intent_id = ?")
-        .bind(intent_id)
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
+    let attempts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM order_attempts WHERE intent_id = ?")
+            .bind(intent_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
     assert_eq!(attempts, 0);
     let lots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM position_lots WHERE account_id = 1")
         .fetch_one(&db.pool)
@@ -2096,31 +2082,58 @@ async fn a_definitive_rejection_prepares_one_fresh_retry_without_phantom_lot() {
     *venue.submit_result.lock().unwrap() = Err(SubmitError::Rejected("price moved".to_owned()));
 
     assert_eq!(
-        execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)), &venue, &venue, &EmptyHistory, intent_id, Utc::now())
-            .await
-            .unwrap(),
+        execute_one_intent(
+            &db,
+            &FixedBalance(Decimal::new(100, 0)),
+            &venue,
+            &venue,
+            &EmptyHistory,
+            intent_id,
+            Utc::now()
+        )
+        .await
+        .unwrap(),
         OrchestrateOutcome::Rejected
     );
     assert_eq!(attempt_status(&db, intent_id).await, "rejected");
     assert_eq!(venue.submit_count.load(Ordering::SeqCst), 1);
     let lots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM position_lots WHERE account_id = 1")
-        .fetch_one(&db.pool).await.unwrap();
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
     assert_eq!(lots, 0);
 
     // The next run uses a new signed envelope/attempt, then a proven receipt
     // can finalize exactly one lot. It does not reuse the rejected attempt.
-    *venue.submit_result.lock().unwrap() = Ok(
-        OrderReceipt::from_fak_buy_budget(Decimal::new(5, 0), Decimal::new(5, 0), Decimal::new(5, 0)).unwrap(),
-    );
+    *venue.submit_result.lock().unwrap() = Ok(OrderReceipt::from_fak_buy_budget(
+        Decimal::new(5, 0),
+        Decimal::new(5, 0),
+        Decimal::new(5, 0),
+    )
+    .unwrap());
     assert_eq!(
-        execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)), &venue, &venue, &EmptyHistory, intent_id, Utc::now())
-            .await
-            .unwrap(),
-        OrchestrateOutcome::Filled { filled_qty: Decimal::new(5, 0) }
+        execute_one_intent(
+            &db,
+            &FixedBalance(Decimal::new(100, 0)),
+            &venue,
+            &venue,
+            &EmptyHistory,
+            intent_id,
+            Utc::now()
+        )
+        .await
+        .unwrap(),
+        OrchestrateOutcome::Filled {
+            filled_qty: Decimal::new(5, 0)
+        }
     );
     assert_eq!(venue.submit_count.load(Ordering::SeqCst), 2);
-    let attempt_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM order_attempts WHERE intent_id = ?")
-        .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    let attempt_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM order_attempts WHERE intent_id = ?")
+            .bind(intent_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
     assert_eq!(attempt_count, 2);
     let lot: String = sqlx::query_scalar("SELECT qty FROM position_lots WHERE account_id = 1 AND leader_id = 1 AND token_id = '123456'")
         .fetch_one(&db.pool).await.unwrap();

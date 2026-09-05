@@ -30,16 +30,16 @@ use crate::venue::intl_clob::StrictTradeHistoryReader;
 // `AccountTrade` fixtures; the production bodies that used these types
 // moved to `venue::execution_contract` in P0-1.
 #[cfg(test)]
-use std::str::FromStr as _;
-#[cfg(test)]
-use rust_decimal::Decimal;
-#[cfg(test)]
 use crate::venue::intl_clob::{
     AccountTrade, AccountTradeRole, AccountTradeSide, AccountTradeStatus, OutcomeTokenId,
     StrictTradeHistoryError,
 };
 #[cfg(test)]
 use crate::venue::OrderReceipt;
+#[cfg(test)]
+use rust_decimal::Decimal;
+#[cfg(test)]
+use std::str::FromStr as _;
 
 /// Maximum submission attempts for one intent within [`RETRY_WINDOW_SECONDS`]
 /// before retries are exhausted and a reconciliation case opens.
@@ -64,8 +64,8 @@ pub use crate::venue::execution_contract::{
 // on, and `execute` implies `intl_clob`, so the re-export is always
 // available here).
 pub use crate::venue::trade_history_recovery::{
-    lookup_prepared_fak_in_trade_history, recover_fak_taker_order_from_trades,
-    TradeHistoryLookup, TradeHistoryRecoveryError, TradeHistoryWindow,
+    lookup_prepared_fak_in_trade_history, recover_fak_taker_order_from_trades, TradeHistoryLookup,
+    TradeHistoryRecoveryError, TradeHistoryWindow,
 };
 // Local scope + backward-compat re-export for the two venue primitives
 // moved in the first P0-1 step. `pub use` serves both purposes.
@@ -136,9 +136,7 @@ pub async fn load_or_prepare_attempt(
 
     match &result {
         Ok(_) => {
-            let commit_result = sqlx::query("COMMIT")
-                .execute(&mut *conn)
-                .await;
+            let commit_result = sqlx::query("COMMIT").execute(&mut *conn).await;
             if let Err(commit_error) = commit_result {
                 // P2-1: COMMIT itself failed (rare -- e.g. I/O error
                 // mid-flush). Best-effort ROLLBACK so the pooled
@@ -551,6 +549,7 @@ pub async fn open_reconciliation_case(
 /// the call site: the only path for the Local arm to release the
 /// reservation and open the case now goes through one `BEGIN IMMEDIATE`
 /// + `COMMIT` pair. The release call is a no-op (zero rows affected)
+///
 /// when the attempt has no associated reservation -- this is fine, the
 /// transaction still commits cleanly and the case row is still inserted.
 ///
@@ -1107,13 +1106,7 @@ mod tests {
         // P2-6 pin: signed_order_json must be a JSON object (the SDK
         // serializes SignedOrder as a JSON object; any other JSON shape
         // means a corrupted or hand-rolled envelope).
-        for bad in [
-            r#""""#,
-            r#"null"#,
-            r#"[]"#,
-            r#"42"#,
-            r#"not even json"#,
-        ] {
+        for bad in [r#""""#, r#"null"#, r#"[]"#, r#"42"#, r#"not even json"#] {
             let mut env = envelope(42);
             env.signed_order_json = bad.to_owned();
             assert_eq!(
@@ -1198,7 +1191,10 @@ mod tests {
         // above. Pin it here directly so a future refactor that loosens
         // the check (e.g. silently swapping after and before) is caught
         // before any malformed window reaches the matcher.
-        let after = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 10).single().unwrap();
+        let after = Utc
+            .with_ymd_and_hms(2026, 9, 1, 12, 0, 10)
+            .single()
+            .unwrap();
         let before = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).single().unwrap();
         assert_eq!(
             TradeHistoryWindow::new(after, before),
@@ -1834,23 +1830,17 @@ mod tests {
         .await
         .expect("reservation pre-state");
         assert_eq!(state_before, "reserved");
-        let case_count_before: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ?",
-        )
-        .bind(intent_id)
-        .fetch_one(&db.pool)
-        .await
-        .expect("case count pre-state");
+        let case_count_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ?")
+                .bind(intent_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("case count pre-state");
         assert_eq!(case_count_before, 0);
 
-        open_local_submission_failure_case(
-            &db,
-            intent_id,
-            attempt_id,
-            "payload validation failed",
-        )
-        .await
-        .expect("open_local_submission_failure_case must succeed");
+        open_local_submission_failure_case(&db, intent_id, attempt_id, "payload validation failed")
+            .await
+            .expect("open_local_submission_failure_case must succeed");
 
         // All three writes must be observable together -- a single
         // tx commit guarantee. A two-transaction regression would
@@ -1959,7 +1949,10 @@ mod tests {
         .fetch_one(&db.pool)
         .await
         .expect("case count after second call");
-        assert_eq!(case_count, 1, "NOT EXISTS clause must prevent duplicate case rows");
+        assert_eq!(
+            case_count, 1,
+            "NOT EXISTS clause must prevent duplicate case rows"
+        );
 
         // released_at unchanged: the WHERE state='reserved' filter
         // excludes the already-released row, so the second call

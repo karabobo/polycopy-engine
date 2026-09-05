@@ -625,7 +625,7 @@ pub async fn release_pre_boundary_failure(
     reason: &str,
 ) -> Result<(), PersistentError> {
     let mut conn = pool.acquire().await.map_err(db_err)?;
-    release_pre_boundary_failure_with_conn(&mut *conn, attempt_id, reason).await
+    release_pre_boundary_failure_with_conn(&mut conn, attempt_id, reason).await
 }
 
 /// Transaction-aware variant of [`release_pre_boundary_failure`]. Used by
@@ -635,7 +635,7 @@ pub async fn release_pre_boundary_failure(
 /// could leave a freed reservation with no audit case (or vice versa),
 /// violating AGENTS.md's "atomic" invariant for receipt accounting,
 /// reservation release, and intent finalization.
-pub async fn release_pre_boundary_failure_with_conn<'c>(
+pub async fn release_pre_boundary_failure_with_conn(
     conn: &mut sqlx::SqliteConnection,
     attempt_id: i64,
     reason: &str,

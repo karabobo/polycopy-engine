@@ -473,12 +473,12 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
 
 fn apply_tolerance(event_price: Decimal, tolerance_bps: i64, side: Side) -> Decimal {
     let tolerance = event_price * Decimal::new(tolerance_bps, 4); // bps / 10_000
-    // BUY ceiling strictly below 1.00: the Polymarket CLOB accepts only
-    // prices in the open interval (0, 1). A tolerance-adjusted BUY must
-    // never reach 1.00 (or above) before tick alignment; otherwise the
-    // subsequent `round_price(BUY=ceil)` would emit exactly 1.00 or step
-    // over the boundary. We use a tick-size-agnostic cap below 1.00 that
-    // is safe for every documented tick granularity (>= 0.001).
+                                                                  // BUY ceiling strictly below 1.00: the Polymarket CLOB accepts only
+                                                                  // prices in the open interval (0, 1). A tolerance-adjusted BUY must
+                                                                  // never reach 1.00 (or above) before tick alignment; otherwise the
+                                                                  // subsequent `round_price(BUY=ceil)` would emit exactly 1.00 or step
+                                                                  // over the boundary. We use a tick-size-agnostic cap below 1.00 that
+                                                                  // is safe for every documented tick granularity (>= 0.001).
     const BUY_CEILING: Decimal = Decimal::from_parts(999999, 0, 0, false, 6); // 0.999999
     match side {
         // Willing to pay slightly more than the leader did, to raise the
@@ -1048,15 +1048,22 @@ mod tests {
         // A BUY with event price just below 1.00 and any tolerance must
         // never produce a tolerance-adjusted price at or above 1.00.
         let adjusted = apply_tolerance(Decimal::new(999, 3), 100, Side::Buy);
-        assert!(adjusted < Decimal::ONE,
-            "apply_tolerance must never produce a BUY price >= 1.00; got {adjusted}");
+        assert!(
+            adjusted < Decimal::ONE,
+            "apply_tolerance must never produce a BUY price >= 1.00; got {adjusted}"
+        );
         // Even an arbitrarily large BUY tolerance cannot push the
         // adjusted price to 1.00 -- the cap holds.
         let any = apply_tolerance(Decimal::new(999, 3), 10_000, Side::Buy);
-        assert!(any < Decimal::ONE,
-            "an arbitrarily large BUY tolerance must still cap below 1.00; got {any}");
-        assert_eq!(any, Decimal::new(999_999, 6),
-            "the BUY cap is the tick-size-agnostic 0.999999 ceiling");
+        assert!(
+            any < Decimal::ONE,
+            "an arbitrarily large BUY tolerance must still cap below 1.00; got {any}"
+        );
+        assert_eq!(
+            any,
+            Decimal::new(999_999, 6),
+            "the BUY cap is the tick-size-agnostic 0.999999 ceiling"
+        );
     }
 
     #[test]
@@ -1729,25 +1736,28 @@ mod tests {
         // strictly below 1.00 for every (event_price, tolerance_bps, tick)
         // combination that is otherwise in-range.
         for event in [
-            Decimal::new(999, 3),   // 0.999 (within tick=0.01)
+            Decimal::new(999, 3), // 0.999 (within tick=0.01)
             Decimal::new(998, 3),
             Decimal::new(995, 3),
-            Decimal::new(99, 2),    // 0.99 (already at max boundary)
-            Decimal::new(1, 0),     // 1.0 (would round to 1.00)
+            Decimal::new(99, 2), // 0.99 (already at max boundary)
+            Decimal::new(1, 0),  // 1.0 (would round to 1.00)
         ] {
             for tol in [0i64, 50, 100, 1_000, 10_000] {
                 let adjusted = apply_tolerance(event, tol, Side::Buy);
                 let r1 = round_price(adjusted, Decimal::new(1, 2), Side::Buy);
-                let r2 = clamp_to_policy_band(r1, Decimal::new(1, 2), Decimal::new(99, 2))
-                    .unwrap_or_else(|_| r1);
-                assert!(r2 < Decimal::ONE,
-                    "BUY pipeline produced {r2} (event={event}, tol={tol}); must be < 1.00");
+                let r2 =
+                    clamp_to_policy_band(r1, Decimal::new(1, 2), Decimal::new(99, 2)).unwrap_or(r1);
+                assert!(
+                    r2 < Decimal::ONE,
+                    "BUY pipeline produced {r2} (event={event}, tol={tol}); must be < 1.00"
+                );
                 // And the price must remain inside the open (0, 1) interval.
                 assert!(r2 > Decimal::ZERO);
             }
         }
     }
 
+    #[tokio::test]
     async fn an_expired_persisted_decision_is_never_resumed_or_left_reserved() {
         let db = TestDb::new().await;
         seed_account_and_schedule(&db).await;

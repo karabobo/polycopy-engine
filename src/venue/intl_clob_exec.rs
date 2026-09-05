@@ -146,6 +146,7 @@ impl IntlClobCopyAdapter {
 /// Shares filled:
 /// - BUY: `taking_amount` (Phase 0.5 Result 3)
 /// - SELL: `making_amount` (SDK `order_builder` swaps maker/taker by side)
+///
 /// P2-7: the single strict parse of `envelope.size`. Both the submit-path
 /// receipt builder and the query-first recovery path use this; a malformed
 /// persisted size is always an error, never a silent zero.
