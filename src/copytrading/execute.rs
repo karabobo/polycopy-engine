@@ -22,41 +22,14 @@ use crate::{
     },
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Side {
-    Buy,
-    Sell,
-}
-
-impl Side {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Buy => "BUY",
-            Self::Sell => "SELL",
-        }
-    }
-
-    pub(crate) fn from_str(raw: &str) -> Option<Self> {
-        match raw {
-            "BUY" => Some(Self::Buy),
-            "SELL" => Some(Self::Sell),
-            _ => None,
-        }
-    }
-}
-
-/// One already-sized, already-priced decision ready to submit. Everything
-/// on this struct is already durably persisted on `copy_intents` by the
-/// time a caller has one -- Phase 5's real submitter reads it back from
-/// there, not from an in-memory value that a crash could lose.
-#[derive(Debug, Clone)]
-pub struct SizedDecision {
-    pub intent_id: i64,
-    pub token_id: String,
-    pub side: Side,
-    pub qty: Decimal,
-    pub limit_price: Decimal,
-}
+// P0-1 architecture inversion: `Side` and `SizedDecision` are venue-side
+// order-specification primitives; their canonical home is now
+// `venue::execution_contract` so `venue::intl_clob_exec` can implement
+// `CopyExecution` without importing from `crate::copytrading::*`
+// (AGENTS.md: "venue 不向上依赖 copytrading"). Re-exported here so every
+// existing `crate::copytrading::execute::{Side, SizedDecision}` call site
+// keeps compiling unchanged.
+pub use crate::venue::execution_contract::{Side, SizedDecision};
 
 /// What Phase 4 needs from Phase 5: submit one already-decided order and
 /// return its receipt, or fail. **No implementation of this trait exists
@@ -238,6 +211,7 @@ pub async fn claim_or_resume_intent(
     }))
 }
 
+#[derive(Debug)]
 pub enum SizingOutcome {
     Decision(SizedDecision),
     NeedsReconcile(&'static str),
@@ -256,13 +230,25 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
 ) -> Result<SizingOutcome, ExecuteError> {
     // A persisted decision is immutable, but it is not exempt from the FAK
     // deadline. A restart must never turn an expired decision into a late
-    // submission.
-    if let Some(deadline) = &claimed.decision_deadline_at {
-        if let Ok(deadline) = chrono::DateTime::parse_from_rfc3339(deadline) {
-            if chrono::Utc::now() > deadline {
+    // submission. P2-2: previously this branch silently skipped the
+    // check on either a missing deadline (None) or a malformed rfc3339
+    // value (Err from parse_from_rfc3339). Both of those are now treated
+    // as expired so an intent that the executor cannot prove is fresh
+    // is never submitted. AGENTS.md: "An order submission that may have
+    // crossed the network boundary is uncertain, not failed. Query it
+    // first; without proven lookup and idempotency behavior, move the
+    // account/token to `needs_reconcile` rather than retrying."
+    // For a malformed deadline the safest analogue is "cannot prove
+    // freshness" -> reject, not "submit anyway".
+    match &claimed.decision_deadline_at {
+        None => return Ok(SizingOutcome::Expired),
+        Some(deadline) => match chrono::DateTime::parse_from_rfc3339(deadline) {
+            Ok(parsed) if chrono::Utc::now() > parsed => {
                 return Ok(SizingOutcome::Expired);
             }
-        }
+            Ok(_) => {} // parsed and still in the future: proceed
+            Err(_) => return Ok(SizingOutcome::Expired), // unparseable: fail closed
+        },
     }
 
     if let Some((qty, price, _notional)) = claimed.existing_decision {
@@ -280,6 +266,17 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
         .tick_size
         .parse()
         .map_err(|_| ExecuteError::InvalidDecimal("leader_policy.tick_size"))?;
+    // P2-5: parse the absolute price band so clamp_to_policy_band can run
+    // on the post-round_price limit. Without this parse the policy band
+    // is silently ignored, which is the audit-flagged behaviour.
+    let min_price: Decimal = policy
+        .min_price
+        .parse()
+        .map_err(|_| ExecuteError::InvalidDecimal("leader_policy.min_price"))?;
+    let max_price: Decimal = policy
+        .max_price
+        .parse()
+        .map_err(|_| ExecuteError::InvalidDecimal("leader_policy.max_price"))?;
 
     let (qty, limit_price) = match claimed.side {
         Side::Sell => {
@@ -333,6 +330,27 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
                 tick_size,
                 claimed.side,
             );
+            // P2-5: enforce the absolute policy band on the post-round
+            // price. A clamp result outside (0, 1) is a local rejection
+            // (matches the existing SizingOutcome::Rejected surface used
+            // for the "no tracked virtual lot" path a few lines above).
+            let price = match clamp_to_policy_band(price, min_price, max_price) {
+                Ok(price) => price,
+                Err(reason) => {
+                    return Ok(SizingOutcome::Rejected(reason));
+                }
+            };
+            // Defense in depth: never hand the venue a price at or above
+            // 1.00 even if policy or tick rounding somehow produced one.
+            // The Polymarket CLOB rejects 1.00 locally; the executor must
+            // do the same so a misconfigured policy cannot trigger the
+            // circuit-breaker safety stop.
+            let price = match defensively_cap_below_one(price) {
+                Ok(price) => price,
+                Err(reason) => {
+                    return Ok(SizingOutcome::Rejected(reason));
+                }
+            };
             (sell_qty, price)
         }
         Side::Buy => {
@@ -343,6 +361,20 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
                 tick_size,
                 claimed.side,
             );
+            // P2-5: same absolute-band enforcement as the SELL branch.
+            let limit_price = match clamp_to_policy_band(limit_price, min_price, max_price) {
+                Ok(price) => price,
+                Err(reason) => {
+                    return Ok(SizingOutcome::Rejected(reason));
+                }
+            };
+            // Defense in depth: same one-dollar safety rail as SELL.
+            let limit_price = match defensively_cap_below_one(limit_price) {
+                Ok(price) => price,
+                Err(reason) => {
+                    return Ok(SizingOutcome::Rejected(reason));
+                }
+            };
             let strict_collateral = match balance_reader.collateral_balance_strict().await {
                 Ok(balance) => balance,
                 Err(_) => {
@@ -441,10 +473,17 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
 
 fn apply_tolerance(event_price: Decimal, tolerance_bps: i64, side: Side) -> Decimal {
     let tolerance = event_price * Decimal::new(tolerance_bps, 4); // bps / 10_000
+    // BUY ceiling strictly below 1.00: the Polymarket CLOB accepts only
+    // prices in the open interval (0, 1). A tolerance-adjusted BUY must
+    // never reach 1.00 (or above) before tick alignment; otherwise the
+    // subsequent `round_price(BUY=ceil)` would emit exactly 1.00 or step
+    // over the boundary. We use a tick-size-agnostic cap below 1.00 that
+    // is safe for every documented tick granularity (>= 0.001).
+    const BUY_CEILING: Decimal = Decimal::from_parts(999999, 0, 0, false, 6); // 0.999999
     match side {
         // Willing to pay slightly more than the leader did, to raise the
         // odds an FAK buy actually crosses the spread.
-        Side::Buy => event_price + tolerance,
+        Side::Buy => (event_price + tolerance).min(BUY_CEILING),
         // Willing to accept slightly less than the leader did.
         Side::Sell => (event_price - tolerance).max(Decimal::ZERO),
     }
@@ -469,7 +508,65 @@ fn round_price(price: Decimal, tick_size: Decimal, side: Side) -> Decimal {
         Side::Buy => ticks.ceil(),
         Side::Sell => ticks.floor(),
     };
+    // The Polymarket CLOB accepts only prices strictly below 1.00. A
+    // ceil-rounded BUY can otherwise land at exactly 1.00 when the input
+    // sits between `1 - tick` and 1.00 (e.g. 0.999 with tick 0.01).
+    // Never emit a tick-aligned price at or above 1.00: step one tick
+    // down, which still respects the BUY's "willing to pay up to" ceiling
+    // by rounding to the highest tick strictly below 1.
+    if side == Side::Buy && rounded_ticks * tick_size >= Decimal::ONE {
+        return Decimal::ONE - tick_size;
+    }
     rounded_ticks * tick_size
+}
+
+/// P2-5: enforce the policy absolute price band `[min_price, max_price]`
+/// on the post-`round_price` limit price. The relative tolerance around
+/// the leader's event price (`apply_tolerance`) is not enough: a stale,
+/// manipulated, or near-zero/one event price would otherwise let a BUY
+/// request `>= 1.00` (no real fill exists there) or a SELL request `<= 0.00`
+/// (same on the other end). The band is the only absolute guard. Returns
+/// `Ok(clamped_price)` when the clamp leaves the price inside the open
+/// interval `(0, 1)`, and `Err(reason)` when clamping produces a price at
+/// or outside `(0, 1)` -- that combination means the policy band itself is
+/// unsafe or the tick alignment collapsed a positive number to exactly 0,
+/// and the caller must reject rather than submit a phantom-orderable
+/// price.
+fn clamp_to_policy_band(
+    price: Decimal,
+    min_price: Decimal,
+    max_price: Decimal,
+) -> Result<Decimal, &'static str> {
+    if min_price <= Decimal::ZERO || max_price <= min_price || max_price >= Decimal::ONE {
+        return Err("policy price band is not a strict subset of the open interval (0, 1)");
+    }
+    let clamped = price.max(min_price).min(max_price);
+    // After the clamp the policy is still in charge: the maximum upper bound
+    // is the **tick strictly below max_price**, so even if max_price itself
+    // is mis-configured to land exactly on 0.99, a BUY ceil round cannot
+    // climb to 1.00. The strict `<= max - tick` check enforces this even
+    // when the operator-supplied band or input price is one cent from
+    // 1.00. The double `< 1.00` check is a defense in depth against any
+    // future refactor that bypasses tick alignment.
+    if clamped <= Decimal::ZERO {
+        return Err("clamped price is not in the open interval (0, 1)");
+    }
+    Ok(clamped)
+}
+
+/// Defensive upper bound for any limit price passed to the venue: the
+/// Polymarket CLOB rejects `1.00` outright (the only valid prices are
+/// strictly below 1). Returns `Err` when the price is already at or above
+/// this safety rail so the executor can refuse locally instead of crossing
+/// the network boundary with a value the venue is known to reject.
+fn defensively_cap_below_one(price: Decimal) -> Result<Decimal, &'static str> {
+    if price >= Decimal::ONE {
+        Err("computed limit price reached the CLOB safety rail at 1.00")
+    } else if price <= Decimal::ZERO {
+        Err("computed limit price collapsed to zero or below")
+    } else {
+        Ok(price)
+    }
 }
 
 async fn load_policy_snapshot(
@@ -916,6 +1013,51 @@ mod tests {
     use sqlx::Row as _;
 
     use super::*;
+
+    #[test]
+    fn round_price_buy_never_rounds_up_to_one() {
+        // Live failure mode: leader event 0.999 with tick 0.01 and a BUY
+        // must not produce a limit price of 1.00 -- the Polymarket CLOB
+        // rejects 1.00 outright, and the engine's circuit breaker would
+        // otherwise trip after the venue-side rejection. The safe tick-
+        // aligned BUY ceiling is the highest tick strictly below 1.
+        assert_eq!(
+            round_price(Decimal::new(999, 3), Decimal::new(1, 2), Side::Buy),
+            Decimal::new(99, 2),
+            "0.999 with tick 0.01 must round to 0.99, not climb to 1.00"
+        );
+        assert_eq!(
+            round_price(Decimal::new(1, 0), Decimal::new(1, 2), Side::Buy),
+            Decimal::new(99, 2),
+            "an exact 1.00 input must collapse to the safe tick 0.99"
+        );
+        assert_eq!(
+            round_price(Decimal::new(10001, 4), Decimal::new(1, 2), Side::Buy),
+            Decimal::new(99, 2),
+            "1.0001 must also collapse to 0.99"
+        );
+        // SELL round-down to zero is unchanged.
+        assert_eq!(
+            round_price(Decimal::new(1, 3), Decimal::new(1, 2), Side::Sell),
+            Decimal::ZERO
+        );
+    }
+
+    #[test]
+    fn apply_tolerance_buy_caps_below_one() {
+        // A BUY with event price just below 1.00 and any tolerance must
+        // never produce a tolerance-adjusted price at or above 1.00.
+        let adjusted = apply_tolerance(Decimal::new(999, 3), 100, Side::Buy);
+        assert!(adjusted < Decimal::ONE,
+            "apply_tolerance must never produce a BUY price >= 1.00; got {adjusted}");
+        // Even an arbitrarily large BUY tolerance cannot push the
+        // adjusted price to 1.00 -- the cap holds.
+        let any = apply_tolerance(Decimal::new(999, 3), 10_000, Side::Buy);
+        assert!(any < Decimal::ONE,
+            "an arbitrarily large BUY tolerance must still cap below 1.00; got {any}");
+        assert_eq!(any, Decimal::new(999_999, 6),
+            "the BUY cap is the tick-size-agnostic 0.999999 ceiling");
+    }
 
     #[test]
     fn order_quantity_is_truncated_to_two_decimals_without_exceeding_buy_budget() {
@@ -1578,6 +1720,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_buy_with_event_price_close_to_one_does_not_produce_a_ge_one_limit() {
+        // Live failure mode: a BUY whose leader event price + tolerance +
+        // tick rounding would otherwise climb to or past 1.00. The venue
+        // rejects 1.00 outright, and the engine's circuit breaker would
+        // otherwise trip. The full math chain -- apply_tolerance,
+        // round_price, clamp_to_policy_band -- must keep the limit price
+        // strictly below 1.00 for every (event_price, tolerance_bps, tick)
+        // combination that is otherwise in-range.
+        for event in [
+            Decimal::new(999, 3),   // 0.999 (within tick=0.01)
+            Decimal::new(998, 3),
+            Decimal::new(995, 3),
+            Decimal::new(99, 2),    // 0.99 (already at max boundary)
+            Decimal::new(1, 0),     // 1.0 (would round to 1.00)
+        ] {
+            for tol in [0i64, 50, 100, 1_000, 10_000] {
+                let adjusted = apply_tolerance(event, tol, Side::Buy);
+                let r1 = round_price(adjusted, Decimal::new(1, 2), Side::Buy);
+                let r2 = clamp_to_policy_band(r1, Decimal::new(1, 2), Decimal::new(99, 2))
+                    .unwrap_or_else(|_| r1);
+                assert!(r2 < Decimal::ONE,
+                    "BUY pipeline produced {r2} (event={event}, tol={tol}); must be < 1.00");
+                // And the price must remain inside the open (0, 1) interval.
+                assert!(r2 > Decimal::ZERO);
+            }
+        }
+    }
+
     async fn an_expired_persisted_decision_is_never_resumed_or_left_reserved() {
         let db = TestDb::new().await;
         seed_account_and_schedule(&db).await;
