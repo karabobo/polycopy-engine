@@ -8,10 +8,10 @@ mod live {
     use std::{collections::BTreeSet, env, error::Error, time::Duration};
 
     use chrono::Utc;
-    use polycopy_engine::copytrading::ingest::AddressResolver;
+    use polycopy_engine::copytrading::ingest::{spawn_supervised_ingest, AddressResolver};
     use polycopy_engine::{
         copytrading::{
-            orchestrate::{execute_one_intent, list_runnable_intents, live_execute_enabled},
+            execute_one_intent, list_runnable_intents, live_execute_enabled,
             plan::{plan_next_batch, verify_schedule_compatible_with_pending_work},
         },
         venue::intl_clob_exec::IntlClobCopyAdapter,
@@ -29,7 +29,6 @@ mod live {
     const MAX_ORDER_NOTIONAL_ENV: &str = "POLYCOPY_MAX_ORDER_NOTIONAL";
     const MAX_RUNTIME_ENV: &str = "POLYCOPY_MAX_RUNTIME_SECONDS";
     const BACKFILL_SECONDS_ENV: &str = "POLYCOPY_BACKFILL_EVERY_SECONDS";
-    const DATA_API_HOST: &str = "https://data-api.polymarket.com";
 
     #[derive(Debug, Clone)]
     struct RuntimeLimits {
@@ -295,68 +294,6 @@ mod live {
             }
         }
         Ok(ids)
-    }
-
-    #[cfg(feature = "ingest")]
-    fn spawn_supervised_ingest(
-        pool: SqlitePool,
-        resolver: std::sync::Arc<AddressResolver>,
-        backfill_every: Duration,
-    ) -> Result<tokio::task::JoinHandle<()>, Box<dyn Error>> {
-        use polycopy_engine::copytrading::ingest::{activity_ws, backfill_leader};
-
-        let backfill_client = polymarket_client_sdk_v2::data::Client::new(DATA_API_HOST)?;
-        let supervisor = tokio::spawn(async move {
-            let ws_pool = pool.clone();
-            let ws_resolver = resolver.clone();
-            let websocket = activity_ws::run(ws_pool, ws_resolver.as_ref());
-            tokio::pin!(websocket);
-            let backfill = async {
-                loop {
-                    resolver
-                        .reload_from_db(&pool)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    backfill_enabled_leaders(&pool, resolver.as_ref(), &backfill_client)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    tokio::time::sleep(backfill_every).await;
-                }
-                #[allow(unreachable_code)]
-                Ok::<(), String>(())
-            };
-            tokio::pin!(backfill);
-
-            // A realtime feed or a REST catch-up failure makes event delivery
-            // uncertain. End the supervisor so the executor notices and exits
-            // before it can plan or submit another order.
-            tokio::select! {
-                result = &mut websocket => eprintln!("activity websocket supervisor stopped: {result:?}"),
-                result = &mut backfill => eprintln!("activity REST backfill supervisor stopped: {result:?}"),
-            }
-        });
-
-        async fn backfill_enabled_leaders(
-            pool: &SqlitePool,
-            resolver: &AddressResolver,
-            client: &polymarket_client_sdk_v2::data::Client,
-        ) -> Result<(), Box<dyn Error>> {
-            let aliases: Vec<(i64, String)> = sqlx::query_as(
-                "SELECT leader_id, address FROM leader_wallet_aliases WHERE enabled = 1",
-            )
-            .fetch_all(pool)
-            .await?;
-            for (leader_id, address) in aliases {
-                let summary = backfill_leader(pool, resolver, client, leader_id, &address).await?;
-                eprintln!(
-                    "backfill leader {leader_id}: fetched={} ingested={} rejected={}",
-                    summary.fetched, summary.ingested, summary.rejected
-                );
-            }
-            Ok(())
-        }
-
-        Ok(supervisor)
     }
 
     #[cfg(test)]
