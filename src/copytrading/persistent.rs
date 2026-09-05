@@ -485,21 +485,33 @@ pub async fn reserve_budget_and_mark_submitting(
         if fuse_open != 0 {
             return Err(PersistentError::FuseOpen);
         }
-        if let Some(deadline) = row.1 {
-            let deadline = DateTime::parse_from_rfc3339(&deadline)
-                .map_err(|_| PersistentError::MalformedBudgetState)?
-                .with_timezone(&Utc);
-            if now > deadline {
-                sqlx::query(
-                    "UPDATE copy_intents SET status = 'cancelled', \
-                     rejection_reason = 'decision deadline expired', \
-                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
-                )
-                .bind(intent_id)
-                .execute(&mut *conn)
-                .await
-                .map_err(db_err)?;
-                return Err(PersistentError::DecisionExpired);
+        // P2-2 symmetry: mirror execute.rs size_and_reserve's fail-closed
+        // deadline check. A missing OR malformed deadline is treated as
+        // expired so an intent whose freshness cannot be proven never
+        // crosses the persistent budget reservation boundary. Both the
+        // None arm and the Err(parse) arm surface as DecisionExpired for
+        // exact symmetry with execute.rs (whose Err(parse) arm returns
+        // SizingOutcome::Expired -- not a separate MalformedDeadline
+        // variant). The None case is currently unreachable via plan.rs
+        // but the guard exists for symmetry and for defense in depth.
+        match row.1.as_deref() {
+            None => return Err(PersistentError::DecisionExpired),
+            Some(deadline) => {
+                let deadline = DateTime::parse_from_rfc3339(deadline)
+                    .map_err(|_| PersistentError::DecisionExpired)?
+                    .with_timezone(&Utc);
+                if now > deadline {
+                    sqlx::query(
+                        "UPDATE copy_intents SET status = 'cancelled', \
+                         rejection_reason = 'decision deadline expired', \
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+                    )
+                    .bind(intent_id)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(db_err)?;
+                    return Err(PersistentError::DecisionExpired);
+                }
             }
         }
         if row.3 != "in_progress" {
@@ -578,16 +590,27 @@ pub async fn reserve_budget_and_mark_submitting(
 
     match &result {
         Ok(()) => {
-            sqlx::query("COMMIT")
-                .execute(&mut *conn)
-                .await
-                .map_err(db_err)?;
+            let commit_result = sqlx::query("COMMIT").execute(&mut *conn).await;
+            if let Err(commit_error) = commit_result {
+                // P2-1: COMMIT itself failed (rare -- e.g. I/O error
+                // mid-flush). Best-effort ROLLBACK so the pooled
+                // connection is never handed back with an open BEGIN
+                // IMMEDIATE transaction. The original commit error is
+                // what the caller wants.
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(db_err(commit_error));
+            }
         }
         Err(PersistentError::DecisionExpired) => {
-            sqlx::query("COMMIT")
-                .execute(&mut *conn)
-                .await
-                .map_err(db_err)?;
+            let commit_result = sqlx::query("COMMIT").execute(&mut *conn).await;
+            if let Err(commit_error) = commit_result {
+                // P2-1: same leak guard as the Ok arm -- the expired-
+                // decision path intentionally commits (it persists the
+                // expired state), but a failed commit must still unwind
+                // the connection instead of leaking the transaction.
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(db_err(commit_error));
+            }
         }
         Err(_) => {
             let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
@@ -601,6 +624,22 @@ pub async fn release_pre_boundary_failure(
     attempt_id: i64,
     reason: &str,
 ) -> Result<(), PersistentError> {
+    let mut conn = pool.acquire().await.map_err(db_err)?;
+    release_pre_boundary_failure_with_conn(&mut *conn, attempt_id, reason).await
+}
+
+/// Transaction-aware variant of [`release_pre_boundary_failure`]. Used by
+/// the orchestrator's `Local` arm so the rolling-budget release and the
+/// `local_submission_failure` reconciliation case open atomically in a
+/// single SQLite transaction -- otherwise a crash between the two writes
+/// could leave a freed reservation with no audit case (or vice versa),
+/// violating AGENTS.md's "atomic" invariant for receipt accounting,
+/// reservation release, and intent finalization.
+pub async fn release_pre_boundary_failure_with_conn<'c>(
+    conn: &mut sqlx::SqliteConnection,
+    attempt_id: i64,
+    reason: &str,
+) -> Result<(), PersistentError> {
     let reason = non_empty(reason, "reason")?;
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     sqlx::query(
@@ -611,7 +650,7 @@ pub async fn release_pre_boundary_failure(
     .bind(reason)
     .bind(now)
     .bind(attempt_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await
     .map(|_| ())
     .map_err(db_err)

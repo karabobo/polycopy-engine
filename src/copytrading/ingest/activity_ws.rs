@@ -25,6 +25,13 @@ const STALE_AFTER: Duration = Duration::from_secs(30);
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(3);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 
+/// Reset the backoff delay to its initial value. Exposed for testing so the
+/// reset contract (a successful connection clears prior backoff) can be
+/// asserted directly without running the full connection loop.
+pub fn reset_backoff(delay: &mut Duration) {
+    *delay = INITIAL_RECONNECT_DELAY;
+}
+
 /// `rustls` 0.23+ does not pick a default crypto backend on its own; without
 /// installing one, every TLS connect attempt (including
 /// `tokio_tungstenite::connect_async`) panics or hangs. Safe to call before
@@ -100,12 +107,14 @@ fn now_utc() -> String {
 /// Runs the activity WebSocket connection forever, reconnecting with
 /// exponential backoff (3s, 6s, 12s, 24s, capped at 60s, matching the
 /// reference implementation) on any disconnect, error, or detected staleness.
-/// Never returns under normal operation; only returns if `pool` itself
-/// becomes unusable in a way a reconnect cannot fix.
+/// The backoff resets to INITIAL_RECONNECT_DELAY on every successful
+/// connection establishment (Connected event emitted). Never returns under
+/// normal operation; only returns if `pool` itself becomes unusable in a way
+/// a reconnect cannot fix.
 pub async fn run(pool: SqlitePool, resolver: &AddressResolver) -> ! {
     let mut reconnect_delay = INITIAL_RECONNECT_DELAY;
     loop {
-        match run_once(&pool, resolver).await {
+        match run_once(&pool, resolver, &mut reconnect_delay).await {
             Err(error) => {
                 eprintln!("activity ws: {error}, reconnecting in {reconnect_delay:?}");
                 log_ws_event(&WsConnectionEvent {
@@ -126,9 +135,14 @@ pub async fn run(pool: SqlitePool, resolver: &AddressResolver) -> ! {
 /// is currently no clean-shutdown signal); every real exit path is an
 /// `Err`, including a graceful server-initiated close, so the caller always
 /// treats leaving this function as "reconnect".
+///
+/// On successful connection establishment (after the Connected event is
+/// logged), `reconnect_delay` is reset to INITIAL_RECONNECT_DELAY so the
+/// next failure starts the backoff from the beginning.
 async fn run_once(
     pool: &SqlitePool,
     resolver: &AddressResolver,
+    reconnect_delay: &mut Duration,
 ) -> Result<std::convert::Infallible, ActivityWsError> {
     ensure_crypto_provider_installed();
 
@@ -147,6 +161,9 @@ async fn run_once(
         detail: String::new(),
         next_reconnect_delay_ms: None,
     });
+    // Reset backoff on every successful connection establishment.
+    // A future failure will start the exponential sequence from the beginning.
+    *reconnect_delay = INITIAL_RECONNECT_DELAY;
 
     let mut ping_interval = tokio::time::interval(PING_INTERVAL);
     ping_interval.tick().await; // the first tick fires immediately; skip it.
@@ -250,6 +267,22 @@ mod tests {
         // The exact prefix a log-parsing tool must match on.
         let line = format!("{WS_EVENT_PREFIX}{json}");
         assert!(line.starts_with("WS_EVENT: {"));
+    }
+
+    // P2-3: pin the reconnect backoff reset contract. A successful
+    // connection must clear the accumulated delay so the next failure
+    // starts the exponential sequence from the beginning (3s), not from
+    // a previously-doubled value.
+
+    #[test]
+    fn reconnect_backoff_resets_to_initial_on_success() {
+        let mut delay = Duration::from_secs(24); // arbitrary doubled state
+        reset_backoff(&mut delay);
+        assert_eq!(delay, INITIAL_RECONNECT_DELAY);
+
+        // Idempotent: resetting an already-initial delay keeps it initial.
+        reset_backoff(&mut delay);
+        assert_eq!(delay, INITIAL_RECONNECT_DELAY);
     }
 
     // Mirrors src/copytrading/db.rs's TestDb: a migrated pool at a unique
@@ -383,11 +416,13 @@ mod tests {
             outcome,
             ProcessOutcome::Ingested {
                 leader_id: 1,
-                canonical_event_key: "activity:0xh1:123:BUY:0.5:5".to_owned()
+                canonical_event_key:
+                    "activity:0xh1:0xleader:0xcond:123:0:BUY:0.5:5:2025-01-01T00:00:00.000Z"
+                        .to_owned()
             }
         );
 
-        let event_count: i64 = sqlx::query("SELECT COUNT(*) FROM leader_events WHERE canonical_event_key = 'activity:0xh1:123:BUY:0.5:5'")
+        let event_count: i64 = sqlx::query("SELECT COUNT(*) FROM leader_events WHERE canonical_event_key = 'activity:0xh1:0xleader:0xcond:123:0:BUY:0.5:5:2025-01-01T00:00:00.000Z'")
             .fetch_one(&*db)
             .await
             .expect("event count must be queryable")

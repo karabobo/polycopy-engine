@@ -16,16 +16,15 @@ use polymarket_client_sdk_v2::{
     POLYGON,
 };
 
-use crate::{
-    copytrading::reconcile::{
-        lookup_prepared_fak_in_trade_history, CopyExecution, OrderId, PreparedOrderEnvelope,
-        SubmitError, TradeHistoryLookup, TradeHistoryWindow, VenueOrderState,
+use crate::venue::{
+    execution_contract::{CopyExecution, PreparedOrderEnvelope, SubmitError},
+    intl_clob::{IntlClobReadAdapter, OutcomeTokenId, StrictTokenBalanceReader},
+    signed_order::reconstruct_signed_order,
+    trade_history_recovery::{
+        lookup_prepared_fak_in_trade_history, TradeHistoryLookup, TradeHistoryWindow,
     },
-    venue::{
-        intl_clob::{IntlClobReadAdapter, OutcomeTokenId, StrictTokenBalanceReader},
-        signed_order::reconstruct_signed_order,
-        OrderReceipt,
-    },
+    types::{OrderId, VenueOrderState},
+    OrderReceipt,
 };
 
 const CLOB_HOST: &str = "https://clob.polymarket.com";
@@ -147,13 +146,20 @@ impl IntlClobCopyAdapter {
 /// Shares filled:
 /// - BUY: `taking_amount` (Phase 0.5 Result 3)
 /// - SELL: `making_amount` (SDK `order_builder` swaps maker/taker by side)
+/// P2-7: the single strict parse of `envelope.size`. Both the submit-path
+/// receipt builder and the query-first recovery path use this; a malformed
+/// persisted size is always an error, never a silent zero.
+fn parsed_envelope_size(envelope: &PreparedOrderEnvelope) -> Result<Decimal, String> {
+    Decimal::from_str(&envelope.size)
+        .map_err(|_| format!("invalid envelope size: {}", envelope.size))
+}
+
 pub fn receipt_from_submitted_envelope(
     envelope: &PreparedOrderEnvelope,
     making_amount: Decimal,
     taking_amount: Decimal,
 ) -> Result<OrderReceipt, String> {
-    let requested = Decimal::from_str(&envelope.size)
-        .map_err(|_| format!("invalid envelope size: {}", envelope.size))?;
+    let requested = parsed_envelope_size(envelope)?;
     match envelope.side.as_str() {
         "BUY" => OrderReceipt::from_fak_buy_budget(requested, requested, taking_amount)
             .map_err(|error| error.to_string()),
@@ -221,7 +227,17 @@ impl CopyExecution for IntlClobCopyAdapter {
                 .map_err(|error| error.to_string())?;
             match lookup_prepared_fak_in_trade_history(&read, &envelope, window).await {
                 Ok(TradeHistoryLookup::Recovered { filled_qty, .. }) => {
-                    let size = Decimal::from_str(&envelope.size).unwrap_or(Decimal::ZERO);
+                    // P2-7: fail closed on an unparseable envelope.size.
+                    // This used to `unwrap_or(Decimal::ZERO)`, which on the
+                    // query-first recovery path (AGENTS.md-mandatory after
+                    // an uncertain submission) turned a corrupted persisted
+                    // size into a receipt whose requested budget was zero
+                    // while filled_qty came from real venue history -- a
+                    // phantom lot straight into finalize_receipt. The
+                    // strict parse mirrors receipt_from_submitted_envelope,
+                    // and OrderReceipt's FillOnZeroRequest guard now backs
+                    // this up as defense in depth.
+                    let size = parsed_envelope_size(&envelope)?;
                     let receipt = match envelope.side.as_str() {
                         "BUY" => OrderReceipt::from_fak_buy_budget(size, size, filled_qty),
                         "SELL" => OrderReceipt::from_fak_sell_shares(size, size, filled_qty),
@@ -591,6 +607,46 @@ mod tests {
             classify_sdk_submit_error(&error),
             SubmitError::Rejected(_)
         ));
+    }
+
+    #[test]
+    fn a_malformed_envelope_size_is_an_error_not_a_silent_zero() {
+        // P2-7 pin: the shared parse must fail closed. The query-first
+        // recovery path used to unwrap_or(ZERO) here, which combined with
+        // real venue history would have minted a phantom lot.
+        let error = parsed_envelope_size(&envelope("BUY", "not-a-number"))
+            .expect_err("a malformed size must fail closed");
+        assert_eq!(error, "invalid envelope size: not-a-number");
+        assert_eq!(
+            parsed_envelope_size(&envelope("SELL", "5")).expect("valid size"),
+            RustDecimal::new(5, 0)
+        );
+    }
+
+    #[test]
+    fn receipt_from_submitted_envelope_rejects_a_malformed_size() {
+        let error = receipt_from_submitted_envelope(
+            &envelope("BUY", "garbage"),
+            RustDecimal::ONE,
+            RustDecimal::ONE,
+        )
+        .expect_err("submit path must also fail closed on a malformed size");
+        assert_eq!(error, "invalid envelope size: garbage");
+    }
+
+    #[test]
+    fn a_zero_size_envelope_with_real_history_cannot_become_a_receipt() {
+        // P2-7 end-to-end pin at the receipt boundary: even if some future
+        // regression re-introduces a fail-open zero parse, the
+        // FillOnZeroRequest receipt guard rejects the combination
+        // (requested == 0, filled > 0) that used to mint phantom lots.
+        let error = receipt_from_submitted_envelope(
+            &envelope("BUY", "0"),
+            RustDecimal::new(275, 2),
+            RustDecimal::new(5, 0), // real matched shares from venue history
+        )
+        .expect_err("a zero-size BUY with real fills must be rejected");
+        assert!(error.contains("zero-quantity request"), "{error}");
     }
 
     #[test]

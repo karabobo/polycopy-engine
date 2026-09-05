@@ -46,15 +46,50 @@ use crate::{
     venue::order_hash::{self, ExchangeAddresses},
 };
 
+/// Abstraction over neg-risk resolution so `EnvelopePreparer` does not
+/// directly depend on `polymarket_client_sdk_v2::Client::neg_risk`.
+///
+/// Implementations may call the real SDK, return a cached response, or
+/// inject a deterministic answer for tests. The trait lives in the
+/// prepare module (not the venue layer) because neg-risk resolution is
+/// a prepare-time concern, not a general venue capability.
+#[async_trait::async_trait]
+pub trait NegRiskResolver: Send + Sync {
+    async fn resolve(&self, token_id: U256) -> Result<NegRiskResponse, polymarket_client_sdk_v2::error::Error>;
+}
+
+/// The subset of the SDK's neg-risk response that `prepare` needs.
+#[derive(Clone, Debug)]
+pub struct NegRiskResponse {
+    pub neg_risk: bool,
+}
+
+/// Default implementation that delegates to the SDK client.
+pub struct SdkNegRiskResolver<'a> {
+    pub client: &'a Client<Authenticated<Normal>>,
+}
+
+#[async_trait::async_trait]
+impl<'a> NegRiskResolver for SdkNegRiskResolver<'a> {
+    async fn resolve(&self, token_id: U256) -> Result<NegRiskResponse, polymarket_client_sdk_v2::error::Error> {
+        let resp = self.client.neg_risk(token_id).await?;
+        Ok(NegRiskResponse { neg_risk: resp.neg_risk })
+    }
+}
+
 /// The signer + authenticated client pair needed to prepare one envelope.
 ///
 /// `S` is any [`Signer`] implementation (typically `LocalSigner`). This
 /// mirrors `canary_run`'s `signer()` return (`impl Signer + Clone`), but
 /// accepts it explicitly here so the preparer does not own the key.
+///
+/// The `R` resolver abstracts neg-risk resolution so the preparer is
+/// testable without a live SDK client.
 #[derive(Clone, Debug)]
-pub struct EnvelopePreparer<'a, S: Signer> {
+pub struct EnvelopePreparer<'a, S: Signer, R: NegRiskResolver> {
     pub client: &'a Client<Authenticated<Normal>>,
     pub signer: &'a S,
+    pub neg_risk_resolver: &'a R,
 }
 
 /// The result of envelope preparation. Contains the fully-serializable
@@ -67,7 +102,7 @@ pub struct PreparedEnvelope {
     pub signed_order: polymarket_client_sdk_v2::clob::types::SignedOrder,
 }
 
-impl<'a, S: Signer> EnvelopePreparer<'a, S> {
+impl<'a, S: Signer, R: NegRiskResolver> EnvelopePreparer<'a, S, R> {
     /// Builds, signs, and serializes one FAK order envelope from a
     /// [`SizedDecision`].
     ///
@@ -85,7 +120,8 @@ impl<'a, S: Signer> EnvelopePreparer<'a, S> {
         decision: &SizedDecision,
     ) -> Result<PreparedEnvelope, PrepareError> {
         let token_id =
-            U256::from_str(&decision.token_id).map_err(|_| PrepareError::InvalidTokenId)?;
+            U256::from_str(&decision.token_id)
+                .map_err(|e| PrepareError::InvalidTokenId(e.to_string()))?;
         let side = match decision.side {
             crate::copytrading::execute::Side::Buy => SdkSide::Buy,
             crate::copytrading::execute::Side::Sell => SdkSide::Sell,
@@ -115,56 +151,112 @@ impl<'a, S: Signer> EnvelopePreparer<'a, S> {
             .map_err(PrepareError::OrderSigning)?;
 
         // Step 3: Compute the expected order ID offline (no venue call).
-        let expected_hash = {
-            let token_id_match = match &signed_order.payload {
-                polymarket_client_sdk_v2::clob::types::OrderPayload::V2(p) => p.order.tokenId,
-                polymarket_client_sdk_v2::clob::types::OrderPayload::V1(p) => p.order.tokenId,
-                _ => return Err(PrepareError::UnsupportedPayloadVersion),
-            };
-            let neg_risk_resp = self
-                .client
-                .neg_risk(token_id_match)
-                .await
-                .map_err(PrepareError::NegRiskQuery)?;
-            let config = polymarket_client_sdk_v2::contract_config(
-                polymarket_client_sdk_v2::POLYGON,
-                neg_risk_resp.neg_risk,
-            )
-            .ok_or(PrepareError::MissingContractConfig)?;
-            let exchanges = ExchangeAddresses {
-                v1: config.exchange,
-                v2: config.exchange_v2,
-            };
-            order_hash::expected_order_id(
-                &signed_order.payload,
-                &exchanges,
-                polymarket_client_sdk_v2::POLYGON,
-            )
-            .map_err(PrepareError::OrderHash)?
+        // Resolve neg-risk + exchange addresses from the on-chain token id,
+        // then delegate to the pure helper `compute_expected_taker_order_id`.
+        let token_id_match = match &signed_order.payload {
+            polymarket_client_sdk_v2::clob::types::OrderPayload::V2(p) => p.order.tokenId,
+            polymarket_client_sdk_v2::clob::types::OrderPayload::V1(p) => p.order.tokenId,
+            _ => return Err(PrepareError::UnsupportedPayloadVersion),
         };
-        let expected_taker_order_id = order_hash::format_order_id(expected_hash);
+        let neg_risk_resp = self
+            .neg_risk_resolver
+            .resolve(token_id_match)
+            .await
+            .map_err(PrepareError::NegRiskQuery)?;
+        let config = polymarket_client_sdk_v2::contract_config(
+            polymarket_client_sdk_v2::POLYGON,
+            neg_risk_resp.neg_risk,
+        )
+        .ok_or(PrepareError::MissingContractConfig)?;
+        let exchanges = ExchangeAddresses {
+            v1: config.exchange,
+            v2: config.exchange_v2,
+        };
+        let expected_taker_order_id = compute_expected_taker_order_id(
+            &signed_order.payload,
+            &exchanges,
+            polymarket_client_sdk_v2::POLYGON,
+        )?;
 
         // Step 4: Serialize the signed order (SDK's manual Serialize impl).
         let signed_order_json =
             serde_json::to_string(&signed_order).map_err(|_| PrepareError::OrderSerialization)?;
 
-        // Step 5: Assemble the envelope.
-        let envelope = PreparedOrderEnvelope {
-            token_id: decision.token_id.clone(),
-            side: decision.side.as_str().to_owned(),
-            price: decision.limit_price.to_string(),
-            size: decision.qty.to_string(),
-            salt: extract_salt(&signed_order).unwrap_or(0),
-            order_type: "FAK".to_owned(),
-            expected_taker_order_id,
-            signed_order_json,
-        };
+        // Step 5: Assemble the envelope (pure helper — no I/O).
+        let envelope = assemble_envelope(
+            decision,
+            &signed_order,
+            &expected_taker_order_id,
+            &signed_order_json,
+        );
 
         Ok(PreparedEnvelope {
             envelope,
             signed_order,
         })
     }
+}
+
+/// Pure helper that turns an already-signed `SignedOrder` + the offline
+/// `expected_taker_order_id` + the serialized JSON form into the
+/// [`PreparedOrderEnvelope`] that `load_or_prepare_attempt` persists.
+///
+/// Split out of `prepare()` so the field-by-field mapping (which is the
+/// only piece of the envelope-building path that does *no* network or crypto
+/// work) can be unit-tested without an SDK client. The mapping is also the
+/// place where AGENTS.md's "Persist every order decision's quantity, price,
+/// tick rule, TIF, and deadline before preparing a signed order" invariant
+/// meets the persistence schema, so a direct test here is the cheapest way
+/// to catch a future drift between `SizedDecision`'s fields and the
+/// envelope's serialized shape.
+///
+/// Salt is read via [`extract_salt`] and is `0` only if the payload version
+/// is unrecognized — the same behavior the original `prepare()` had, since
+/// a salt-less envelope cannot cross the network boundary anyway.
+pub(crate) fn assemble_envelope(
+    decision: &SizedDecision,
+    signed_order: &polymarket_client_sdk_v2::clob::types::SignedOrder,
+    expected_taker_order_id: &str,
+    signed_order_json: &str,
+) -> PreparedOrderEnvelope {
+    PreparedOrderEnvelope {
+        token_id: decision.token_id.clone(),
+        side: decision.side.as_str().to_owned(),
+        price: decision.limit_price.to_string(),
+        size: decision.qty.to_string(),
+        salt: extract_salt(signed_order).unwrap_or(0),
+        order_type: "FAK".to_owned(),
+        expected_taker_order_id: expected_taker_order_id.to_owned(),
+        signed_order_json: signed_order_json.to_owned(),
+    }
+}
+
+/// Pure helper that computes the deterministic order-id string for a
+/// `SignedOrder` payload, given the exchange addresses for its
+/// chain/neg-risk configuration.
+///
+/// Wraps [`order_hash::expected_order_id`] + [`order_hash::format_order_id`]
+/// and translates the SDK's hashing errors into this module's
+/// [`PrepareError`] variants:
+///
+/// * `UnsupportedPayloadVersion` and `MissingV2ExchangeAddress` from the
+///   hashing layer map to [`PrepareError::OrderHash`] — both are
+///   order-shape problems, not transport problems, and the caller cannot
+///   retry around either of them.
+/// * Any other future `OrderHashError` variant similarly becomes
+///   [`PrepareError::OrderHash`].
+///
+/// Split out of `prepare()` for the same reason as [`assemble_envelope`]:
+/// it is the only piece of envelope-building that is purely local, so it is
+/// the only piece worth unit-testing in isolation.
+pub(crate) fn compute_expected_taker_order_id(
+    payload: &polymarket_client_sdk_v2::clob::types::OrderPayload,
+    exchanges: &ExchangeAddresses,
+    chain_id: polymarket_client_sdk_v2::types::ChainId,
+) -> Result<String, PrepareError> {
+    order_hash::expected_order_id(payload, exchanges, chain_id)
+        .map(order_hash::format_order_id)
+        .map_err(PrepareError::OrderHash)
 }
 
 /// Extracts the salt from a signed order for audit logging.
@@ -186,12 +278,27 @@ mod tests {
     use polymarket_client_sdk_v2::{
         auth::ApiKey,
         clob::types::{OrderPayload, OrderSignature, OrderType, SignedOrder},
+        types::ChainId,
     };
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
 
-    #[test]
-    fn extract_salt_reads_v2_salt_as_u64() {
+    fn ecdsa_signature() -> Signature {
+        Signature::from_str(concat!(
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            "1b"
+        ))
+        .unwrap()
+    }
+
+    fn api_key() -> ApiKey {
+        "550e8400-e29b-41d4-a716-446655440000".parse().unwrap()
+    }
+
+    fn v2_signed_order(salt: u64) -> SignedOrder {
         let mut order = polymarket_client_sdk_v2::clob::types::OrderV2::default();
-        order.salt = U256::from(42u64);
+        order.salt = U256::from(salt);
         order.maker = Address::from_str("0x1111111111111111111111111111111111111111").unwrap();
         order.signer = Address::from_str("0x2222222222222222222222222222222222222222").unwrap();
         order.tokenId = U256::from(1u64);
@@ -199,27 +306,266 @@ mod tests {
         order.metadata = B256::ZERO;
         order.builder = B256::ZERO;
         let payload = OrderPayload::new(order, U256::from(0u64));
-        let signature = Signature::from_str(concat!(
-            "0x1111111111111111111111111111111111111111111111111111111111111111",
-            "2222222222222222222222222222222222222222222222222222222222222222",
-            "1b"
-        ))
-        .unwrap();
-        let owner: ApiKey = "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
-        let signed = SignedOrder::builder()
+        SignedOrder::builder()
             .payload(payload)
-            .signature(OrderSignature::Ecdsa(signature))
+            .signature(OrderSignature::Ecdsa(ecdsa_signature()))
             .order_type(OrderType::FAK)
-            .owner(owner)
-            .build();
-        assert_eq!(extract_salt(&signed), Some(42));
+            .owner(api_key())
+            .build()
+    }
+
+    fn v1_signed_order(salt: u64) -> SignedOrder {
+        let mut order = polymarket_client_sdk_v2::clob::types::OrderV1::default();
+        order.salt = U256::from(salt);
+        order.maker = Address::from_str("0x1111111111111111111111111111111111111111").unwrap();
+        order.signer = Address::from_str("0x2222222222222222222222222222222222222222").unwrap();
+        order.tokenId = U256::from(2u64);
+        let payload = OrderPayload::new_v1(order);
+        SignedOrder::builder()
+            .payload(payload)
+            .signature(OrderSignature::Ecdsa(ecdsa_signature()))
+            .order_type(OrderType::FAK)
+            .owner(api_key())
+            .build()
+    }
+
+    fn decision(side: crate::copytrading::execute::Side) -> SizedDecision {
+        SizedDecision {
+            intent_id: 7,
+            token_id: "12345".to_owned(),
+            side,
+            qty: Decimal::from(100),
+            limit_price: Decimal::from_str("0.55").unwrap(),
+        }
+    }
+
+    fn exchanges_with_v2() -> ExchangeAddresses {
+        ExchangeAddresses {
+            v1: Address::repeat_byte(0x11),
+            v2: Some(Address::repeat_byte(0x22)),
+        }
+    }
+
+    fn exchanges_without_v2() -> ExchangeAddresses {
+        ExchangeAddresses {
+            v1: Address::repeat_byte(0x11),
+            v2: None,
+        }
+    }
+
+    #[test]
+    fn extract_salt_reads_v2_salt_as_u64() {
+        assert_eq!(extract_salt(&v2_signed_order(42)), Some(42));
+    }
+
+    #[test]
+    fn extract_salt_reads_v1_salt_as_u64() {
+        // The original suite only covered V2; V1 went silent. V1's wire
+        // shape is `OrderV1` (with `taker`/`expiration`/`nonce`/`feeRateBps`)
+        // and it shares the salt field name with V2, but the SDK uses a
+        // distinct `OrderPayload::V1` arm — confirm both go through the same
+        // `extract_salt` path without branching on payload version.
+        assert_eq!(extract_salt(&v1_signed_order(99)), Some(99));
+    }
+
+    #[test]
+    fn assemble_envelope_maps_every_decision_field_for_a_buy() {
+        let signed = v2_signed_order(2024);
+        let decision = decision(crate::copytrading::execute::Side::Buy);
+        let expected_taker_order_id =
+            "0x000000000000000000000000000000000000000000000000000000000000abcd".to_owned();
+        let signed_order_json = "{\"signed\":true}".to_owned();
+
+        let env = assemble_envelope(&decision, &signed, &expected_taker_order_id, &signed_order_json);
+
+        assert_eq!(env.token_id, "12345");
+        assert_eq!(env.side, "BUY");
+        assert_eq!(env.price, "0.55");
+        assert_eq!(env.size, "100");
+        assert_eq!(env.salt, 2024);
+        assert_eq!(env.order_type, "FAK");
+        assert_eq!(env.expected_taker_order_id, expected_taker_order_id);
+        assert_eq!(env.signed_order_json, signed_order_json);
+    }
+
+    #[test]
+    fn assemble_envelope_maps_side_sell_as_uppercase_sell() {
+        let signed = v2_signed_order(7);
+        let decision = decision(crate::copytrading::execute::Side::Sell);
+
+        let env = assemble_envelope(&decision, &signed, "0xff", "{}");
+
+        assert_eq!(env.side, "SELL");
+        // Other fields should not change with side.
+        assert_eq!(env.token_id, decision.token_id);
+        assert_eq!(env.price, "0.55");
+        assert_eq!(env.size, "100");
+    }
+
+    #[test]
+    fn assemble_envelope_preserves_decimal_precision_verbatim() {
+        // price/size come straight from `decision.limit_price.to_string()` /
+        // `decision.qty.to_string()`. Pin both: a future refactor that
+        // accidentally routes them through `f64` would lose the trailing
+        // zeros and quietly break idempotency for identical-sized decisions.
+        let signed = v2_signed_order(1);
+        let mut d = decision(crate::copytrading::execute::Side::Buy);
+        d.limit_price = Decimal::from_str("0.5050").unwrap();
+        d.qty = Decimal::from_str("100.000").unwrap();
+
+        let env = assemble_envelope(&d, &signed, "0x00", "{}");
+
+        assert_eq!(env.price, "0.5050");
+        assert_eq!(env.size, "100.000");
+    }
+
+    #[test]
+    fn assemble_envelope_records_v2_salt_verbatim() {
+        // The salt comes straight from `extract_salt(signed_order)`; this
+        // is the primary code path covered by `extract_salt`'s own unit
+        // tests. Repeating it here documents that `assemble_envelope`
+        // doesn't transform or re-derive the salt, only persists it.
+        let signed = v2_signed_order(11);
+        let env = assemble_envelope(
+            &decision(crate::copytrading::execute::Side::Buy),
+            &signed,
+            "0x00",
+            "{}",
+        );
+        assert_eq!(env.salt, 11);
+    }
+
+    #[test]
+    fn assemble_envelope_records_v1_salt_verbatim() {
+        // V1 payload: same contract as V2 from `assemble_envelope`'s
+        // perspective; covered by `extract_salt_reads_v1_salt_as_u64`.
+        let signed = v1_signed_order(13);
+        let env = assemble_envelope(
+            &decision(crate::copytrading::execute::Side::Buy),
+            &signed,
+            "0x00",
+            "{}",
+        );
+        assert_eq!(env.salt, 13);
+    }
+
+    #[test]
+    fn compute_expected_taker_order_id_returns_a_v2_formatted_id() {
+        let signed = v2_signed_order(7);
+        let id =
+            compute_expected_taker_order_id(&signed.payload, &exchanges_with_v2(), 137u32 as ChainId)
+                .unwrap();
+        assert!(id.starts_with("0x"));
+        assert_eq!(id.len(), 66);
+        assert!(id[2..].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn compute_expected_taker_order_id_returns_a_v1_formatted_id() {
+        let signed = v1_signed_order(7);
+        let id =
+            compute_expected_taker_order_id(&signed.payload, &exchanges_with_v2(), 137u32 as ChainId)
+                .unwrap();
+        assert!(id.starts_with("0x"));
+        assert_eq!(id.len(), 66);
+    }
+
+    #[test]
+    fn compute_expected_taker_order_id_is_deterministic_for_a_v1_payload() {
+        let signed = v1_signed_order(11);
+        let first =
+            compute_expected_taker_order_id(&signed.payload, &exchanges_with_v2(), 137u32 as ChainId)
+                .unwrap();
+        let second =
+            compute_expected_taker_order_id(&signed.payload, &exchanges_with_v2(), 137u32 as ChainId)
+                .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn compute_expected_taker_order_id_translates_missing_v2_address_into_order_hash_error() {
+        // V2 payload but no V2 exchange configured for this chain/neg-risk
+        // combination — `prepare()` previously mapped this to
+        // `PrepareError::MissingContractConfig` indirectly via the
+        // upstream `contract_config` lookup. After the extraction,
+        // `contract_config` lookup is still inline in `prepare()`, while
+        // `expected_order_id` returns OrderHashError::MissingV2ExchangeAddress
+        // when V2 is absent. Pin that the helper maps it to
+        // `PrepareError::OrderHash`, not `MissingContractConfig` — the two
+        // upstream call sites can legitimately produce different errors
+        // for the same symptom, and the helper must not silently swallow
+        // the difference.
+        let signed = v2_signed_order(11);
+        let result = compute_expected_taker_order_id(
+            &signed.payload,
+            &exchanges_without_v2(),
+            137u32 as ChainId,
+        );
+        assert!(matches!(result, Err(PrepareError::OrderHash(_))));
+    }
+
+    #[test]
+    fn compute_expected_taker_order_id_translates_unsupported_payload_into_order_hash_error() {
+        // The `_ => Err(UnsupportedPayloadVersion)` arm of
+        // `order_hash::expected_order_id` is reached only via a future SDK
+        // release adding a new variant (the SDK marks OrderPayload
+        // `#[non_exhaustive]`). We cannot construct that here, so instead
+        // verify the mapping rule by checking the helper's behavior is
+        // symmetric for V1/V2 (both succeed) and that error paths
+        // exclusively surface as OrderHash, not as MissingContractConfig.
+        //
+        // This guards against a future refactor where the helper begins
+        // distinguishing `UnsupportedPayloadVersion` from
+        // `MissingV2ExchangeAddress` at the PrepareError level — if that
+        // is ever desired, both `MissingV2ExchangeAddress` and
+        // `UnsupportedPayloadVersion` must flow through, and this test
+        // will need to assert the exact mapping at that point.
+        let v1 = v1_signed_order(11);
+        let v2 = v2_signed_order(11);
+        assert!(compute_expected_taker_order_id(
+            &v1.payload,
+            &exchanges_with_v2(),
+            137u32 as ChainId
+        )
+        .is_ok());
+        assert!(compute_expected_taker_order_id(
+            &v2.payload,
+            &exchanges_with_v2(),
+            137u32 as ChainId
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn prepare_error_display_messages_are_stable() {
+        // These strings are observed in metrics and log scrapers; renaming
+        // any of them silently breaks downstream alerting. Pin them.
+        assert_eq!(
+            PrepareError::InvalidTokenId("bad".to_owned()).to_string(),
+            "invalid outcome token ID in decision: bad"
+        );
+        assert_eq!(
+            PrepareError::MissingContractConfig.to_string(),
+            "no contract config for the resolved chain/neg-risk"
+        );
+        assert_eq!(
+            PrepareError::UnsupportedPayloadVersion.to_string(),
+            "unsupported order payload version"
+        );
+        assert_eq!(
+            PrepareError::OrderSerialization.to_string(),
+            "failed to serialize signed order to JSON"
+        );
+        let order_hash_err = crate::venue::order_hash::OrderHashError::MissingV2ExchangeAddress;
+        let wrapped = PrepareError::OrderHash(order_hash_err);
+        assert!(wrapped.to_string().contains("offline order hash failed"));
     }
 }
 
 /// Errors from envelope preparation.
 #[derive(Debug)]
 pub enum PrepareError {
-    InvalidTokenId,
+    InvalidTokenId(String),
     OrderBuilding(polymarket_client_sdk_v2::error::Error),
     OrderSigning(polymarket_client_sdk_v2::error::Error),
     NegRiskQuery(polymarket_client_sdk_v2::error::Error),
@@ -232,7 +578,7 @@ pub enum PrepareError {
 impl std::fmt::Display for PrepareError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidTokenId => write!(f, "invalid outcome token ID in decision"),
+            Self::InvalidTokenId(detail) => write!(f, "invalid outcome token ID in decision: {detail}"),
             Self::OrderBuilding(source) => write!(f, "order building failed: {source}"),
             Self::OrderSigning(source) => write!(f, "order signing failed: {source}"),
             Self::NegRiskQuery(source) => write!(f, "neg-risk query failed: {source}"),

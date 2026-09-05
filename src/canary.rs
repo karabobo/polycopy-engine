@@ -290,7 +290,62 @@ pub fn write_new_record(path: &Path, contents: &str) -> Result<(), CanaryRecordE
         .map_err(|source| CanaryRecordError::Io {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+
+    // P2-9: fsync the data file so the canary dedup record survives a
+    // crash before the OS flushes its page cache. Without this, a crash
+    // here leaves the canary record invisible at restart, indistinguishable
+    // from "never attempted", and a duplicate-submission dedup invariant
+    // (blueprint §0.5) is silently broken.
+    file.sync_all().map_err(|source| CanaryRecordError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    // P2-9 (continued): fsync the parent directory so the file entry
+    // itself is durable. POSIX requires a directory fsync after creating
+    // a file so the entry and its metadata are flushed; Windows has no
+    // directory-fsync concept and surfaces it as `Unsupported` (Windows
+    // ERROR_INVALID_FUNCTION) or sometimes `PermissionDenied`. We treat
+    // those as best-effort (the file fsync above already guards the
+    // data-loss window on every platform); any other I/O error -- e.g.
+    // the parent directory being unlinked between create_dir_all and
+    // open here -- still propagates as CanaryRecordError::Io so a real
+    // disk problem is not swallowed.
+    if let Some(parent) = path.parent() {
+        match std::fs::File::open(parent) {
+            Ok(dir) => {
+                if let Err(source) = dir.sync_all() {
+                    if !is_unsupported_directory_sync(&source) {
+                        return Err(CanaryRecordError::Io {
+                            path: parent.to_path_buf(),
+                            source,
+                        });
+                    }
+                }
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(CanaryRecordError::Io {
+                    path: parent.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns true when `sync_all()` on a directory fd fails with the
+/// platform-specific "this OS does not support directory fsync" error,
+/// so callers can degrade to best-effort. Windows surfaces this as
+/// `ERROR_INVALID_FUNCTION`; libstd maps it to `ErrorKind::Unsupported`
+/// on recent versions and `ErrorKind::PermissionDenied` on others.
+fn is_unsupported_directory_sync(source: &io::Error) -> bool {
+    matches!(
+        source.kind(),
+        io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied
+    )
 }
 
 /// Reads and returns the contents of an already-persisted record.
@@ -462,6 +517,41 @@ mod tests {
         fs::remove_file(path).expect("test artifact must be removable");
     }
 
+    #[test]
+    fn write_new_record_persists_a_freshly_created_parent_directory() {
+        // P2-9 pin: the parent directory is created on demand by
+        // write_new_record itself, and dir.sync_all() is then issued
+        // against that just-opened directory. This test exercises that
+        // path (parent did not exist when write_new_record was called)
+        // and verifies the record round-trips through the create_dir_all
+        // + file.sync_all + dir.sync_all pipeline.
+        //
+        // KNOWN LIMITATION (audit finding #2): std::fs offers no
+        // cross-platform hook for asserting that sync_all() actually
+        // reached the kernel, so a regression that silently removes
+        // either sync_all call would not fail this test. The test is
+        // therefore a path-coverage pin, not a syscall-observation pin:
+        // it guarantees the fsync-on-parent-freshly-created code path is
+        // exercised by CI, and the durability guarantee itself rests on
+        // review + the explicit test for the write+read round-trip across
+        // a real directory fd. A future change that drops fsync must be
+        // caught in review.
+        let parent = unique_temp_path("nested/canary/spec.json")
+            .parent()
+            .expect("temp path must have a parent")
+            .to_path_buf();
+        let _ = fs::remove_dir_all(&parent);
+
+        let path = parent.join("spec.json");
+        write_new_record(&path, "fresh").expect("write into a brand-new parent must succeed");
+        assert_eq!(
+            read_record(&path).expect("record must be readable from a freshly-created parent"),
+            "fresh"
+        );
+
+        let _ = fs::remove_dir_all(&parent);
+    }
+
     // Phase 0.5 confirmed live that a fully matched order can 404 from
     // `GET /data/order/{id}` immediately afterward, and that the field-based
     // fallback listing does not find a matched order at all. Neither is
@@ -517,5 +607,27 @@ mod tests {
 
         assert!(!found.is_query_failure());
         assert_eq!(found.found_order_id.as_deref(), Some("0xabc"));
+    }
+
+    #[test]
+    fn unsupported_directory_sync_errors_are_classified_as_best_effort() {
+        // P2-9 audit finding #1 pin: dir.sync_all on Windows surfaces
+        // ErrorKind::Unsupported (ERROR_INVALID_FUNCTION) or
+        // PermissionDenied depending on libstd version; both must be
+        // tolerated as best-effort. Any other kind (e.g. Storage full,
+        // Io) must NOT be tolerated.
+        use std::io;
+        let unsupported = io::Error::new(io::ErrorKind::Unsupported, "ERROR_INVALID_FUNCTION");
+        assert!(is_unsupported_directory_sync(&unsupported));
+        let permission_denied =
+            io::Error::new(io::ErrorKind::PermissionDenied, "ERROR_INVALID_FUNCTION");
+        assert!(is_unsupported_directory_sync(&permission_denied));
+        for kind in [io::ErrorKind::Other, io::ErrorKind::BrokenPipe, io::ErrorKind::InvalidInput] {
+            let other = io::Error::new(kind, "real disk error");
+            assert!(
+                !is_unsupported_directory_sync(&other),
+                "{kind:?} must not be classified as best-effort"
+            );
+        }
     }
 }

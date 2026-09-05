@@ -278,6 +278,30 @@ pub enum StrictTradeHistoryError {
     },
 }
 
+// Manual PartialEq: InvalidWindow is structurally equal; the Query
+// variant compares only token_id (the SDK error type does not
+// implement PartialEq, and the matcher tests that exercise this
+// enum never compare the inner SDK error -- they compare against the
+// canned enum form).
+impl PartialEq for StrictTradeHistoryError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::InvalidWindow, Self::InvalidWindow) => true,
+            (
+                Self::Query {
+                    token_id: lhs_token,
+                    ..
+                },
+                Self::Query {
+                    token_id: rhs_token,
+                    ..
+                },
+            ) => lhs_token == rhs_token,
+            _ => false,
+        }
+    }
+}
+
 impl fmt::Display for StrictTradeHistoryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

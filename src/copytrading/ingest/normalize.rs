@@ -31,6 +31,13 @@
 use serde::Deserialize;
 use serde_json::Value;
 
+/// Maximum accepted length (in bytes) of a single raw WebSocket text frame
+/// for the activity topic. Frames exceeding this are rejected early
+/// (ParseResult::Skip) to avoid unbounded allocation/CPU in serde_json.
+/// Chosen to be well above any legitimate trade payload (~1-2 KB) while
+/// still bounding worst-case attacker input.
+pub const MAX_WS_FRAME_BYTES: usize = 262_144; // 256 KiB
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradeSide {
     Buy,
@@ -105,7 +112,14 @@ struct RawTrader {
 }
 
 /// Parses one raw WebSocket text frame. Never panics on malformed input.
+///
+/// Rejects frames whose UTF-8 byte length exceeds MAX_WS_FRAME_BYTES before
+/// any JSON parsing occurs. This is a fail-closed defense against
+/// pathological or malicious input.
 pub fn parse(raw: &str) -> ParseResult {
+    if raw.len() > MAX_WS_FRAME_BYTES {
+        return ParseResult::Skip;
+    }
     let trimmed = raw.trim();
     if trimmed.eq_ignore_ascii_case("pong") || trimmed.eq_ignore_ascii_case("ping") {
         return ParseResult::Skip;
@@ -155,10 +169,12 @@ pub fn parse(raw: &str) -> ParseResult {
         return ParseResult::Rejected("missing transactionHash");
     };
 
+    // REST Activity normalizes identity to proxy_wallet. Prefer the same
+    // address on WS when both fields are present so WS/REST observations of
+    // one execution deduplicate and resolve the same watched leader.
     let Some(trader_address) = payload
-        .trader
-        .and_then(|trader| trader.address)
-        .or(payload.proxy_wallet)
+        .proxy_wallet
+        .or(payload.trader.and_then(|trader| trader.address))
         .filter(|address| !address.is_empty())
     else {
         return ParseResult::Rejected("missing trader address");
@@ -404,5 +420,27 @@ mod tests {
             panic!("expected a parsed trade");
         };
         assert_eq!(trade.occurred_at_utc, "2025-01-01T00:00:00.000Z");
+    }
+
+    // P2-4: pin the WS frame length guard. A frame whose UTF-8 byte
+    // length exceeds MAX_WS_FRAME_BYTES must be rejected early
+    // (ParseResult::Skip) without attempting JSON parse. This bounds
+    // attacker-controlled allocation/CPU. Legitimate trade payloads are
+    // a few hundred bytes; 256 KiB is a conservative ceiling.
+
+    #[test]
+    fn parse_rejects_an_oversized_frame_before_json_parsing() {
+        // Construct a frame that is just over the limit. We do not need
+        // valid JSON content -- the length check happens first.
+        let big = "x".repeat(MAX_WS_FRAME_BYTES + 1);
+        assert_eq!(parse(&big), ParseResult::Skip);
+
+        // Exactly at the limit is still accepted for parsing (though it
+        // will likely fail JSON schema checks and return Skip for other
+        // reasons -- the point is the length guard itself does not reject).
+        let exact = "x".repeat(MAX_WS_FRAME_BYTES);
+        // This will fail to parse as a valid activity message and return
+        // Skip for schema reasons, not length. Assert it is not a panic.
+        let _ = parse(&exact);
     }
 }

@@ -58,6 +58,11 @@ impl OrderReceipt {
         matched_shares: Decimal,
     ) -> Result<Self, ReceiptError> {
         validate_not_greater_than_requested("accepted_qty", accepted_budget, requested_budget)?;
+        // P2-7 defense in depth: a zero-quantity request can never have a
+        // real fill. A corrupted or fail-open-parsed size (requested == 0)
+        // combined with real venue history (matched > 0) must be rejected
+        // here so it can never become a phantom lot in finalize_receipt.
+        validate_no_fill_on_zero_request("filled_qty", requested_budget, matched_shares)?;
         Self::new(
             requested_budget,
             accepted_budget,
@@ -74,6 +79,10 @@ impl OrderReceipt {
         accepted_shares: Decimal,
         matched_shares: Decimal,
     ) -> Result<Self, ReceiptError> {
+        // P2-7 defense in depth: checked BEFORE ExceedsRequested so the
+        // more specific diagnosis wins -- a zero-request corruption should
+        // report FillOnZeroRequest, not the generic exceeds error.
+        validate_no_fill_on_zero_request("filled_qty", requested_shares, matched_shares)?;
         validate_not_greater_than_requested("accepted_qty", accepted_shares, requested_shares)?;
         validate_not_greater_than_requested("filled_qty", matched_shares, requested_shares)?;
         Self::new(
@@ -123,6 +132,24 @@ fn validate_not_greater_than_requested(
     Ok(())
 }
 
+/// P2-7: a zero-quantity request can never have a real fill. Enforced for
+/// both FAK constructors so a fail-open size parse (or any other corruption
+/// that zeroes the requested quantity) cannot combine with real venue
+/// matched-shares to mint a phantom lot.
+fn validate_no_fill_on_zero_request(
+    field: &'static str,
+    requested_qty: Decimal,
+    filled_qty: Decimal,
+) -> Result<(), ReceiptError> {
+    if requested_qty == Decimal::ZERO && filled_qty > Decimal::ZERO {
+        return Err(ReceiptError::FillOnZeroRequest {
+            field,
+            filled_qty,
+        });
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReceiptError {
     NegativeQuantity {
@@ -133,6 +160,10 @@ pub enum ReceiptError {
         field: &'static str,
         value: Decimal,
         requested_qty: Decimal,
+    },
+    FillOnZeroRequest {
+        field: &'static str,
+        filled_qty: Decimal,
     },
 }
 
@@ -149,6 +180,10 @@ impl fmt::Display for ReceiptError {
             } => write!(
                 formatter,
                 "{field} ({value}) must not exceed requested_qty ({requested_qty})"
+            ),
+            Self::FillOnZeroRequest { field, filled_qty } => write!(
+                formatter,
+                "{field} ({filled_qty}) must be zero when requested_qty is zero -- a zero-quantity request can never have a real fill"
             ),
         }
     }

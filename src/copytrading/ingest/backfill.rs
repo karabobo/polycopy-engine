@@ -199,7 +199,10 @@ fn normalize_rest_activity(activity: &Activity) -> Option<NormalizedTrade> {
     };
     let outcome_index = i64::from(activity.outcome_index?);
     let price = activity.price?;
-    let occurred_at_utc = chrono::DateTime::from_timestamp(activity.timestamp, 0)?
+    // WS observes the same fill with millisecond precision (`from_timestamp_millis`).
+    // REST exposes whole seconds; widen to milliseconds so the canonical key is
+    // identical when both sources deliver the same trade.
+    let occurred_at_utc = chrono::DateTime::from_timestamp_millis(activity.timestamp * 1000)?
         .to_rfc3339_opts(SecondsFormat::Millis, true);
 
     Some(NormalizedTrade {

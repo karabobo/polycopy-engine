@@ -38,20 +38,27 @@ pub struct DriftReport {
     /// A line contained the `GHOST_RECORD:` prefix but did not parse as
     /// valid JSON -- a real problem with the log, never silently dropped.
     pub unparseable_record_lines: usize,
+    /// A record line parsed as valid JSON but its checked_at_utc field was
+    /// not a valid RFC3339 timestamp. These are counted separately from
+    /// unparseable_record_lines so the operator can distinguish "bad JSON"
+    /// from "good JSON, bad timestamp format".
+    pub timestamp_parse_failures: usize,
     pub first_checked_at_utc: Option<String>,
     pub last_checked_at_utc: Option<String>,
 }
 
 impl DriftReport {
     /// `true` only when every run was clean, no gap exceeded the caller's
-    /// tolerance, and no record line failed to parse. Mirrors
-    /// `GhostVerification::is_clean`'s "only a genuinely clean result counts"
-    /// discipline at the level of a whole multi-day run.
+    /// tolerance, and no record line failed to parse as JSON or as a valid
+    /// RFC3339 timestamp. Mirrors `GhostVerification::is_clean`'s "only a
+    /// genuinely clean result counts" discipline at the level of a whole
+    /// multi-day run.
     pub fn is_clean(&self) -> bool {
         self.total_runs > 0
             && self.unclean_runs.is_empty()
             && self.gaps.is_empty()
             && self.unparseable_record_lines == 0
+            && self.timestamp_parse_failures == 0
     }
 
     /// Elapsed time between the first and last parseable record, if both are
@@ -95,14 +102,18 @@ pub fn build_drift_report(log: &str, max_gap_seconds: i64) -> DriftReport {
         }
     }
 
-    let mut timestamped: Vec<(DateTime<Utc>, GhostRunRecord)> = records
-        .into_iter()
-        .filter_map(|record| {
-            DateTime::parse_from_rfc3339(&record.checked_at_utc)
-                .ok()
-                .map(|timestamp| (timestamp.with_timezone(&Utc), record))
-        })
-        .collect();
+    let mut timestamp_parse_failures = 0usize;
+    let mut timestamped: Vec<(DateTime<Utc>, GhostRunRecord)> = Vec::new();
+    for record in records {
+        match DateTime::parse_from_rfc3339(&record.checked_at_utc) {
+            Ok(timestamp) => {
+                timestamped.push((timestamp.with_timezone(&Utc), record));
+            }
+            Err(_) => {
+                timestamp_parse_failures += 1;
+            }
+        }
+    }
     timestamped.sort_by_key(|(timestamp, _)| *timestamp);
 
     let total_runs = timestamped.len();
@@ -137,6 +148,7 @@ pub fn build_drift_report(log: &str, max_gap_seconds: i64) -> DriftReport {
         unclean_runs,
         gaps,
         unparseable_record_lines,
+        timestamp_parse_failures,
         first_checked_at_utc: timestamped
             .first()
             .map(|(_, record)| record.checked_at_utc.clone()),
@@ -282,4 +294,5 @@ mod tests {
         assert!(!build_drift_report(&short, 13 * 60 * 60).meets_minimum_window());
         assert!(build_drift_report(&full, 13 * 60 * 60).meets_minimum_window());
     }
-}
+
+    }

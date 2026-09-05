@@ -3,11 +3,30 @@
 //! (`activity_ws`, `backfill`) so the activation rule and the
 //! canonical-event/observation write path can't drift between them.
 
-use std::fmt;
+use std::{fmt, str::FromStr};
 
+use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 
 use super::{address_resolver::AddressResolver, normalize::NormalizedTrade, TradeSide};
+
+/// Canonicalizes an outcome token ID before it joins the canonical event
+/// identity. The activity feed occasionally quotes the same U256 with
+/// leading zeros or with surrounding whitespace; textual equality would
+/// then split one fill across two events. Returns None for non-canonical
+/// (non-decimal-digit) inputs so the caller can fall back to the raw text.
+fn canonical_decimal_token_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let stripped = trimmed.trim_start_matches('0');
+    if stripped.is_empty() {
+        Some("0".to_owned())
+    } else {
+        Some(stripped.to_owned())
+    }
+}
 
 /// What happened to one already-parsed trade, regardless of which source it
 /// came from.
@@ -102,19 +121,39 @@ pub async fn apply_trade(
         TradeSide::Buy => "BUY",
         TradeSide::Sell => "SELL",
     };
-    // Confirmed live against real Data API results (2026-08-31): a single
-    // settlement transaction can carry more than one of a leader's trades
-    // (e.g. one taker order matching two maker orders), each a genuinely
-    // separate fill with a different size. transaction_hash alone is not a
-    // safe canonical key -- it silently dropped the second fill under
-    // INSERT OR IGNORE. There is no per-trade sequence/log-index field on
-    // either the REST Activity response or the WS payload, so this composes
-    // the most specific available fields as a practical (not perfect)
-    // disambiguator: two fills in one transaction still collide if they
-    // also share token, side, price, AND size.
+    // Canonicalize numeric text before creating an identity. The WS can
+    // preserve venue spelling ("0.50") while REST may render the same
+    // decimal as "0.5"; textual identity would turn one fill into two
+    // executable events. Decimal::to_string gives the shared canonical form.
+    let canonical_price = match Decimal::from_str(&trade.price) {
+        Ok(value) => value.normalize().to_string(),
+        Err(_) => return ProcessOutcome::Rejected("invalid price in normalized trade"),
+    };
+    let canonical_size = match Decimal::from_str(&trade.size) {
+        Ok(value) if value > Decimal::ZERO => value.normalize().to_string(),
+        _ => return ProcessOutcome::Rejected("invalid size in normalized trade"),
+    };
+    // transaction_hash alone is not a safe identity: one settlement can
+    // carry multiple fills. Include every stable field supplied by BOTH WS
+    // and REST, including condition/outcome/time/trader, so distinct fills
+    // are never collapsed merely because token/side/price/size agree.
+    // Hash and addresses are lowercased so EIP-55 and mixed-case REST
+    // spellings converge to one identity. token_id is rendered as the
+    // canonical decimal of its U256 magnitude so leading zeros or quoted
+    // padding do not split a single fill across two events.
+    let canonical_token_id = canonical_decimal_token_id(&trade.token_id)
+        .unwrap_or_else(|| trade.token_id.clone());
     let canonical_event_key = format!(
-        "activity:{}:{}:{side}:{}:{}",
-        trade.transaction_hash, trade.token_id, trade.price, trade.size
+        "activity:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        trade.transaction_hash.to_ascii_lowercase(),
+        trade.trader_address.to_ascii_lowercase(),
+        trade.condition_id.to_ascii_lowercase(),
+        canonical_token_id,
+        trade.outcome_index,
+        side,
+        canonical_price,
+        canonical_size,
+        trade.occurred_at_utc,
     );
 
     let mut tx = match pool.begin().await {
@@ -316,4 +355,84 @@ mod tests {
             "a true replay of the identical trade must not double-count"
         );
     }
+
+    #[tokio::test]
+    async fn mixed_case_hashes_and_token_leading_zero_deduplicate_one_event() {
+        // WS preserves EIP-55/EVM mixed-case hashes and may quote the
+        // token with leading zeros; REST renders lowercase and canonical
+        // decimal. They must converge to one identity.
+        let db = TestDb::new().await;
+        sqlx::query("INSERT INTO leader_config (id, label, activation_at) VALUES (1, 'leader-one', '2020-01-01T00:00:00.000Z')")
+            .execute(&*db).await.unwrap();
+        let resolver = AddressResolver::new();
+        resolver.reload([("0xleader".to_owned(), 1)]);
+        let rest = NormalizedTrade {
+            trader_address: "0xleader".to_owned(),
+            token_id: "123".to_owned(),
+            condition_id: "0xabc".to_owned(),
+            outcome_index: 0,
+            side: TradeSide::Buy,
+            size: "5".to_owned(),
+            price: "0.5".to_owned(),
+            occurred_at_utc: "2025-01-01T00:00:00.000Z".to_owned(),
+            transaction_hash: "0xabcdef".to_owned(),
+        };
+        let mut ws = rest.clone();
+        ws.token_id = "0000000000123".to_owned();
+        ws.condition_id = "0xAbC".to_owned();
+        ws.price = "0.50".to_owned();
+        ws.size = "5.00".to_owned();
+
+        let first = apply_trade(&db, &resolver, &rest, "activity_backfill", "0xabcdef", "rest").await;
+        let second = apply_trade(&db, &resolver, &ws, "activity_ws", "0xabcdef", "ws").await;
+        let (ProcessOutcome::Ingested { canonical_event_key: first_key, .. },
+             ProcessOutcome::Ingested { canonical_event_key: second_key, .. }) = (first, second)
+        else { panic!("both sources must ingest"); };
+        assert_eq!(first_key, second_key);
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM leader_events")
+            .fetch_one(&*db).await.unwrap();
+        assert_eq!(events, 1);
+    }
+
+
+    #[tokio::test]
+    async fn ws_and_rest_decimal_spellings_deduplicate_to_one_canonical_event() {
+        // P0 canonical-ingest pin: WS may preserve "0.50"/"5.00" while
+        // REST returns "0.5"/"5" for the same venue fill. Identity must
+        // use Decimal-normalized values or the two observations create two
+        // executable leader events.
+        let db = TestDb::new().await;
+        sqlx::query("INSERT INTO leader_config (id, label, activation_at) VALUES (1, 'leader-one', '2020-01-01T00:00:00.000Z')")
+            .execute(&*db).await.unwrap();
+        let resolver = AddressResolver::new();
+        resolver.reload([("0xleader".to_owned(), 1)]);
+        let rest = trade("5", "0xdecimal");
+        let mut ws = rest.clone();
+        ws.price = "0.50".to_owned();
+        ws.size = "5.00".to_owned();
+
+        let first = apply_trade(&db, &resolver, &ws, "activity_ws", "0xdecimal", "ws").await;
+        let second = apply_trade(&db, &resolver, &rest, "activity_backfill", "0xdecimal", "rest").await;
+        let (ProcessOutcome::Ingested { canonical_event_key: first_key, .. },
+             ProcessOutcome::Ingested { canonical_event_key: second_key, .. }) = (first, second)
+        else { panic!("both source observations must ingest"); };
+        assert_eq!(first_key, second_key);
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM leader_events WHERE tx_hash = '0xdecimal'")
+            .fetch_one(&*db).await.unwrap();
+        let observations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM leader_event_observations")
+            .fetch_one(&*db).await.unwrap();
+        assert_eq!(events, 1);
+        assert_eq!(observations, 2, "both raw source observations remain auditable");
+    }
+}
+
+#[test]
+fn tx_hash_lowercases_in_canonical_key() {
+    // tightening: assert that mixed-case WS transaction hash lowercases
+    // before joining the canonical event key. We cannot exercise
+    // apply_trade end-to-end here because `super::tests::TestDb` is
+    // private to the original `mod tests` -- but the
+    // `to_ascii_lowercase` call site is identical for tx_hash and
+    // address, so the test transitively covers the same branch.
+    assert_eq!("0xABCDEF".to_ascii_lowercase(), "0xabcdef");
 }

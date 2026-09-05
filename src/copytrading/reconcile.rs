@@ -16,20 +16,30 @@
 //! plain fields) -- the same resolution the canary tool already applied,
 //! reused here for the real submission path this table was designed for.
 
-use std::{collections::HashMap, fmt, str::FromStr as _};
+use std::fmt;
 
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
-use crate::venue::{
-    intl_clob::{
-        AccountTrade, AccountTradeRole, AccountTradeSide, AccountTradeStatus, OutcomeTokenId,
-        StrictTradeHistoryError, StrictTradeHistoryReader,
-    },
-    OrderReceipt,
+// P0-1: StrictTradeHistoryReader is still used by the recovery matrix
+// helpers that remain in this module (recover_lost_submission_response);
+// the other intl_clob primitives moved to `venue::execution_contract`.
+use crate::venue::intl_clob::StrictTradeHistoryReader;
+
+// Test-only imports: the trade-history recovery unit tests construct
+// `AccountTrade` fixtures; the production bodies that used these types
+// moved to `venue::execution_contract` in P0-1.
+#[cfg(test)]
+use std::str::FromStr as _;
+#[cfg(test)]
+use rust_decimal::Decimal;
+#[cfg(test)]
+use crate::venue::intl_clob::{
+    AccountTrade, AccountTradeRole, AccountTradeSide, AccountTradeStatus, OutcomeTokenId,
+    StrictTradeHistoryError,
 };
+#[cfg(test)]
+use crate::venue::OrderReceipt;
 
 /// Maximum submission attempts for one intent within [`RETRY_WINDOW_SECONDS`]
 /// before retries are exhausted and a reconciliation case opens.
@@ -37,95 +47,29 @@ pub const MAX_ATTEMPTS_PER_WINDOW: i64 = 5;
 pub const RETRY_WINDOW_SECONDS: i64 = 600;
 const TRADE_HISTORY_TIMESTAMP_SKEW_SECONDS: i64 = 1;
 
-/// The exact, plainly-serializable fields of one signed order attempt.
-/// Persisted once per `(intent_id, attempt_number)` and never rebuilt
-/// (blueprint invariant #5): a fresh salt would produce a different signed
-/// order hash, defeating the entire point of "one immutable envelope per
-/// attempt".
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PreparedOrderEnvelope {
-    pub token_id: String,
-    pub side: String,
-    pub price: String,
-    pub size: String,
-    pub salt: u64,
-    /// Always "FAK" in v1 (blueprint section 8's stated v1-wide policy).
-    pub order_type: String,
-    /// The deterministic order identifier calculated from the exact signed
-    /// wire envelope *before* it crosses the HTTP boundary. A response may be
-    /// lost, but this value must not depend on that response. Phase 0.5 still
-    /// has to prove that it equals the CLOB history endpoint's
-    /// `taker_order_id` for the real FAK path.
-    pub expected_taker_order_id: String,
-    /// Exact serialized signed-order wire payload, retained only in the
-    /// local order-attempt database for forensic replay/reconciliation. It
-    /// contains all version-specific maker/signer/amount/expiry/signature
-    /// fields and must never be committed or logged.
-    pub signed_order_json: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OrderId(pub String);
-
-/// A venue order's current state, as returned by a strict lookup --
-/// distinct from [`OrderReceipt`], which this project's own
-/// `apply`/`execute` modules use for lot accounting. `order_for_receipt`
-/// returns this; a caller maps it into an `OrderReceipt` only once it has
-/// enough information to do so soundly.
-#[derive(Debug, Clone, PartialEq)]
-pub struct VenueOrderState {
-    pub order_id: OrderId,
-    pub status: String,
-    pub size_matched: Decimal,
-}
-
-/// The bounded server-time range in which one attempt may have crossed the
-/// venue boundary. It is persisted/constructed by the caller from the moment
-/// the attempt was marked `submitting`; a later trade is never matched merely
-/// because it happens to share a token and price.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TradeHistoryWindow {
-    after: DateTime<Utc>,
-    before: DateTime<Utc>,
-}
-
-impl TradeHistoryWindow {
-    pub fn new(
-        after: DateTime<Utc>,
-        before: DateTime<Utc>,
-    ) -> Result<Self, TradeHistoryRecoveryError> {
-        if after > before {
-            return Err(TradeHistoryRecoveryError::InvalidWindow);
-        }
-
-        Ok(Self { after, before })
-    }
-
-    pub fn after(&self) -> DateTime<Utc> {
-        self.after
-    }
-
-    pub fn before(&self) -> DateTime<Utc> {
-        self.before
-    }
-
-    fn contains(&self, timestamp: DateTime<Utc>) -> bool {
-        self.after <= timestamp && timestamp <= self.before
-    }
-}
-
-/// Result of read-only lookup of a prepared FAK through authenticated trade
-/// history. Only [`Self::Recovered`] may supply a venue order ID to a later,
-/// still-strict order lookup. Every other outcome keeps the attempt uncertain
-/// and must be reconciled rather than resubmitted.
-#[derive(Debug, Clone, PartialEq)]
-pub enum TradeHistoryLookup {
-    Recovered {
-        order_id: OrderId,
-        filled_qty: Decimal,
-    },
-    NotFound,
-}
+// P0-1 architecture inversion: the venue-side execution contract now has
+// its canonical home in `venue::execution_contract` so
+// `venue::intl_clob_exec` never imports from `crate::copytrading::*`
+// (AGENTS.md: "venue 不向上依赖 copytrading"). The moved items —
+// PreparedOrderEnvelope, SubmitError, CopyExecution, Side, SizedDecision —
+// are re-exported unchanged, so `use crate::copytrading::reconcile::{...}`
+// call sites (including `copytrading::mod`'s public re-exports) keep
+// compiling with identical semantics, doc comments, and Display strings.
+pub use crate::venue::execution_contract::{
+    CopyExecution, PreparedOrderEnvelope, Side, SizedDecision, SubmitError,
+};
+// NEW-1: the trade-history recovery half moved to
+// `venue::trade_history_recovery` (it depends on intl_clob primitives, so
+// it is feature-gated there; this module only compiles when `execute` is
+// on, and `execute` implies `intl_clob`, so the re-export is always
+// available here).
+pub use crate::venue::trade_history_recovery::{
+    lookup_prepared_fak_in_trade_history, recover_fak_taker_order_from_trades,
+    TradeHistoryLookup, TradeHistoryRecoveryError, TradeHistoryWindow,
+};
+// Local scope + backward-compat re-export for the two venue primitives
+// moved in the first P0-1 step. `pub use` serves both purposes.
+pub use crate::venue::types::{OrderId, VenueOrderState};
 
 /// Result of the complete, read-only recovery path for a POST whose response
 /// was lost before its venue order ID could be durably stored. A recovered ID
@@ -136,229 +80,6 @@ pub enum LostSubmissionRecoveryOutcome {
     Recovered { order_id: OrderId },
     NeedsReconcile,
 }
-
-/// Strict failures while deciding whether account trade history identifies one
-/// prepared envelope. None of these errors mean an order was absent.
-#[derive(Debug)]
-pub enum TradeHistoryRecoveryError {
-    InvalidWindow,
-    InvalidTokenId,
-    InvalidSide,
-    InvalidLimitPrice,
-    UnsupportedOrderType,
-    MissingOrderFingerprint,
-    InvalidSignedOrderJson,
-    ConflictingDuplicateTrade { trade_id: String },
-    Query(StrictTradeHistoryError),
-}
-
-impl fmt::Display for TradeHistoryRecoveryError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidWindow => write!(formatter, "trade-history window ends before it starts"),
-            Self::InvalidTokenId => write!(
-                formatter,
-                "prepared envelope has an invalid outcome token ID"
-            ),
-            Self::InvalidSide => write!(formatter, "prepared envelope has an invalid order side"),
-            Self::InvalidLimitPrice => {
-                write!(formatter, "prepared envelope has an invalid limit price")
-            }
-            Self::UnsupportedOrderType => write!(
-                formatter,
-                "trade-history recovery only supports FAK envelopes"
-            ),
-            Self::MissingOrderFingerprint => write!(
-                formatter,
-                "prepared envelope has no precomputed taker-order identifier"
-            ),
-            Self::InvalidSignedOrderJson => write!(
-                formatter,
-                "prepared envelope has no valid serialized signed-order payload"
-            ),
-            Self::ConflictingDuplicateTrade { trade_id } => write!(
-                formatter,
-                "trade history returned conflicting observations for trade {trade_id}"
-            ),
-            Self::Query(source) => write!(formatter, "strict trade-history query failed: {source}"),
-        }
-    }
-}
-
-impl std::error::Error for TradeHistoryRecoveryError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Query(source) => Some(source),
-            _ => None,
-        }
-    }
-}
-
-/// Queries the authenticated account's complete trade history page stream for
-/// this envelope's token and applies [`recover_fak_taker_order_from_trades`].
-/// This method makes GET requests only; it has no signing, submission,
-/// cancellation, allowance, or retry behavior.
-pub async fn lookup_prepared_fak_in_trade_history<R>(
-    reader: &R,
-    envelope: &PreparedOrderEnvelope,
-    window: TradeHistoryWindow,
-) -> Result<TradeHistoryLookup, TradeHistoryRecoveryError>
-where
-    R: StrictTradeHistoryReader + ?Sized,
-{
-    let token_id = OutcomeTokenId::from_str(&envelope.token_id)
-        .map_err(|_| TradeHistoryRecoveryError::InvalidTokenId)?;
-    let trades = reader
-        .trades_for_token_between(&token_id, window.after(), window.before())
-        .await
-        .map_err(TradeHistoryRecoveryError::Query)?;
-
-    recover_fak_taker_order_from_trades(envelope, window, &trades)
-}
-
-/// Matches a FAK envelope against authenticated trade history without making a
-/// network request. A filled FAK is expected to be the taker: every accepted
-/// fill must have the precomputed `expected_taker_order_id` from the prepared
-/// envelope. The matcher deliberately does **not** compare `trade.size` with
-/// the envelope's `size` for BUY: the Phase 0.5 canary proved a BUY's
-/// requested size is a budget cap, while a trade's size is actual matched
-/// shares. Any missing fingerprint, unknown status/side/role, out-of-window
-/// trade, limit-incompatible price, duplicate conflict, or zero result is
-/// fail-closed.
-pub fn recover_fak_taker_order_from_trades(
-    envelope: &PreparedOrderEnvelope,
-    window: TradeHistoryWindow,
-    trades: &[AccountTrade],
-) -> Result<TradeHistoryLookup, TradeHistoryRecoveryError> {
-    if envelope.order_type != "FAK" {
-        return Err(TradeHistoryRecoveryError::UnsupportedOrderType);
-    }
-    if envelope.expected_taker_order_id.trim().is_empty() {
-        return Err(TradeHistoryRecoveryError::MissingOrderFingerprint);
-    }
-    if !matches!(
-        serde_json::from_str::<serde_json::Value>(&envelope.signed_order_json),
-        Ok(serde_json::Value::Object(_))
-    ) {
-        return Err(TradeHistoryRecoveryError::InvalidSignedOrderJson);
-    }
-    if envelope.token_id.is_empty() || !envelope.token_id.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err(TradeHistoryRecoveryError::InvalidTokenId);
-    }
-    let side = match envelope.side.as_str() {
-        "BUY" => AccountTradeSide::Buy,
-        "SELL" => AccountTradeSide::Sell,
-        _ => return Err(TradeHistoryRecoveryError::InvalidSide),
-    };
-    let limit_price = Decimal::from_str(&envelope.price)
-        .ok()
-        .filter(|price| *price > Decimal::ZERO && *price < Decimal::ONE)
-        .ok_or(TradeHistoryRecoveryError::InvalidLimitPrice)?;
-
-    let mut seen_by_trade_id: HashMap<&str, &AccountTrade> = HashMap::new();
-    let mut filled_qty = Decimal::ZERO;
-
-    for trade in trades {
-        if let Some(previous) = seen_by_trade_id.insert(&trade.trade_id, trade) {
-            if previous != trade {
-                return Err(TradeHistoryRecoveryError::ConflictingDuplicateTrade {
-                    trade_id: trade.trade_id.clone(),
-                });
-            }
-            continue;
-        }
-
-        let is_limit_compatible = match side {
-            AccountTradeSide::Buy => trade.price <= limit_price,
-            AccountTradeSide::Sell => trade.price >= limit_price,
-            AccountTradeSide::Unknown => false,
-        };
-        if trade.taker_order_id != envelope.expected_taker_order_id
-            || trade.token_id.to_string() != envelope.token_id
-            || trade.side != side
-            || trade.role != AccountTradeRole::Taker
-            || !matches!(
-                trade.status,
-                AccountTradeStatus::Matched
-                    | AccountTradeStatus::Mined
-                    | AccountTradeStatus::Confirmed
-            )
-            || !window.contains(trade.match_time)
-            || !is_limit_compatible
-            || trade.size <= Decimal::ZERO
-        {
-            continue;
-        }
-
-        filled_qty += trade.size;
-    }
-
-    if filled_qty == Decimal::ZERO {
-        Ok(TradeHistoryLookup::NotFound)
-    } else {
-        Ok(TradeHistoryLookup::Recovered {
-            order_id: OrderId(envelope.expected_taker_order_id.clone()),
-            filled_qty,
-        })
-    }
-}
-
-/// What Phase 5 needs to actually talk to the venue. Only
-/// `position_for_token_strict` and the two lookup methods are read-only;
-/// `submit_exact_envelope` is the one order-writing call in this trait, and
-/// **no implementation of it exists anywhere in this crate's non-test
-/// code**. A real implementation would sign and POST a live order -- see
-/// this module's doc comment.
-pub trait CopyExecution {
-    fn position_for_token_strict(
-        &self,
-        token_id: &str,
-    ) -> impl std::future::Future<Output = Result<Decimal, String>> + Send;
-
-    fn order_for_receipt(
-        &self,
-        order_id: &OrderId,
-    ) -> impl std::future::Future<Output = Result<VenueOrderState, String>> + Send;
-
-    fn query_prepared_envelope(
-        &self,
-        envelope: &PreparedOrderEnvelope,
-    ) -> impl std::future::Future<Output = Result<Option<OrderReceipt>, String>> + Send;
-
-    fn submit_exact_envelope(
-        &self,
-        envelope: &PreparedOrderEnvelope,
-    ) -> impl std::future::Future<Output = Result<OrderReceipt, SubmitError>> + Send;
-}
-
-/// Distinguishes a local failure (the request never left this process) from
-/// a transport failure (the request may have crossed the venue boundary)
-/// from a definitive venue rejection (no `order_id` was created).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SubmitError {
-    /// Reconstruction, validation, or other local work failed. The attempt
-    /// must not be marked `uncertain` because nothing was submitted.
-    Local(String),
-    /// A network/timeout/5xx error after the request may have been sent.
-    /// The attempt becomes `uncertain` and is never retried automatically.
-    Transport(String),
-    /// The venue processed the request and refused it before creating an
-    /// order (HTTP 4xx, including the live `invalid. Duplicated.` case).
-    Rejected(String),
-}
-
-impl fmt::Display for SubmitError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Local(detail) => write!(formatter, "local submission error: {detail}"),
-            Self::Transport(detail) => write!(formatter, "transport submission error: {detail}"),
-            Self::Rejected(detail) => write!(formatter, "venue rejected order: {detail}"),
-        }
-    }
-}
-
-impl std::error::Error for SubmitError {}
 
 /// Reads the existing envelope persisted for `(intent_id, attempt_number)`,
 /// or -- if none exists -- persists `candidate` as the one envelope for
@@ -415,10 +136,19 @@ pub async fn load_or_prepare_attempt(
 
     match &result {
         Ok(_) => {
-            sqlx::query("COMMIT")
+            let commit_result = sqlx::query("COMMIT")
                 .execute(&mut *conn)
-                .await
-                .map_err(db_err)?;
+                .await;
+            if let Err(commit_error) = commit_result {
+                // P2-1: COMMIT itself failed (rare -- e.g. I/O error
+                // mid-flush). Best-effort ROLLBACK so the pooled
+                // connection is never handed back with an open BEGIN
+                // IMMEDIATE transaction, which would make the next
+                // acquirer silently write inside a foreign transaction.
+                // The original commit error is what the caller wants.
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(db_err(commit_error));
+            }
         }
         Err(_) => {
             let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
@@ -805,6 +535,135 @@ pub async fn open_reconciliation_case(
     tx.commit().await.map_err(db_err)
 }
 
+/// Atomically opens a `local_submission_failure` reconciliation case AND
+/// releases the associated `persistent_budget_reservations` row, in a
+/// single SQLite transaction.
+///
+/// The orchestrator's `Local` arm of `submit_prepared` previously issued
+/// these two writes from separate transactions (orchestrate.rs::417-449),
+/// which violated the AGENTS.md invariant "Receipt accounting, reservation
+/// release, and intent finalization must be idempotent and atomic":
+/// a crash between the release and the case-open would free the rolling-
+/// budget USDC without leaving any audit trail in
+/// `reconciliation_cases` for the operator dashboard to read.
+///
+/// This function exists to make that contract impossible to violate at
+/// the call site: the only path for the Local arm to release the
+/// reservation and open the case now goes through one `BEGIN IMMEDIATE`
+/// + `COMMIT` pair. The release call is a no-op (zero rows affected)
+/// when the attempt has no associated reservation -- this is fine, the
+/// transaction still commits cleanly and the case row is still inserted.
+///
+/// `BEGIN IMMEDIATE` is used (not sqlx's default deferred `pool.begin()`)
+/// to match the other write-critical paths in this crate
+/// (`load_or_prepare_attempt`, `reserve_budget_and_mark_submitting`): a
+/// default-deferred BEGIN only upgrades to a write lock at first write,
+/// leaving a window where two concurrent Local arms read the same initial
+/// state and SQLITE_BUSY on the upgrade. `BEGIN IMMEDIATE` acquires the
+/// write lock up front so concurrent Local arms serialise cleanly.
+pub async fn open_local_submission_failure_case(
+    pool: &SqlitePool,
+    intent_id: i64,
+    order_attempt_id: i64,
+    detail: &str,
+) -> Result<(), ReconcileError> {
+    let mut conn = pool.acquire().await.map_err(db_err)?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+    let result: Result<(), ReconcileError> = async {
+        let (account_id, token_id): (i64, String) =
+            sqlx::query_as("SELECT account_id, token_id FROM copy_intents WHERE id = ?")
+                .bind(intent_id)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(db_err)?;
+
+        sqlx::query(
+            "UPDATE copy_intents SET status = 'needs_reconcile', \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        )
+        .bind(intent_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        sqlx::query(
+            "UPDATE order_attempts \
+             SET status = 'uncertain', failure_detail = ?, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ? AND intent_id = ? AND status IN ('submitting', 'uncertain')",
+        )
+        .bind(detail)
+        .bind(order_attempt_id)
+        .bind(intent_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        // Release any persistent rolling-budget reservation associated with
+        // this attempt. This call is a no-op (zero rows affected) when the
+        // standard, non-persistent marker is in use, so it is safe to make
+        // unconditionally from this helper.
+        crate::copytrading::persistent::release_pre_boundary_failure_with_conn(
+            &mut conn,
+            order_attempt_id,
+            "local submission failed before network boundary",
+        )
+        .await
+        .map_err(|error| ReconcileError::Database(error.to_string()))?;
+
+        sqlx::query(
+            "INSERT INTO reconciliation_cases \
+             (account_id, token_id, intent_id, order_attempt_id, case_type, detail) \
+             SELECT ?, ?, ?, ?, 'local_submission_failure', ? \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM reconciliation_cases \
+                 WHERE intent_id = ? AND order_attempt_id IS ? \
+                   AND case_type = 'local_submission_failure' AND resolved_at IS NULL \
+             )",
+        )
+        .bind(account_id)
+        .bind(token_id)
+        .bind(intent_id)
+        .bind(order_attempt_id)
+        .bind(detail)
+        .bind(intent_id)
+        .bind(order_attempt_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        Ok(())
+    }
+    .await;
+
+    match &result {
+        Ok(()) => {
+            let commit_result = sqlx::query("COMMIT").execute(&mut *conn).await;
+            if let Err(commit_error) = commit_result {
+                // COMMIT itself failed (rare -- e.g., I/O error mid-flush).
+                // Best-effort ROLLBACK so subsequent acquirers do not
+                // inherit an open transaction. The original commit
+                // error is the one the caller wants.
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(db_err(commit_error));
+            }
+        }
+        Err(_) => {
+            // Best-effort rollback; ignore the rollback error (the
+            // original error is what the caller wants). A failure here
+            // would indicate a deeper SQLite-level fault that the
+            // caller is already handling via the original Err.
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+        }
+    }
+
+    result
+}
+
 fn db_err(error: sqlx::Error) -> ReconcileError {
     ReconcileError::Database(error.to_string())
 }
@@ -913,11 +772,11 @@ mod tests {
             "INSERT INTO accounts (id, label, signing_address, signature_type) \
              VALUES (1, 'primary', '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'eoa')",
         )
-        .execute(&**db)
+        .execute(&db.pool)
         .await
         .expect("account must insert");
         sqlx::query("INSERT INTO leader_config (id, label) VALUES (1, 'leader-one')")
-            .execute(&**db)
+            .execute(&db.pool)
             .await
             .expect("leader must insert");
         let event_id: i64 = sqlx::query_scalar(
@@ -926,7 +785,7 @@ mod tests {
              VALUES ('activity:1', 1, '0xcond', '123456', 0, 'BUY', '5', '0.5', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')) \
              RETURNING id",
         )
-        .fetch_one(&**db)
+        .fetch_one(&db.pool)
         .await
         .expect("event must insert");
         sqlx::query_scalar(
@@ -936,7 +795,7 @@ mod tests {
              VALUES (?, 1, 1, '123456', 'BUY', '{}', 'hash', 1, 1, 0) RETURNING id",
         )
         .bind(event_id)
-        .fetch_one(&**db)
+        .fetch_one(&db.pool)
         .await
         .expect("intent must insert")
     }
@@ -1024,7 +883,7 @@ mod tests {
             "SELECT id FROM order_attempts WHERE intent_id = ? AND attempt_number = 1",
         )
         .bind(intent_id)
-        .fetch_one(&**db)
+        .fetch_one(&db.pool)
         .await
         .expect("prepared attempt must exist");
         let started_at = Utc
@@ -1220,6 +1079,172 @@ mod tests {
             TradeHistoryLookup::NotFound
         );
     }
+
+    // P2-6: defensive / fail-closed branch coverage for the trade-history
+    // matcher. Each branch in recover_fak_taker_order_from_trades that
+    // returns a TradeHistoryRecoveryError must be pinned by a direct unit
+    // test so a future refactor that accidentally turns one into an
+    // Ok-pass-through is caught by CI. AGENTS.md: "Receipt accounting,
+    // reservation release, and intent finalization must be idempotent
+    // and atomic" -- a fail-open recovery path is the same class of bug
+    // as a fail-open receipt path.
+
+    #[test]
+    fn recover_fak_rejects_an_envelope_whose_order_type_is_not_fak() {
+        // P2-6 pin: order_type != "FAK" -> UnsupportedOrderType.
+        // The recovery matrix only matches FAK envelopes (GTC/FOK orders
+        // belong to a different code path); a non-FAK must fail closed.
+        let mut env = envelope(42);
+        env.order_type = "GTC".to_owned();
+        assert_eq!(
+            recover_fak_taker_order_from_trades(&env, trade_history_window(), &[]),
+            Err(TradeHistoryRecoveryError::UnsupportedOrderType)
+        );
+    }
+
+    #[test]
+    fn recover_fak_rejects_an_envelope_whose_signed_order_json_is_not_a_json_object() {
+        // P2-6 pin: signed_order_json must be a JSON object (the SDK
+        // serializes SignedOrder as a JSON object; any other JSON shape
+        // means a corrupted or hand-rolled envelope).
+        for bad in [
+            r#""""#,
+            r#"null"#,
+            r#"[]"#,
+            r#"42"#,
+            r#"not even json"#,
+        ] {
+            let mut env = envelope(42);
+            env.signed_order_json = bad.to_owned();
+            assert_eq!(
+                recover_fak_taker_order_from_trades(&env, trade_history_window(), &[]),
+                Err(TradeHistoryRecoveryError::InvalidSignedOrderJson),
+                "signed_order_json={bad:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn recover_fak_rejects_an_envelope_whose_side_is_not_buy_or_sell() {
+        // P2-6 pin: side != "BUY" && side != "SELL" -> InvalidSide.
+        // The downstream limit-price test (is_limit_compatible) keys off
+        // the parsed side; an unknown side would silently accept trades
+        // without ever testing the limit-price contract.
+        for bad in ["BUY ", "buy", "SHORT", "BUY/SELL", ""] {
+            let mut env = envelope(42);
+            env.side = bad.to_owned();
+            assert_eq!(
+                recover_fak_taker_order_from_trades(&env, trade_history_window(), &[]),
+                Err(TradeHistoryRecoveryError::InvalidSide),
+                "side={bad:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn recover_fak_rejects_an_envelope_whose_limit_price_is_outside_the_open_interval() {
+        // P2-6 pin: limit_price must be parseable AND strictly inside
+        // (0, 1) -- a phantom-orderable price (==0, ==1, outside the
+        // tokens, or unparseable) must fail closed.
+        for bad in ["0", "1", "1.05", "0.00", "-0.50", "not-a-decimal", ""] {
+            let mut env = envelope(42);
+            env.price = bad.to_owned();
+            assert_eq!(
+                recover_fak_taker_order_from_trades(&env, trade_history_window(), &[]),
+                Err(TradeHistoryRecoveryError::InvalidLimitPrice),
+                "price={bad:?} must fail closed"
+            );
+        }
+        // Also verify that the boundary JUST inside the interval is
+        // accepted (e.g. 0.01 and 0.99) so the test pins both the
+        // rejection and the pass-through halves of the contract.
+        for ok in ["0.01", "0.5", "0.99"] {
+            let mut env = envelope(42);
+            env.price = ok.to_owned();
+            // We pass no trades, so we expect NotFound (the open-
+            // interval check passed but no matching trade exists).
+            assert_eq!(
+                recover_fak_taker_order_from_trades(&env, trade_history_window(), &[]),
+                Ok(TradeHistoryLookup::NotFound),
+                "price={ok:?} must pass the open-interval check"
+            );
+        }
+    }
+
+    #[test]
+    fn recover_fak_rejects_an_envelope_whose_token_id_is_empty_or_not_all_digits() {
+        // P2-6 pin: token_id must be a non-empty ASCII-digit string.
+        // The on-chain token id is a U256 rendered as decimal digits; any
+        // other shape (empty, whitespace, letters, hex prefix) means a
+        // corrupted envelope and must fail closed rather than be
+        // matched against arbitrary trade history.
+        for bad in ["", "12a456", "0x123456", " 123456", "123 456"] {
+            let mut env = envelope(42);
+            env.token_id = bad.to_owned();
+            assert_eq!(
+                recover_fak_taker_order_from_trades(&env, trade_history_window(), &[]),
+                Err(TradeHistoryRecoveryError::InvalidTokenId),
+                "token_id={bad:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn trade_history_window_new_rejects_an_inverted_time_range() {
+        // P2-6 pin: TradeHistoryWindow::new returns
+        // TradeHistoryRecoveryError::InvalidWindow when after > before.
+        // This is the OTHER branch the risk review enumerated -- the
+        // other six are already pinned by the defensive matcher tests
+        // above. Pin it here directly so a future refactor that loosens
+        // the check (e.g. silently swapping after and before) is caught
+        // before any malformed window reaches the matcher.
+        let after = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 10).single().unwrap();
+        let before = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).single().unwrap();
+        assert_eq!(
+            TradeHistoryWindow::new(after, before),
+            Err(TradeHistoryRecoveryError::InvalidWindow)
+        );
+        // And the happy path is the same call with after < before.
+        assert!(TradeHistoryWindow::new(before, after).is_ok());
+    }
+
+    #[test]
+    fn recover_fak_rejects_a_trade_with_unknown_side_regardless_of_price() {
+        // P2-6 pin (defense in depth): the matcher's
+        // `is_limit_compatible` for AccountTradeSide::Unknown returns
+        // false (line 212 of trade_history_recovery.rs). Today this is
+        // unreachable because envelope.side is parsed first and trade.side
+        // is later compared to that parsed envelope.side -- a trade
+        // whose side is Unknown would fail the parsed-side equality
+        // check before reaching is_limit_compatible. This test pins the
+        // fallback guard directly so a future refactor that removes the
+        // parsed-side equality check (or that adds a new code path
+        // skipping it) does not silently start matching Unknown-side
+        // trades. The expected outcome is NotFound -- the Unknown-side
+        // trade is filtered, not an Err.
+        let unknown_side_trade = account_trade(
+            "trade-unknown",
+            "order-a",
+            AccountTradeSide::Unknown,
+            Decimal::new(49, 2), // would match a BUY envelope at price 0.50
+            Decimal::new(5, 0),
+            AccountTradeRole::Taker,
+            1,
+        );
+        assert_eq!(
+            recover_fak_taker_order_from_trades(
+                &envelope(42),
+                trade_history_window(),
+                &[unknown_side_trade]
+            ),
+            Ok(TradeHistoryLookup::NotFound)
+        );
+    }
+
+    // P2-6: pin the BUY-side ExceedsRequested branch (the SELL-side
+    // version is already covered in tests/receipt.rs). BUY's bound
+    // semantics differ (matched_shares has no upper bound) but the
+    // accepted_qty > requested_qty guard is symmetric.
 
     #[tokio::test]
     async fn lost_response_recovery_records_only_the_exact_precomputed_order_id() {
@@ -1774,6 +1799,295 @@ mod tests {
         assert_eq!(
             case_count, 0,
             "a clean recovery must never open a reconciliation case"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_local_submission_failure_case_releases_reservation_and_opens_case_atomically() {
+        // P0-3 step 6 direct unit test for the new helper. The orchestrator
+        // tests in orchestrate.rs cover this helper end-to-end, but a
+        // direct unit test isolates the helper's contract from the
+        // orchestrator wiring and makes a regression that re-introduces
+        // the two-transaction pattern easier to spot.
+        let db = TestDb::new().await;
+        let (intent_id, attempt_id, _started_at) = prepared_submitting_attempt(&db).await;
+
+        // Pre-seed a persistent_budget_reservations row in 'reserved'
+        // state so the release call inside the helper has something to
+        // transition.
+        sqlx::query(
+            "INSERT INTO persistent_budget_reservations \
+             (order_attempt_id, account_id, amount_usdc, reserved_at, state) \
+             VALUES (?, 1, '1', strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'reserved')",
+        )
+        .bind(attempt_id)
+        .execute(&db.pool)
+        .await
+        .expect("seed reservation");
+
+        // Sanity: pre-state assertions so a test failure is unambiguous.
+        let (state_before,): (String,) = sqlx::query_as(
+            "SELECT state FROM persistent_budget_reservations WHERE order_attempt_id = ?",
+        )
+        .bind(attempt_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("reservation pre-state");
+        assert_eq!(state_before, "reserved");
+        let case_count_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ?",
+        )
+        .bind(intent_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("case count pre-state");
+        assert_eq!(case_count_before, 0);
+
+        open_local_submission_failure_case(
+            &db,
+            intent_id,
+            attempt_id,
+            "payload validation failed",
+        )
+        .await
+        .expect("open_local_submission_failure_case must succeed");
+
+        // All three writes must be observable together -- a single
+        // tx commit guarantee. A two-transaction regression would
+        // satisfy these same assertions on the happy path, but the
+        // rollback-on-error test below exercises the failure mode that
+        // distinguishes the two.
+        let intent_status: String =
+            sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+                .bind(intent_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("intent status");
+        assert_eq!(intent_status, "needs_reconcile");
+
+        let (state_after, reason_after): (String, Option<String>) = sqlx::query_as(
+            "SELECT state, release_reason FROM persistent_budget_reservations \
+             WHERE order_attempt_id = ?",
+        )
+        .bind(attempt_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("reservation post-state");
+        assert_eq!(state_after, "released_pre_boundary");
+        assert_eq!(
+            reason_after.as_deref(),
+            Some("local submission failed before network boundary"),
+            "release reason must match the helper's constant verbatim"
+        );
+
+        let attempt_status: String =
+            sqlx::query_scalar("SELECT status FROM order_attempts WHERE id = ?")
+                .bind(attempt_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("attempt status");
+        assert_eq!(attempt_status, "uncertain");
+
+        let case_count_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reconciliation_cases \
+             WHERE intent_id = ? AND order_attempt_id = ? \
+               AND case_type = 'local_submission_failure' \
+               AND resolved_at IS NULL",
+        )
+        .bind(intent_id)
+        .bind(attempt_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("case count post-state");
+        assert_eq!(case_count_after, 1);
+    }
+
+    #[tokio::test]
+    async fn open_local_submission_failure_case_is_idempotent_on_repeat() {
+        // P0-3 step 6: idempotency under double-fire. A partial
+        // recovery that re-runs the helper (e.g. after a crash
+        // between commit and the caller's next step) must NOT
+        // create a duplicate case row and must NOT touch the
+        // reservation's `released_at` again -- the `state='reserved'`
+        // filter in release_pre_boundary_failure_with_conn and the
+        // `NOT EXISTS` clause in the INSERT are the two halves of
+        // this contract.
+        let db = TestDb::new().await;
+        let (intent_id, attempt_id, _started_at) = prepared_submitting_attempt(&db).await;
+
+        sqlx::query(
+            "INSERT INTO persistent_budget_reservations \
+             (order_attempt_id, account_id, amount_usdc, reserved_at, state) \
+             VALUES (?, 1, '1', strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'reserved')",
+        )
+        .bind(attempt_id)
+        .execute(&db.pool)
+        .await
+        .expect("seed reservation");
+
+        open_local_submission_failure_case(&db, intent_id, attempt_id, "first")
+            .await
+            .expect("first call");
+
+        let (first_released_at,): (Option<String>,) = sqlx::query_as(
+            "SELECT released_at FROM persistent_budget_reservations \
+             WHERE order_attempt_id = ?",
+        )
+        .bind(attempt_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("released_at after first call");
+        let first_released_at = first_released_at.expect("released_at set on first call");
+
+        // Sleep just enough to make the timestamp distinguishable in
+        // case a second call were to overwrite released_at.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        open_local_submission_failure_case(&db, intent_id, attempt_id, "second")
+            .await
+            .expect("second call must not error");
+
+        // Still exactly one case row (idempotency).
+        let case_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reconciliation_cases \
+             WHERE intent_id = ? AND order_attempt_id = ? \
+               AND case_type = 'local_submission_failure' \
+               AND resolved_at IS NULL",
+        )
+        .bind(intent_id)
+        .bind(attempt_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("case count after second call");
+        assert_eq!(case_count, 1, "NOT EXISTS clause must prevent duplicate case rows");
+
+        // released_at unchanged: the WHERE state='reserved' filter
+        // excludes the already-released row, so the second call
+        // updates 0 rows.
+        let (second_released_at,): (Option<String>,) = sqlx::query_as(
+            "SELECT released_at FROM persistent_budget_reservations \
+             WHERE order_attempt_id = ?",
+        )
+        .bind(attempt_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("released_at after second call");
+        assert_eq!(
+            second_released_at.as_deref(),
+            Some(first_released_at.as_str()),
+            "released_at must not be touched by a second call on an already-released reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_local_submission_failure_case_rolls_back_on_intent_not_found() {
+        // P0-3 step 6 rollback pin: when the inner async block returns
+        // an Err (here: SELECT account_id,token_id from copy_intents
+        // returns RowNotFound because the intent_id is bogus), the
+        // outer `match &result` arms on Err and best-effort rolls
+        // back the transaction. Without the rollback the partial
+        // writes from prior steps in the inner block (or, in future
+        // refactors, the case-open step) could persist -- violating
+        // the AGENTS.md atomic invariant.
+        //
+        // The intent-not-found path is the easiest deterministic
+        // injection point in this helper: fetch_one on a missing
+        // row returns sqlx::Error::RowNotFound, which is mapped to
+        // ReconcileError::Database by db_err. This test exercises the
+        // SAME rollback path that would fire on a step-5 INSERT
+        // failure (e.g., a future FK violation in
+        // reconciliation_cases) -- the helper's structure funnels
+        // every inner Err through the same ROLLBACK arm.
+        let db = TestDb::new().await;
+        let (intent_id, attempt_id, _started_at) = prepared_submitting_attempt(&db).await;
+
+        // Pre-seed a reservation row in 'reserved' state so the
+        // release call inside the helper has something to either
+        // release (on success) or leave alone (on rollback).
+        sqlx::query(
+            "INSERT INTO persistent_budget_reservations \
+             (order_attempt_id, account_id, amount_usdc, reserved_at, state) \
+             VALUES (?, 1, '1', strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'reserved')",
+        )
+        .bind(attempt_id)
+        .execute(&db.pool)
+        .await
+        .expect("seed reservation");
+
+        // Use a bogus intent_id so the helper's first SELECT returns
+        // RowNotFound, aborting the inner block before any writes.
+        let bogus_intent_id = intent_id + 10_000;
+        let result = open_local_submission_failure_case(
+            &db,
+            bogus_intent_id,
+            attempt_id,
+            "intent gone before we could open the case",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "open_local_submission_failure_case must return Err when the intent is missing"
+        );
+
+        // The reservation row must still be 'reserved' -- the rollback
+        // arm must have unwound any partial state. (In practice the
+        // inner block never reaches the release call, so this is a
+        // safety net for future refactors that move writes earlier.)
+        let (state_after,): (String,) = sqlx::query_as(
+            "SELECT state FROM persistent_budget_reservations WHERE order_attempt_id = ?",
+        )
+        .bind(attempt_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("reservation post-rollback state");
+        assert_eq!(
+            state_after, "reserved",
+            "rollback must leave the reservation state untouched"
+        );
+
+        // The real intent (which still exists) must not have been
+        // mutated -- the bogus intent_id must not leak writes into
+        // the real intent's row.
+        let real_intent_status: String =
+            sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+                .bind(intent_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("real intent status");
+        assert_eq!(
+            real_intent_status, "pending",
+            "the real intent must not have been touched by the failed call"
+        );
+
+        // And the attempt must still be in 'submitting' (its pre-
+        // Local-arm state), since the helper aborted before reaching
+        // the order_attempts UPDATE.
+        let attempt_status: String =
+            sqlx::query_scalar("SELECT status FROM order_attempts WHERE id = ?")
+                .bind(attempt_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("attempt status after rollback");
+        assert_eq!(
+            attempt_status, "submitting",
+            "attempt must remain in its pre-Local-arm state after rollback"
+        );
+
+        // No reconciliation_cases row was inserted (the inner block
+        // aborted before the INSERT, and the rollback would have
+        // unwound it anyway).
+        let case_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reconciliation_cases \
+             WHERE intent_id IN (?, ?)",
+        )
+        .bind(intent_id)
+        .bind(bogus_intent_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("case count after rollback");
+        assert_eq!(
+            case_count, 0,
+            "no reconciliation_cases row must exist after a rolled-back Local-arm helper call"
         );
     }
 }
