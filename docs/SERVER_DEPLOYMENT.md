@@ -132,7 +132,9 @@ The copy unit reads public, non-secret bounds from
 `LoadCredential=polycopy-copy-secrets`. In its bounded-progression mode it
 requires exactly one enabled leader, exactly one attempted order per process,
 and a per-order maximum no greater than 5 USDC. Any schedule mismatch, open
-reconciliation case, Activity WS failure, or REST backfill failure stops it.
+reconciliation case, or an Activity WS failure stops it. REST backfill is a
+low-frequency audit worker: it records and backs off on Data API failure
+without stopping a healthy realtime WS execution path.
 
 The persistent runner is a separate static unit,
 `polycopy-engine-persistent.service`, using

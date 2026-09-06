@@ -141,8 +141,8 @@ pub async fn apply_trade(
     // spellings converge to one identity. token_id is rendered as the
     // canonical decimal of its U256 magnitude so leading zeros or quoted
     // padding do not split a single fill across two events.
-    let canonical_token_id = canonical_decimal_token_id(&trade.token_id)
-        .unwrap_or_else(|| trade.token_id.clone());
+    let canonical_token_id =
+        canonical_decimal_token_id(&trade.token_id).unwrap_or_else(|| trade.token_id.clone());
     let canonical_event_key = format!(
         "activity:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         trade.transaction_hash.to_ascii_lowercase(),
@@ -161,11 +161,12 @@ pub async fn apply_trade(
         Err(error) => return ProcessOutcome::DatabaseError(error.to_string()),
     };
 
+    let realtime_observed = source == "activity_ws";
     let insert_event = sqlx::query(
         "INSERT OR IGNORE INTO leader_events \
          (canonical_event_key, leader_id, condition_id, token_id, outcome_index, side, size, \
-          price, tx_hash, occurred_at, observed_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+          price, tx_hash, occurred_at, observed_at, realtime_observed) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?)",
     )
     .bind(&canonical_event_key)
     .bind(leader_id)
@@ -177,10 +178,27 @@ pub async fn apply_trade(
     .bind(&trade.price)
     .bind(&trade.transaction_hash)
     .bind(&trade.occurred_at_utc)
+    .bind(realtime_observed)
     .execute(&mut *tx)
     .await;
     if let Err(error) = insert_event {
         return ProcessOutcome::DatabaseError(error.to_string());
+    }
+
+    // The canonical event may first arrive via the audit path, then be seen
+    // live by WS during its overlap. Promote only in that direction: a REST
+    // observation must never make an event executable.
+    if realtime_observed {
+        if let Err(error) = sqlx::query(
+            "UPDATE leader_events SET realtime_observed = 1 \
+             WHERE canonical_event_key = ?",
+        )
+        .bind(&canonical_event_key)
+        .execute(&mut *tx)
+        .await
+        {
+            return ProcessOutcome::DatabaseError(error.to_string());
+        }
     }
 
     // A sub-select, not a captured last-insert-id: the event row may
@@ -383,17 +401,36 @@ mod tests {
         ws.price = "0.50".to_owned();
         ws.size = "5.00".to_owned();
 
-        let first = apply_trade(&db, &resolver, &rest, "activity_backfill", "0xabcdef", "rest").await;
+        let first = apply_trade(
+            &db,
+            &resolver,
+            &rest,
+            "activity_backfill",
+            "0xabcdef",
+            "rest",
+        )
+        .await;
         let second = apply_trade(&db, &resolver, &ws, "activity_ws", "0xabcdef", "ws").await;
-        let (ProcessOutcome::Ingested { canonical_event_key: first_key, .. },
-             ProcessOutcome::Ingested { canonical_event_key: second_key, .. }) = (first, second)
-        else { panic!("both sources must ingest"); };
+        let (
+            ProcessOutcome::Ingested {
+                canonical_event_key: first_key,
+                ..
+            },
+            ProcessOutcome::Ingested {
+                canonical_event_key: second_key,
+                ..
+            },
+        ) = (first, second)
+        else {
+            panic!("both sources must ingest");
+        };
         assert_eq!(first_key, second_key);
         let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM leader_events")
-            .fetch_one(&*db).await.unwrap();
+            .fetch_one(&*db)
+            .await
+            .unwrap();
         assert_eq!(events, 1);
     }
-
 
     #[tokio::test]
     async fn ws_and_rest_decimal_spellings_deduplicate_to_one_canonical_event() {
@@ -412,17 +449,85 @@ mod tests {
         ws.size = "5.00".to_owned();
 
         let first = apply_trade(&db, &resolver, &ws, "activity_ws", "0xdecimal", "ws").await;
-        let second = apply_trade(&db, &resolver, &rest, "activity_backfill", "0xdecimal", "rest").await;
-        let (ProcessOutcome::Ingested { canonical_event_key: first_key, .. },
-             ProcessOutcome::Ingested { canonical_event_key: second_key, .. }) = (first, second)
-        else { panic!("both source observations must ingest"); };
+        let second = apply_trade(
+            &db,
+            &resolver,
+            &rest,
+            "activity_backfill",
+            "0xdecimal",
+            "rest",
+        )
+        .await;
+        let (
+            ProcessOutcome::Ingested {
+                canonical_event_key: first_key,
+                ..
+            },
+            ProcessOutcome::Ingested {
+                canonical_event_key: second_key,
+                ..
+            },
+        ) = (first, second)
+        else {
+            panic!("both source observations must ingest");
+        };
         assert_eq!(first_key, second_key);
-        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM leader_events WHERE tx_hash = '0xdecimal'")
-            .fetch_one(&*db).await.unwrap();
-        let observations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM leader_event_observations")
-            .fetch_one(&*db).await.unwrap();
+        let events: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM leader_events WHERE tx_hash = '0xdecimal'")
+                .fetch_one(&*db)
+                .await
+                .unwrap();
+        let observations: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM leader_event_observations")
+                .fetch_one(&*db)
+                .await
+                .unwrap();
         assert_eq!(events, 1);
-        assert_eq!(observations, 2, "both raw source observations remain auditable");
+        assert_eq!(
+            observations, 2,
+            "both raw source observations remain auditable"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_observation_is_audit_only_until_the_same_event_arrives_on_ws() {
+        let db = TestDb::new().await;
+        sqlx::query("INSERT INTO leader_config (id, label, activation_at) VALUES (1, 'leader-one', '2020-01-01T00:00:00.000Z')")
+            .execute(&*db)
+            .await
+            .unwrap();
+        let resolver = AddressResolver::new();
+        resolver.reload([("0xleader".to_owned(), 1)]);
+        let value = trade("5", "0xaudit-first");
+
+        apply_trade(
+            &db,
+            &resolver,
+            &value,
+            "activity_backfill",
+            "0xaudit-first",
+            "rest",
+        )
+        .await;
+        let first: bool = sqlx::query_scalar(
+            "SELECT realtime_observed FROM leader_events WHERE tx_hash = '0xaudit-first'",
+        )
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        assert!(!first, "REST must not create an executable event");
+
+        apply_trade(&db, &resolver, &value, "activity_ws", "0xaudit-first", "ws").await;
+        let promoted: bool = sqlx::query_scalar(
+            "SELECT realtime_observed FROM leader_events WHERE tx_hash = '0xaudit-first'",
+        )
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        assert!(
+            promoted,
+            "a matching live WS observation may promote the event"
+        );
     }
 }
 

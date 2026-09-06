@@ -82,9 +82,9 @@ than one leader, one attempt, and a maximum 5-USDC notional. Before it can
 prepare a buy it requires a strict CLOB collateral response **and** strict
 allowance data; it uses the smaller of the two, subtracts in-progress BUY
 reservations for every token in the account, and moves any query uncertainty
-to `needs_reconcile`. The Activity WebSocket and REST backfill run under one
-supervisor; either stream ending or failing ends the bounded process before a
-later intent can be executed. These are implementation gates, not evidence
+to `needs_reconcile`. The Activity WebSocket gates realtime execution; REST
+backfill is an independent audit worker that backs off on public Data API
+failures without stopping a healthy WS. These are implementation gates, not evidence
 that a real order is safe: the remaining evidence gates are listed in the
 live-progression runbook.
 

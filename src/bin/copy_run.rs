@@ -111,7 +111,7 @@ mod live {
             )?)
         };
         #[cfg(not(feature = "ingest"))]
-        let ingest_guard: Option<tokio::task::JoinHandle<()>> = None;
+        let ingest_guard: Option<polycopy_engine::copytrading::ingest::IngestSupervisor> = None;
 
         let started = tokio::time::Instant::now();
         let mut attempts_used = 0u64;
@@ -128,8 +128,13 @@ mod live {
                 return Ok(());
             }
             if let Some(handle) = &ingest_guard {
-                if handle.is_finished() {
-                    return Err("activity ingestion supervisor stopped".into());
+                if handle.realtime_finished() {
+                    return Err("activity websocket supervisor stopped".into());
+                }
+                if !handle.realtime_connected() {
+                    eprintln!("activity websocket unavailable; execution paused until reconnect");
+                    tokio::time::sleep(Duration::from_secs(tick)).await;
+                    continue;
                 }
             }
 

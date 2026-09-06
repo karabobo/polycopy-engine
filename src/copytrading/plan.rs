@@ -47,7 +47,7 @@ pub async fn plan_next_batch_with_limit(
             .unwrap_or(0);
 
     let events: Vec<LeaderEventRow> = sqlx::query_as(
-        "SELECT id, leader_id, token_id, side, size, occurred_at, observed_at \
+        "SELECT id, leader_id, token_id, side, size, occurred_at, observed_at, realtime_observed \
          FROM leader_events WHERE id > ? ORDER BY id LIMIT ?",
     )
     .bind(cursor)
@@ -126,6 +126,7 @@ struct LeaderEventRow {
     size: String,
     occurred_at: String,
     observed_at: String,
+    realtime_observed: bool,
 }
 
 struct ExecutionSchedule {
@@ -217,6 +218,14 @@ async fn evaluate_event(
     schedule: &ExecutionSchedule,
 ) -> Result<Decision, PlanError> {
     let shard_id = shard_for(account_id, &event.token_id, schedule.lane_count);
+
+    // REST backfill is retained for durable audit and recovery, but it is not
+    // permitted to create a realtime order. This makes the safety boundary
+    // explicit rather than relying on an incidental polling delay to exceed
+    // the signal-age window.
+    if !event.realtime_observed {
+        return Ok(reject(shard_id, "REST audit event is non-executable"));
+    }
 
     let leader_enabled: Option<bool> =
         sqlx::query_scalar("SELECT enabled FROM leader_config WHERE id = ?")
@@ -829,5 +838,29 @@ mod tests {
         verify_schedule_compatible_with_pending_work(&db)
             .await
             .expect("an unchanged schedule must never block startup");
+    }
+
+    #[tokio::test]
+    async fn rest_audit_event_is_durably_rejected_even_when_it_is_fresh() {
+        let db = TestDb::new().await;
+        seed_account_and_leader(&db).await;
+        seed_policy(&db, 3600, "1").await;
+        let event_id = insert_event(&db, "5", &chrono::Utc::now().to_rfc3339()).await;
+        sqlx::query("UPDATE leader_events SET realtime_observed = 0 WHERE id = ?")
+            .bind(event_id)
+            .execute(&*db)
+            .await
+            .unwrap();
+
+        let summary = plan_next_batch(&db, 1).await.unwrap();
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.rejected, 1);
+        let reason: String =
+            sqlx::query_scalar("SELECT rejection_reason FROM copy_intents WHERE event_id = ?")
+                .bind(event_id)
+                .fetch_one(&*db)
+                .await
+                .unwrap();
+        assert_eq!(reason, "REST audit event is non-executable");
     }
 }

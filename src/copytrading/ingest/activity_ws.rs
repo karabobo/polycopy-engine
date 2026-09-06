@@ -5,7 +5,15 @@
 //! in this project's predecessor, PolyHermes -- see `normalize.rs`'s module
 //! doc for why this isn't sourced from official Polymarket documentation.
 
-use std::{error::Error as StdError, fmt, time::Duration};
+use std::{
+    error::Error as StdError,
+    fmt,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use chrono::{SecondsFormat, Utc};
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -24,6 +32,29 @@ const PING_INTERVAL: Duration = Duration::from_secs(10);
 const STALE_AFTER: Duration = Duration::from_secs(30);
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(3);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+
+/// Shared execution gate for the live Activity WS. It is deliberately
+/// transport-only: a disconnected feed must suspend planning/submission, but
+/// it must not turn a temporary reconnect into an account-wide fuse. REST
+/// backfill has its own audit health and never controls this gate.
+#[derive(Clone, Debug, Default)]
+pub struct WsExecutionGate {
+    connected: Arc<AtomicBool>,
+}
+
+impl WsExecutionGate {
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    fn mark_connected(&self) {
+        self.connected.store(true, Ordering::Release);
+    }
+
+    fn mark_disconnected(&self) {
+        self.connected.store(false, Ordering::Release);
+    }
+}
 
 /// Reset the backoff delay to its initial value. Exposed for testing so the
 /// reset contract (a successful connection clears prior backoff) can be
@@ -112,10 +143,23 @@ fn now_utc() -> String {
 /// normal operation; only returns if `pool` itself becomes unusable in a way
 /// a reconnect cannot fix.
 pub async fn run(pool: SqlitePool, resolver: &AddressResolver) -> ! {
+    run_with_execution_gate(pool, resolver, WsExecutionGate::default()).await
+}
+
+/// Like [`run`], but exposes whether the socket is subscribed and receiving
+/// a live session to the execution loop. A false gate means "do not plan or
+/// submit"; the connection manager continues its own bounded reconnect loop.
+pub async fn run_with_execution_gate(
+    pool: SqlitePool,
+    resolver: &AddressResolver,
+    execution_gate: WsExecutionGate,
+) -> ! {
     let mut reconnect_delay = INITIAL_RECONNECT_DELAY;
+    execution_gate.mark_disconnected();
     loop {
-        match run_once(&pool, resolver, &mut reconnect_delay).await {
+        match run_once(&pool, resolver, &mut reconnect_delay, &execution_gate).await {
             Err(error) => {
+                execution_gate.mark_disconnected();
                 eprintln!("activity ws: {error}, reconnecting in {reconnect_delay:?}");
                 log_ws_event(&WsConnectionEvent {
                     at_utc: now_utc(),
@@ -143,6 +187,7 @@ async fn run_once(
     pool: &SqlitePool,
     resolver: &AddressResolver,
     reconnect_delay: &mut Duration,
+    execution_gate: &WsExecutionGate,
 ) -> Result<std::convert::Infallible, ActivityWsError> {
     ensure_crypto_provider_installed();
 
@@ -161,6 +206,7 @@ async fn run_once(
         detail: String::new(),
         next_reconnect_delay_ms: None,
     });
+    execution_gate.mark_connected();
     // Reset backoff on every successful connection establishment.
     // A future failure will start the exponential sequence from the beginning.
     *reconnect_delay = INITIAL_RECONNECT_DELAY;
@@ -283,6 +329,16 @@ mod tests {
         // Idempotent: resetting an already-initial delay keeps it initial.
         reset_backoff(&mut delay);
         assert_eq!(delay, INITIAL_RECONNECT_DELAY);
+    }
+
+    #[test]
+    fn execution_gate_is_closed_until_a_subscription_is_live() {
+        let gate = WsExecutionGate::default();
+        assert!(!gate.is_connected());
+        gate.mark_connected();
+        assert!(gate.is_connected());
+        gate.mark_disconnected();
+        assert!(!gate.is_connected());
     }
 
     // Mirrors src/copytrading/db.rs's TestDb: a migrated pool at a unique

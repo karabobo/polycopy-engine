@@ -11,11 +11,11 @@ mod live {
     use polycopy_engine::{
         copytrading::{
             assert_persistent_startup_clear, ensure_fuse_clear, execute_one_intent_with_marker,
-            list_runnable_intents,
             ingest::{spawn_supervised_ingest, AddressResolver},
-            OrchestrateError, OrchestrateOutcome, pause_persistent_fuse,
-            verify_schedule_compatible_with_pending_work, PersistentError,
-            PersistentRuntimeConfig, PersistentSubmitMarker, EXIT_CONFIG, EXIT_LOCK_COLLISION,
+            list_runnable_intents, pause_persistent_fuse,
+            verify_schedule_compatible_with_pending_work, OrchestrateError, OrchestrateOutcome,
+            PersistentError, PersistentRuntimeConfig, PersistentSubmitMarker, EXIT_CONFIG,
+            EXIT_LOCK_COLLISION,
         },
         venue::intl_clob_exec::IntlClobCopyAdapter,
         EngineLock, EngineLockError,
@@ -71,16 +71,24 @@ mod live {
         let marker = PersistentSubmitMarker { config: &config };
 
         loop {
-            if ingest_guard.is_finished() {
+            if ingest_guard.realtime_finished() {
                 pause_persistent_fuse(
                     &pool,
                     config.account_id,
-                    "activity ingestion supervisor stopped",
+                    "activity websocket supervisor stopped",
                     "copy_persistent",
                 )
                 .await
                 .map_err(RunnerError::Persistent)?;
                 return Err(RunnerError::Persistent(PersistentError::FuseOpen));
+            }
+            // Do not plan or submit during a WS reconnect gap. REST audit
+            // health is intentionally not an execution gate: backfill events
+            // are ledger-only and cannot create executable intents.
+            if !ingest_guard.realtime_connected() {
+                eprintln!("activity websocket unavailable; execution paused until reconnect");
+                tokio::time::sleep(config.tick).await;
+                continue;
             }
             ensure_fuse_clear(&pool, config.account_id)
                 .await

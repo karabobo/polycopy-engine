@@ -201,7 +201,7 @@ async fn a_replayed_historical_batch_preserves_aggregated_outcome_direction_and_
             &pool,
             &resolver,
             trade,
-            "activity_backfill",
+            "activity_ws",
             &trade.transaction_hash,
             "{}",
         )

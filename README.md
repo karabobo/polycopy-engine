@@ -277,6 +277,8 @@ available field rules that out entirely.
   distinct events from 500 fetched real activity rows for a real address
   (the 500th was the duplicate-transaction-hash fill described above,
   ingested as its own event once the fix above landed).
+  REST observations are durable audit/recovery data only: only a matching
+  Activity WS observation may make the canonical event executable.
 
 One easy-to-miss setup requirement: `rustls` 0.23+ does not select a default
 crypto backend on its own, and without installing one every TLS connect

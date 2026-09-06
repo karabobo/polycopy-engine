@@ -16,8 +16,8 @@ pub mod normalize;
 pub mod runtime;
 
 pub use activity_ws::{
-    process_message, run, ActivityWsError, WsConnectionEvent, WsConnectionEventKind, RTDS_URL,
-    WS_EVENT_PREFIX,
+    process_message, run, run_with_execution_gate, ActivityWsError, WsConnectionEvent,
+    WsConnectionEventKind, WsExecutionGate, RTDS_URL, WS_EVENT_PREFIX,
 };
 pub use address_resolver::AddressResolver;
 pub use apply::{apply_trade, ProcessOutcome};
@@ -28,4 +28,4 @@ pub use latency_report::{
     ObserveWindow, SourceLatencyStats, OBSERVE_EVENT_PREFIX,
 };
 pub use normalize::{NormalizedTrade, ParseResult, TradeSide, MAX_WS_FRAME_BYTES};
-pub use runtime::spawn_supervised_ingest;
+pub use runtime::{spawn_supervised_ingest, IngestSupervisor};
