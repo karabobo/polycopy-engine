@@ -1,0 +1,142 @@
+{
+  "account": {
+    "label": "controlled-copy-account",
+    "signature_type": "gnosis_safe",
+    "funder_address": "0x0000000000000000000000000000000000000000"
+  },
+  "leaders": [
+    {
+      "label": "leader-01-5usdc",
+      "enabled": true,
+      "addresses": [
+        "0x0000000000000000000000000000000000000001"
+      ],
+      "policy": {
+        "max_signal_age_seconds": 3,
+        "decision_window_seconds": 3,
+        "price_tolerance_bps": 300,
+        "tick_size": "0.01",
+        "min_price": "0.01",
+        "max_price": "0.85",
+        "max_order_notional": "5",
+        "min_leader_trade_size": "0",
+        "rolling_budget_usdc": "20",
+        "budget_window_seconds": 600
+      }
+    },
+    {
+      "label": "leader-02-5usdc",
+      "enabled": true,
+      "addresses": [
+        "0x0000000000000000000000000000000000000002"
+      ],
+      "policy": {
+        "max_signal_age_seconds": 3,
+        "decision_window_seconds": 3,
+        "price_tolerance_bps": 300,
+        "tick_size": "0.01",
+        "min_price": "0.01",
+        "max_price": "0.85",
+        "max_order_notional": "5",
+        "min_leader_trade_size": "0",
+        "rolling_budget_usdc": "20",
+        "budget_window_seconds": 600
+      }
+    },
+    {
+      "label": "leader-03-1usdc",
+      "enabled": true,
+      "addresses": [
+        "0x0000000000000000000000000000000000000003"
+      ],
+      "policy": {
+        "max_signal_age_seconds": 3,
+        "decision_window_seconds": 3,
+        "price_tolerance_bps": 300,
+        "tick_size": "0.01",
+        "min_price": "0.01",
+        "max_price": "0.70",
+        "max_order_notional": "1",
+        "min_leader_trade_size": "0",
+        "rolling_budget_usdc": "4",
+        "budget_window_seconds": 600
+      }
+    },
+    {
+      "label": "leader-04-1usdc",
+      "enabled": true,
+      "addresses": [
+        "0x0000000000000000000000000000000000000004"
+      ],
+      "policy": {
+        "max_signal_age_seconds": 3,
+        "decision_window_seconds": 3,
+        "price_tolerance_bps": 300,
+        "tick_size": "0.01",
+        "min_price": "0.01",
+        "max_price": "0.70",
+        "max_order_notional": "1",
+        "min_leader_trade_size": "0",
+        "rolling_budget_usdc": "4",
+        "budget_window_seconds": 600
+      }
+    },
+    {
+      "label": "leader-05-1usdc",
+      "enabled": true,
+      "addresses": [
+        "0x0000000000000000000000000000000000000005"
+      ],
+      "policy": {
+        "max_signal_age_seconds": 3,
+        "decision_window_seconds": 3,
+        "price_tolerance_bps": 300,
+        "tick_size": "0.01",
+        "min_price": "0.01",
+        "max_price": "0.70",
+        "max_order_notional": "1",
+        "min_leader_trade_size": "0",
+        "rolling_budget_usdc": "4",
+        "budget_window_seconds": 600
+      }
+    },
+    {
+      "label": "leader-06-1usdc",
+      "enabled": true,
+      "addresses": [
+        "0x0000000000000000000000000000000000000006"
+      ],
+      "policy": {
+        "max_signal_age_seconds": 3,
+        "decision_window_seconds": 3,
+        "price_tolerance_bps": 300,
+        "tick_size": "0.01",
+        "min_price": "0.01",
+        "max_price": "0.70",
+        "max_order_notional": "1",
+        "min_leader_trade_size": "0",
+        "rolling_budget_usdc": "6",
+        "budget_window_seconds": 600
+      }
+    },
+    {
+      "label": "leader-07-1usdc",
+      "enabled": true,
+      "addresses": [
+        "0x0000000000000000000000000000000000000007"
+      ],
+      "policy": {
+        "max_signal_age_seconds": 3,
+        "decision_window_seconds": 3,
+        "price_tolerance_bps": 300,
+        "tick_size": "0.01",
+        "min_price": "0.01",
+        "max_price": "0.70",
+        "max_order_notional": "1",
+        "min_leader_trade_size": "0",
+        "rolling_budget_usdc": "4",
+        "budget_window_seconds": 600
+      }
+    }
+  ]
+}

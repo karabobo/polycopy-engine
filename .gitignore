@@ -37,3 +37,9 @@
 /vendor/polymarket_client_sdk_v2/
 # Build products from an occasional standalone vendored-SDK test run.
 /vendor/polymarket_client_sdk_v2_source/target/
+
+# Live copy-trading configuration: real Leader and funder addresses. Publishing
+# them hands over both the screening pipeline's output and an on-chain account
+# that can be watched -- and front-run -- trade by trade. The example beside it
+# carries every tuning value with the addresses zeroed.
+/deploy/trading-config.json

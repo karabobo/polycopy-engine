@@ -57,6 +57,10 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
+use crate::copytrading::persistent::{
+    MAX_BUDGET_WINDOW_SECONDS, MIN_BUDGET_WINDOW_SECONDS,
+};
+
 pub const CONFIG_APPLIED_PREFIX: &str = "CONFIG_APPLIED: ";
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -96,6 +100,14 @@ pub struct LeaderPolicyInput {
     pub max_price: String,
     pub max_order_notional: String,
     pub min_leader_trade_size: String,
+    /// Optional per-Leader rolling budget. Absent means this Leader is bound
+    /// only by the account ceiling -- the behaviour every Leader had before
+    /// this field existed, so omitting it changes nothing.
+    #[serde(default)]
+    pub rolling_budget_usdc: Option<String>,
+    /// Window for that budget. Absent falls back to the account window.
+    #[serde(default)]
+    pub budget_window_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -474,8 +486,9 @@ async fn insert_policy(
     sqlx::query(
         "INSERT INTO leader_policy \
          (leader_id, max_signal_age_seconds, decision_window_seconds, price_tolerance_bps, \
-          tick_size, min_price, max_price, max_order_notional, min_leader_trade_size) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          tick_size, min_price, max_price, max_order_notional, min_leader_trade_size, \
+          rolling_budget_usdc, budget_window_seconds) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(leader_id)
     .bind(policy.max_signal_age_seconds)
@@ -486,6 +499,8 @@ async fn insert_policy(
     .bind(&policy.max_price)
     .bind(&policy.max_order_notional)
     .bind(&policy.min_leader_trade_size)
+    .bind(&policy.rolling_budget_usdc)
+    .bind(policy.budget_window_seconds)
     .execute(&mut **tx)
     .await
     .map_err(ConfigError::Database)?;
@@ -498,9 +513,21 @@ async fn update_policy_if_changed(
     leader_id: i64,
     policy: &NormalizedPolicy,
 ) -> Result<bool, ConfigError> {
-    let current: Option<(i64, i64, i64, String, String, String, String, String)> = sqlx::query_as(
+    let current: Option<(
+        i64,
+        i64,
+        i64,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+    )> = sqlx::query_as(
         "SELECT max_signal_age_seconds, decision_window_seconds, price_tolerance_bps, \
-         tick_size, min_price, max_price, max_order_notional, min_leader_trade_size \
+         tick_size, min_price, max_price, max_order_notional, min_leader_trade_size, \
+         rolling_budget_usdc, budget_window_seconds \
          FROM leader_policy WHERE leader_id = ?",
     )
     .bind(leader_id)
@@ -517,6 +544,8 @@ async fn update_policy_if_changed(
         policy.max_price.clone(),
         policy.max_order_notional.clone(),
         policy.min_leader_trade_size.clone(),
+        policy.rolling_budget_usdc.clone(),
+        policy.budget_window_seconds,
     );
     if current.as_ref() == Some(&desired) {
         return Ok(false);
@@ -527,6 +556,7 @@ async fn update_policy_if_changed(
             "UPDATE leader_policy SET max_signal_age_seconds = ?, decision_window_seconds = ?, \
              price_tolerance_bps = ?, tick_size = ?, min_price = ?, max_price = ?, \
              max_order_notional = ?, min_leader_trade_size = ?, \
+             rolling_budget_usdc = ?, budget_window_seconds = ?, \
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE leader_id = ?",
         )
         .bind(policy.max_signal_age_seconds)
@@ -537,6 +567,8 @@ async fn update_policy_if_changed(
         .bind(&policy.max_price)
         .bind(&policy.max_order_notional)
         .bind(&policy.min_leader_trade_size)
+        .bind(&policy.rolling_budget_usdc)
+        .bind(policy.budget_window_seconds)
         .bind(leader_id)
         .execute(&mut **tx)
         .await
@@ -556,6 +588,8 @@ struct NormalizedPolicy {
     max_price: String,
     max_order_notional: String,
     min_leader_trade_size: String,
+    rolling_budget_usdc: Option<String>,
+    budget_window_seconds: Option<i64>,
 }
 
 fn normalize_policy(
@@ -595,6 +629,28 @@ fn normalize_policy(
         return Err(ConfigError::InvalidPolicyField("min_leader_trade_size"));
     }
 
+    // A per-Leader budget must be a real allowance, and its window must be
+    // one the runtime will accept -- rejecting it here means an operator finds
+    // out at apply time rather than by watching a Leader silently never trade.
+    let rolling_budget_usdc = match policy.rolling_budget_usdc.as_deref() {
+        None => None,
+        Some(raw) => {
+            Some(parse_positive_decimal(raw, "rolling_budget_usdc")?.to_string())
+        }
+    };
+    if let Some(seconds) = policy.budget_window_seconds {
+        let seconds = u64::try_from(seconds)
+            .map_err(|_| ConfigError::InvalidPolicyField("budget_window_seconds"))?;
+        if !(MIN_BUDGET_WINDOW_SECONDS..=MAX_BUDGET_WINDOW_SECONDS).contains(&seconds) {
+            return Err(ConfigError::InvalidPolicyField("budget_window_seconds"));
+        }
+    }
+    // A window without a budget silently does nothing; say so rather than
+    // accept a config whose author plainly meant to limit something.
+    if policy.budget_window_seconds.is_some() && rolling_budget_usdc.is_none() {
+        return Err(ConfigError::InvalidPolicyField("budget_window_seconds"));
+    }
+
     Ok(NormalizedPolicy {
         max_signal_age_seconds: policy.max_signal_age_seconds,
         decision_window_seconds: policy.decision_window_seconds,
@@ -604,6 +660,8 @@ fn normalize_policy(
         max_price: max_price.to_string(),
         max_order_notional: max_order_notional.to_string(),
         min_leader_trade_size: min_leader_trade_size.to_string(),
+        rolling_budget_usdc,
+        budget_window_seconds: policy.budget_window_seconds,
     })
 }
 
@@ -768,6 +826,8 @@ mod tests {
             max_price: "0.99".to_owned(),
             max_order_notional: max_order_notional.to_owned(),
             min_leader_trade_size: "0".to_owned(),
+            rolling_budget_usdc: None,
+            budget_window_seconds: None,
         }
     }
 

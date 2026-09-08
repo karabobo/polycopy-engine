@@ -32,7 +32,23 @@ pub const BACKFILL_SECONDS_ENV: &str = "POLYCOPY_PERSISTENT_BACKFILL_EVERY_SECON
 /// per-leader policy remain independent lower-or-equal gates; this merely
 /// prevents an accidental configuration from expanding live risk without a
 /// reviewed code change.
-pub const MAX_PERSISTENT_ORDER_NOTIONAL_USDC: Decimal = Decimal::from_parts(50, 0, 0, false, 0);
+/// Shortest budget window an operator may set. Below a minute the window
+/// stops bounding anything useful: a burst inside one tick would clear it.
+pub const MIN_BUDGET_WINDOW_SECONDS: u64 = 60;
+
+/// Longest budget window. A day is the coarsest ceiling that still resets
+/// often enough for an operator to reason about, and was the only value this
+/// field previously accepted.
+pub const MAX_BUDGET_WINDOW_SECONDS: u64 = 86_400;
+
+/// Runtime ceiling on a single order, independent of anything a config file
+/// says. Five USDC is the reviewed figure; it was briefly fifty, which left
+/// the cap ten times looser than the decision behind it while a test in this
+/// same file still asserted five. Headroom is the wrong instinct here: a cap
+/// exists to bound the worst case, so one set well above what the operator
+/// intends to do stops bounding anything short of catastrophe. Raising it
+/// should cost a code change and a redeploy.
+pub const MAX_PERSISTENT_ORDER_NOTIONAL_USDC: Decimal = Decimal::from_parts(5, 0, 0, false, 0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistentRuntimeConfig {
@@ -92,7 +108,10 @@ impl PersistentRuntimeConfig {
             && max_order_notional <= MAX_PERSISTENT_ORDER_NOTIONAL_USDC)
         {
             return Err(PersistentError::Config(
-                "persistent max order notional must be > 0 and <= 50 USDC".to_owned(),
+                format!(
+                    "persistent max order notional must be > 0 and \
+                     <= {MAX_PERSISTENT_ORDER_NOTIONAL_USDC} USDC"
+                ),
             ));
         }
         let rolling_budget = parse_decimal(rolling_budget, ROLLING_BUDGET_ENV)?;
@@ -101,10 +120,21 @@ impl PersistentRuntimeConfig {
                 "persistent rolling budget must be greater than 0 USDC".to_owned(),
             ));
         }
-        if budget_window_seconds != 86_400 {
-            return Err(PersistentError::Config(
-                "persistent budget window must be exactly 86400 seconds".to_owned(),
-            ));
+        // A single permitted value made this control unusable for the markets
+        // it guards. Five-minute markets settle and recycle capital about
+        // seventy times a day, so a 24-hour window bounds turnover while the
+        // notional actually exposed at any instant stays two orders of
+        // magnitude below it -- measured on this account: $17 peak concurrent
+        // against $141 of daily turnover. An operator who wants the budget to
+        // bound exposure rather than turnover needs a window near the holding
+        // period; one who wants a daily spend ceiling keeps 86400.
+        if !(MIN_BUDGET_WINDOW_SECONDS..=MAX_BUDGET_WINDOW_SECONDS)
+            .contains(&budget_window_seconds)
+        {
+            return Err(PersistentError::Config(format!(
+                "persistent budget window must be between {MIN_BUDGET_WINDOW_SECONDS} \
+                 and {MAX_BUDGET_WINDOW_SECONDS} seconds"
+            )));
         }
         if tick_seconds == 0 || backfill_every_seconds == 0 {
             return Err(PersistentError::Config(
@@ -472,8 +502,8 @@ pub async fn reserve_budget_and_mark_submitting(
         .map_err(db_err)?;
 
     let result: Result<(), PersistentError> = async {
-        let row: (i64, Option<String>, Option<String>, String) = sqlx::query_as(
-            "SELECT account_id, decision_deadline_at, planned_notional_usdc, status \
+        let row: (i64, Option<String>, Option<String>, String, i64) = sqlx::query_as(
+            "SELECT account_id, decision_deadline_at, planned_notional_usdc, status, leader_id \
              FROM copy_intents WHERE id = ?",
         )
         .bind(intent_id)
@@ -538,6 +568,58 @@ pub async fn reserve_budget_and_mark_submitting(
             });
         }
 
+        let leader_id = row.4;
+        // A Leader with no budget of its own is bound only by the account
+        // ceiling, which is how every Leader behaved before this existed.
+        let leader_budget: Option<(Option<String>, Option<i64>)> = sqlx::query_as(
+            "SELECT rolling_budget_usdc, budget_window_seconds \
+             FROM leader_policy WHERE leader_id = ?",
+        )
+        .bind(leader_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        if let Some((Some(budget_text), window_seconds)) = leader_budget {
+            let leader_cap = budget_text
+                .parse::<Decimal>()
+                .map_err(|_| PersistentError::MalformedBudgetState)?;
+            if leader_cap <= Decimal::ZERO {
+                return Err(PersistentError::MalformedBudgetState);
+            }
+            let leader_window = window_seconds
+                .filter(|seconds| *seconds > 0)
+                .map(|seconds| seconds as u64)
+                .unwrap_or_else(|| config.budget_window.as_secs());
+            let leader_cutoff = now - chrono::Duration::seconds(leader_window as i64);
+            let leader_rows: Vec<String> = sqlx::query_scalar(
+                "SELECT amount_usdc FROM persistent_budget_reservations \
+                 WHERE leader_id = ? AND state = 'reserved' AND reserved_at >= ?",
+            )
+            .bind(leader_id)
+            .bind(leader_cutoff.to_rfc3339_opts(SecondsFormat::Millis, true))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(db_err)?;
+            let mut leader_used = Decimal::ZERO;
+            for entry in leader_rows {
+                let existing = entry
+                    .parse::<Decimal>()
+                    .map_err(|_| PersistentError::MalformedBudgetState)?;
+                if existing <= Decimal::ZERO {
+                    return Err(PersistentError::MalformedBudgetState);
+                }
+                leader_used += existing;
+            }
+            if leader_used + amount > leader_cap {
+                return Err(PersistentError::LeaderBudgetExhausted {
+                    leader_id,
+                    used: leader_used,
+                    requested: amount,
+                    cap: leader_cap,
+                });
+            }
+        }
+
         let cutoff = now - chrono::Duration::seconds(config.budget_window.as_secs() as i64);
         let rows: Vec<String> = sqlx::query_scalar(
             "SELECT amount_usdc FROM persistent_budget_reservations \
@@ -582,11 +664,12 @@ pub async fn reserve_budget_and_mark_submitting(
         }
         sqlx::query(
             "INSERT INTO persistent_budget_reservations \
-             (order_attempt_id, account_id, amount_usdc, reserved_at, state) \
-             VALUES (?, ?, ?, ?, 'reserved')",
+             (order_attempt_id, account_id, leader_id, amount_usdc, reserved_at, state) \
+             VALUES (?, ?, ?, ?, ?, 'reserved')",
         )
         .bind(attempt_id)
         .bind(config.account_id)
+        .bind(leader_id)
         .bind(amount.to_string())
         .bind(now.to_rfc3339_opts(SecondsFormat::Millis, true))
         .execute(&mut *conn)
@@ -903,6 +986,16 @@ pub enum PersistentError {
         requested: Decimal,
         cap: Decimal,
     },
+    /// One Leader has spent its own budget. Deliberately not an account-level
+    /// fault: the other Leaders are unaffected, and halting the process for
+    /// one of them is what let a single high-frequency Leader take the whole
+    /// portfolio off the market for the rest of the day.
+    LeaderBudgetExhausted {
+        leader_id: i64,
+        used: Decimal,
+        requested: Decimal,
+        cap: Decimal,
+    },
 }
 
 impl PersistentError {
@@ -914,7 +1007,13 @@ impl PersistentError {
             | Self::ConfigMismatch
             | Self::AlreadyConfigured => EXIT_CONFIG,
             Self::UnresolvedRecovery => EXIT_UNRESOLVED_RECOVERY,
-            Self::MalformedBudgetState | Self::BudgetExceeded { .. } => EXIT_BUDGET_STATE,
+            // LeaderBudgetExhausted shares the fail-closed exit as a backstop
+            // only. The caller is expected to intercept it and reject the one
+            // intent; reaching here means nobody did, and halting is the safe
+            // reading of an unhandled budget condition.
+            Self::MalformedBudgetState
+            | Self::BudgetExceeded { .. }
+            | Self::LeaderBudgetExhausted { .. } => EXIT_BUDGET_STATE,
             Self::Database(_)
             | Self::FuseNotOpen
             | Self::InvalidAttemptTransition
@@ -955,6 +1054,16 @@ impl fmt::Display for PersistentError {
             } => write!(
                 formatter,
                 "persistent rolling budget exceeded: used={used} requested={requested} cap={cap}"
+            ),
+            Self::LeaderBudgetExhausted {
+                leader_id,
+                used,
+                requested,
+                cap,
+            } => write!(
+                formatter,
+                "leader {leader_id} rolling budget exhausted: \
+                 used={used} requested={requested} cap={cap}"
             ),
         }
     }
@@ -1018,9 +1127,10 @@ mod tests {
 
         assert_eq!(
             PersistentRuntimeConfig::from_values(1, true, "1", "5.01", "50", 86_400, 1, 60),
-            Err(PersistentError::Config(
-                "persistent max order notional must be > 0 and <= 50 USDC".to_owned()
-            ))
+            Err(PersistentError::Config(format!(
+                "persistent max order notional must be > 0 and \
+                 <= {MAX_PERSISTENT_ORDER_NOTIONAL_USDC} USDC"
+            )))
         );
     }
 
@@ -1090,6 +1200,218 @@ mod tests {
                 .await
                 .expect("attempt id");
         (intent_id, attempt_id)
+    }
+
+    /// Like `seed_attempt`, but for a named Leader. The per-Leader budget is
+    /// only meaningful with more than one Leader in play.
+    async fn seed_attempt_for_leader(
+        db: &SqlitePool,
+        leader_id: i64,
+        event_key: &str,
+        notional: &str,
+        deadline: DateTime<Utc>,
+    ) -> (i64, i64) {
+        let event_id: i64 = sqlx::query_scalar(
+            "INSERT INTO leader_events \
+             (canonical_event_key, leader_id, condition_id, token_id, outcome_index, side, size, price, occurred_at, observed_at) \
+             VALUES (?, ?, '0xcond', '123456', 0, 'BUY', '1', '1', ?, ?) RETURNING id",
+        )
+        .bind(event_key)
+        .bind(leader_id)
+        .bind(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true))
+        .bind(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true))
+        .fetch_one(db)
+        .await
+        .expect("event");
+        let intent_id: i64 = sqlx::query_scalar(
+            "INSERT INTO copy_intents \
+             (event_id, account_id, leader_id, token_id, side, config_snapshot_json, config_snapshot_hash, \
+              planned_qty, planned_price, planned_notional_usdc, reserved_qty, shard_scheme_version, lane_count, shard_id, status, decision_deadline_at) \
+             VALUES (?, 1, ?, '123456', 'BUY', '{}', 'hash', ?, '1', ?, ?, 1, 1, 0, 'in_progress', ?) RETURNING id",
+        )
+        .bind(event_id)
+        .bind(leader_id)
+        .bind(notional)
+        .bind(notional)
+        .bind(notional)
+        .bind(deadline.to_rfc3339_opts(SecondsFormat::Millis, true))
+        .fetch_one(db)
+        .await
+        .expect("intent");
+        let envelope = PreparedOrderEnvelope {
+            token_id: "123456".to_owned(),
+            side: "BUY".to_owned(),
+            price: "1".to_owned(),
+            size: notional.to_owned(),
+            salt: intent_id as u64,
+            order_type: "FAK".to_owned(),
+            expected_taker_order_id: format!("0x{intent_id:x}"),
+            signed_order_json: "{}".to_owned(),
+        };
+        load_or_prepare_attempt(db, intent_id, 1, &envelope)
+            .await
+            .expect("attempt");
+        let attempt_id: i64 =
+            sqlx::query_scalar("SELECT id FROM order_attempts WHERE intent_id = ?")
+                .bind(intent_id)
+                .fetch_one(db)
+                .await
+                .expect("attempt id");
+        (intent_id, attempt_id)
+    }
+
+    async fn seed_second_leader(db: &SqlitePool) {
+        sqlx::query("INSERT INTO leader_config (id, label, enabled) VALUES (2, 'leader-two', 1)")
+            .execute(db)
+            .await
+            .expect("second leader");
+    }
+
+    async fn set_leader_budget(db: &SqlitePool, leader_id: i64, budget: &str, window: Option<i64>) {
+        sqlx::query(
+            "INSERT INTO leader_policy \
+             (leader_id, max_signal_age_seconds, decision_window_seconds, price_tolerance_bps, \
+              tick_size, min_price, max_price, max_order_notional, min_leader_trade_size, \
+              rolling_budget_usdc, budget_window_seconds) \
+             VALUES (?, 3, 3, 100, '0.01', '0.01', '0.99', '5', '0', ?, ?)",
+        )
+        .bind(leader_id)
+        .bind(budget)
+        .bind(window)
+        .execute(db)
+        .await
+        .expect("leader budget");
+    }
+
+    #[tokio::test]
+    async fn one_leader_exhausting_its_budget_leaves_the_others_trading() {
+        // The whole point. Before per-Leader budgets a single high-frequency
+        // Leader consumed the shared ceiling and took the entire portfolio off
+        // the market for the rest of the day -- which meant the day's fills
+        // were chosen by whichever Leader happened to fire first.
+        let db = TestDb::new().await;
+        seed_base(&db).await;
+        seed_second_leader(&db).await;
+        set_leader_budget(&db, 1, "1", None).await;
+        set_leader_budget(&db, 2, "1", None).await;
+        let config = PersistentRuntimeConfig::from_values(1, true, "1,2", "5", "50", 86_400, 1, 60)
+            .expect("config");
+        init_config(&db, &config).await.expect("config persisted");
+        let now = Utc::now();
+        let deadline = now + chrono::Duration::seconds(60);
+
+        let (first_intent, first_attempt) =
+            seed_attempt_for_leader(&db, 1, "one-a", "1", deadline).await;
+        reserve_budget_and_mark_submitting(&db, &config, first_intent, first_attempt, now)
+            .await
+            .expect("leader one spends its budget");
+
+        let (second_intent, second_attempt) =
+            seed_attempt_for_leader(&db, 1, "one-b", "1", deadline).await;
+        let exhausted =
+            reserve_budget_and_mark_submitting(&db, &config, second_intent, second_attempt, now)
+                .await;
+        assert!(matches!(
+            exhausted,
+            Err(PersistentError::LeaderBudgetExhausted { leader_id: 1, .. })
+        ));
+
+        let (other_intent, other_attempt) =
+            seed_attempt_for_leader(&db, 2, "two-a", "1", deadline).await;
+        reserve_budget_and_mark_submitting(&db, &config, other_intent, other_attempt, now)
+            .await
+            .expect("leader two is unaffected");
+    }
+
+    #[tokio::test]
+    async fn a_leader_without_a_budget_is_bound_only_by_the_account_ceiling() {
+        // Applying the migration must change nothing until an operator opts in.
+        let db = TestDb::new().await;
+        seed_base(&db).await;
+        let config = PersistentRuntimeConfig::from_values(1, true, "1", "5", "50", 86_400, 1, 60)
+            .expect("config");
+        init_config(&db, &config).await.expect("config persisted");
+        let now = Utc::now();
+        let deadline = now + chrono::Duration::seconds(60);
+
+        for key in ["none-a", "none-b", "none-c"] {
+            let (intent_id, attempt_id) =
+                seed_attempt_for_leader(&db, 1, key, "1", deadline).await;
+            reserve_budget_and_mark_submitting(&db, &config, intent_id, attempt_id, now)
+                .await
+                .expect("no per-leader limit applies");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_account_ceiling_still_halts_even_when_leader_budgets_allow_it() {
+        // The account budget stays fail-closed: per-Leader limits are an extra
+        // gate, never a way around the shared one.
+        let db = TestDb::new().await;
+        seed_base(&db).await;
+        set_leader_budget(&db, 1, "50", None).await;
+        let config = PersistentRuntimeConfig::from_values(1, true, "1", "1", "1", 86_400, 1, 60)
+            .expect("config");
+        init_config(&db, &config).await.expect("config persisted");
+        let now = Utc::now();
+        let deadline = now + chrono::Duration::seconds(60);
+
+        let (first_intent, first_attempt) =
+            seed_attempt_for_leader(&db, 1, "cap-a", "1", deadline).await;
+        reserve_budget_and_mark_submitting(&db, &config, first_intent, first_attempt, now)
+            .await
+            .expect("first fits the account ceiling");
+
+        let (second_intent, second_attempt) =
+            seed_attempt_for_leader(&db, 1, "cap-b", "1", deadline).await;
+        assert!(matches!(
+            reserve_budget_and_mark_submitting(&db, &config, second_intent, second_attempt, now)
+                .await,
+            Err(PersistentError::BudgetExceeded { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_leader_budget_rolls_off_with_its_own_window() {
+        // A Leader may hold a window shorter than the account's -- that is the
+        // point of allowing one at all, since a 24-hour window bounds turnover
+        // rather than exposure on markets that settle in five minutes.
+        let db = TestDb::new().await;
+        seed_base(&db).await;
+        set_leader_budget(&db, 1, "1", Some(60)).await;
+        let config = PersistentRuntimeConfig::from_values(1, true, "1", "5", "50", 86_400, 1, 60)
+            .expect("config");
+        init_config(&db, &config).await.expect("config persisted");
+        let now = Utc::now();
+
+        let (first_intent, first_attempt) =
+            seed_attempt_for_leader(&db, 1, "roll-a", "1", now + chrono::Duration::seconds(60))
+                .await;
+        reserve_budget_and_mark_submitting(&db, &config, first_intent, first_attempt, now)
+            .await
+            .expect("spends the leader budget");
+
+        let later = now + chrono::Duration::seconds(120);
+        let (second_intent, second_attempt) =
+            seed_attempt_for_leader(&db, 1, "roll-b", "1", later + chrono::Duration::seconds(60))
+                .await;
+        reserve_budget_and_mark_submitting(&db, &config, second_intent, second_attempt, later)
+            .await
+            .expect("the earlier reservation has rolled out of the 60s window");
+    }
+
+    #[tokio::test]
+    async fn the_budget_window_accepts_a_range_instead_of_one_value() {
+        // The single permitted value is what made this control unusable for
+        // five-minute markets.
+        assert!(PersistentRuntimeConfig::from_values(1, true, "1", "1", "50", 60, 1, 60).is_ok());
+        assert!(
+            PersistentRuntimeConfig::from_values(1, true, "1", "1", "50", 86_400, 1, 60).is_ok()
+        );
+        assert!(PersistentRuntimeConfig::from_values(1, true, "1", "1", "50", 30, 1, 60).is_err());
+        assert!(
+            PersistentRuntimeConfig::from_values(1, true, "1", "1", "50", 90_000, 1, 60).is_err()
+        );
     }
 
     #[tokio::test]
