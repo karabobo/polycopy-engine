@@ -9,6 +9,7 @@ use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 
 use super::{address_resolver::AddressResolver, normalize::NormalizedTrade, TradeSide};
+use crate::copytrading::db::{is_sqlite_busy, BUSY_RETRY_DELAYS};
 
 /// Canonicalizes an outcome token ID before it joins the canonical event
 /// identity. The activity feed occasionally quotes the same U256 with
@@ -85,6 +86,46 @@ impl fmt::Display for ProcessOutcome {
 /// this one function, so the activation rule and the insert path can never
 /// drift between sources.
 pub async fn apply_trade(
+    pool: &SqlitePool,
+    resolver: &AddressResolver,
+    trade: &NormalizedTrade,
+    source: &str,
+    source_identifier: &str,
+    raw_payload: &str,
+) -> ProcessOutcome {
+    for (attempt, delay) in BUSY_RETRY_DELAYS.iter().enumerate() {
+        let outcome = apply_trade_once(
+            pool,
+            resolver,
+            trade,
+            source,
+            source_identifier,
+            raw_payload,
+        )
+        .await;
+        if matches!(&outcome, ProcessOutcome::DatabaseError(error) if is_sqlite_busy(error)) {
+            eprintln!(
+                "DB_BUSY: component=ingest source={source} retry={} delay_ms={}",
+                attempt + 1,
+                delay.as_millis()
+            );
+            tokio::time::sleep(*delay).await;
+            continue;
+        }
+        return outcome;
+    }
+    apply_trade_once(
+        pool,
+        resolver,
+        trade,
+        source,
+        source_identifier,
+        raw_payload,
+    )
+    .await
+}
+
+async fn apply_trade_once(
     pool: &SqlitePool,
     resolver: &AddressResolver,
     trade: &NormalizedTrade,
@@ -372,6 +413,41 @@ mod tests {
             event_count, 1,
             "a true replay of the identical trade must not double-count"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_ws_and_backfill_ingest_serializes_without_database_error() {
+        let db = TestDb::new().await;
+        sqlx::query("INSERT INTO leader_config (id, label, activation_at) VALUES (1, 'leader-one', '2020-01-01T00:00:00.000Z')")
+            .execute(&*db)
+            .await
+            .unwrap();
+        let resolver = AddressResolver::new();
+        resolver.reload([("0xleader".to_owned(), 1)]);
+        let ws_trade = trade("5", "0xconcurrent-ws");
+        let rest_trade = trade("6", "0xconcurrent-rest");
+
+        let (ws, rest) = tokio::join!(
+            apply_trade(
+                &db,
+                &resolver,
+                &ws_trade,
+                "activity_ws",
+                "0xconcurrent-ws",
+                "ws"
+            ),
+            apply_trade(
+                &db,
+                &resolver,
+                &rest_trade,
+                "activity_backfill",
+                "0xconcurrent-rest",
+                "rest",
+            ),
+        );
+
+        assert!(matches!(ws, ProcessOutcome::Ingested { .. }));
+        assert!(matches!(rest, ProcessOutcome::Ingested { .. }));
     }
 
     #[tokio::test]

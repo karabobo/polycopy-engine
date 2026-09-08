@@ -5,9 +5,10 @@
 
 #[cfg(feature = "copy_run")]
 mod live {
-    use std::{collections::BTreeSet, env, fmt};
+    use std::{collections::BTreeSet, env, fmt, future::Future};
 
     use chrono::Utc;
+    use polycopy_engine::copytrading::db::{is_sqlite_busy, BUSY_RETRY_DELAYS};
     use polycopy_engine::{
         copytrading::{
             assert_persistent_startup_clear, ensure_fuse_clear, execute_one_intent_with_marker,
@@ -90,20 +91,48 @@ mod live {
                 tokio::time::sleep(config.tick).await;
                 continue;
             }
-            ensure_fuse_clear(&pool, config.account_id)
-                .await
-                .map_err(RunnerError::Persistent)?;
-            polycopy_engine::copytrading::plan_next_batch(&pool, config.account_id)
-                .await
-                .map_err(|error| RunnerError::Other(error.to_string()))?;
-            let intent_ids = runnable_intents_for_allowed_leaders(
-                &pool,
-                config.account_id,
-                &config.allowed_leader_ids,
-                config.max_order_notional,
-            )
+            if let Err(error) = retry_local_busy("ensure_fuse_clear", || {
+                ensure_fuse_clear(&pool, config.account_id)
+            })
             .await
-            .map_err(RunnerError::Persistent)?;
+            {
+                if is_sqlite_busy(&error.to_string()) {
+                    log_busy_pause("ensure_fuse_clear", &error.to_string());
+                    tokio::time::sleep(config.tick).await;
+                    continue;
+                }
+                return Err(RunnerError::Persistent(error));
+            }
+            if let Err(error) = retry_local_busy("plan_next_batch", || {
+                polycopy_engine::copytrading::plan_next_batch(&pool, config.account_id)
+            })
+            .await
+            {
+                if is_sqlite_busy(&error.to_string()) {
+                    log_busy_pause("plan_next_batch", &error.to_string());
+                    tokio::time::sleep(config.tick).await;
+                    continue;
+                }
+                return Err(RunnerError::Other(error.to_string()));
+            }
+            let intent_ids = match retry_local_busy("list_runnable_intents", || {
+                runnable_intents_for_allowed_leaders(
+                    &pool,
+                    config.account_id,
+                    &config.allowed_leader_ids,
+                    config.max_order_notional,
+                )
+            })
+            .await
+            {
+                Ok(ids) => ids,
+                Err(error) if is_sqlite_busy(&error.to_string()) => {
+                    log_busy_pause("list_runnable_intents", &error.to_string());
+                    tokio::time::sleep(config.tick).await;
+                    continue;
+                }
+                Err(error) => return Err(RunnerError::Persistent(error)),
+            };
 
             for intent_id in intent_ids {
                 let outcome = execute_one_intent_with_marker(
@@ -164,6 +193,32 @@ mod live {
         pause_persistent_fuse(pool, account_id, reason, "copy_persistent")
             .await
             .map_err(RunnerError::Persistent)
+    }
+
+    async fn retry_local_busy<T, E, F, Fut>(operation: &str, mut work: F) -> Result<T, E>
+    where
+        E: std::fmt::Display,
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+    {
+        for (attempt, delay) in BUSY_RETRY_DELAYS.iter().enumerate() {
+            match work().await {
+                Err(error) if is_sqlite_busy(&error.to_string()) => {
+                    eprintln!(
+                        "DB_BUSY: component=runner operation={operation} retry={} delay_ms={}",
+                        attempt + 1,
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(*delay).await;
+                }
+                result => return result,
+            }
+        }
+        work().await
+    }
+
+    fn log_busy_pause(operation: &str, error: &str) {
+        eprintln!("DB_BUSY: component=runner operation={operation} action=pause detail={error}");
     }
 
     async fn verify_single_allowed_leader_scope(

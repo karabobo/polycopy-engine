@@ -28,6 +28,12 @@ pub const BUDGET_WINDOW_ENV: &str = "POLYCOPY_PERSISTENT_BUDGET_WINDOW_SECONDS";
 pub const TICK_SECONDS_ENV: &str = "POLYCOPY_PERSISTENT_TICK_SECONDS";
 pub const BACKFILL_SECONDS_ENV: &str = "POLYCOPY_PERSISTENT_BACKFILL_EVERY_SECONDS";
 
+/// Absolute upper bound for a persistent-copy order. The environment and
+/// per-leader policy remain independent lower-or-equal gates; this merely
+/// prevents an accidental configuration from expanding live risk without a
+/// reviewed code change.
+pub const MAX_PERSISTENT_ORDER_NOTIONAL_USDC: Decimal = Decimal::from_parts(50, 0, 0, false, 0);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistentRuntimeConfig {
     pub account_id: i64,
@@ -82,9 +88,11 @@ impl PersistentRuntimeConfig {
         }
         let allowed_leader_ids = parse_allowed_leaders(allowed_leaders)?;
         let max_order_notional = parse_decimal(max_order_notional, MAX_ORDER_NOTIONAL_ENV)?;
-        if !(max_order_notional > Decimal::ZERO && max_order_notional <= Decimal::ONE) {
+        if !(max_order_notional > Decimal::ZERO
+            && max_order_notional <= MAX_PERSISTENT_ORDER_NOTIONAL_USDC)
+        {
             return Err(PersistentError::Config(
-                "persistent max order notional must be > 0 and <= 1 USDC".to_owned(),
+                "persistent max order notional must be > 0 and <= 50 USDC".to_owned(),
             ));
         }
         let rolling_budget = parse_decimal(rolling_budget, ROLLING_BUDGET_ENV)?;
@@ -1000,6 +1008,20 @@ mod tests {
     fn cfg() -> PersistentRuntimeConfig {
         PersistentRuntimeConfig::from_values(1, true, "1", "1", "5", 86_400, 1, 60)
             .expect("valid config")
+    }
+
+    #[test]
+    fn persistent_per_order_cap_allows_five_usdc_but_rejects_any_larger_value() {
+        let at_cap = PersistentRuntimeConfig::from_values(1, true, "1", "5", "50", 86_400, 1, 60)
+            .expect("the reviewed five-USDC cap must be accepted");
+        assert_eq!(at_cap.max_order_notional, Decimal::new(5, 0));
+
+        assert_eq!(
+            PersistentRuntimeConfig::from_values(1, true, "1", "5.01", "50", 86_400, 1, 60),
+            Err(PersistentError::Config(
+                "persistent max order notional must be > 0 and <= 50 USDC".to_owned()
+            ))
+        );
     }
 
     async fn seed_base(db: &SqlitePool) {

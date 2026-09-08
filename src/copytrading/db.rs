@@ -26,6 +26,24 @@ use sqlx::{
 
 /// The blueprint's required busy timeout for every pooled connection.
 pub const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
+/// The live engine has many asynchronous producers but SQLite has one
+/// writer. Keeping one pooled connection makes that constraint explicit and
+/// serializes all in-process ledger writes before SQLite sees contention.
+pub const LIVE_POOL_MAX_CONNECTIONS: u32 = 1;
+/// Local-only operations may retry after a transient external SQLite lock.
+/// The configured SQLite busy timeout applies to each attempt.
+pub const BUSY_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(50),
+    Duration::from_millis(200),
+    Duration::from_millis(750),
+];
+
+pub fn is_sqlite_busy(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("database is locked")
+        || error.contains("database is busy")
+        || error.contains("sqlite_busy")
+}
 
 /// Opens a pooled connection to the copy-engine database at `database_path`
 /// and runs every pending migration.
@@ -51,6 +69,7 @@ pub async fn open(database_path: impl AsRef<Path>) -> Result<SqlitePool, DbError
         .busy_timeout(BUSY_TIMEOUT);
 
     SqlitePoolOptions::new()
+        .max_connections(LIVE_POOL_MAX_CONNECTIONS)
         .connect_with(options)
         .await
         .map_err(DbError::Connect)
@@ -69,6 +88,7 @@ pub async fn open_read_only(database_path: impl AsRef<Path>) -> Result<SqlitePoo
         .busy_timeout(BUSY_TIMEOUT);
 
     SqlitePoolOptions::new()
+        .max_connections(LIVE_POOL_MAX_CONNECTIONS)
         .connect_with(options)
         .await
         .map_err(DbError::Connect)
@@ -113,6 +133,35 @@ mod tests {
     use sqlx::Row as _;
 
     use super::*;
+
+    #[test]
+    fn sqlite_busy_classifier_only_matches_retryable_lock_messages() {
+        assert!(is_sqlite_busy(
+            "error returned from database: database is locked"
+        ));
+        assert!(is_sqlite_busy("SQLITE_BUSY: another writer"));
+        assert!(!is_sqlite_busy("database disk image is malformed"));
+    }
+
+    #[tokio::test]
+    async fn live_pool_serializes_second_connection_acquisition() {
+        let db = TestDb::new().await;
+        let first = db.acquire().await.expect("first connection must acquire");
+        let pool = db.pool.clone();
+        let mut second = tokio::spawn(async move { pool.acquire().await });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second)
+                .await
+                .is_err(),
+            "a one-connection live pool must queue concurrent database work"
+        );
+        drop(first);
+        second
+            .await
+            .expect("second acquisition task must not panic")
+            .expect("second connection must acquire after the first releases");
+    }
 
     // Wall-clock nanos alone collided under `cargo test`'s default thread
     // parallelism (the OS clock's actual resolution is coarser than the

@@ -3,8 +3,9 @@
 //!
 //! `plan_next_batch` reads the event ledger by cursor. It never mutates
 //! `position_lots` or sends orders (Phase 4/5). For each event past the
-//! cursor it durably records either an explainable rejection or a pending
-//! intent -- it never silently skips an event. It does **not** compute
+//! cursor it durably records an explainable rejection or pending intent for
+//! a realtime event, while REST-only audit events advance the cursor without
+//! creating an intent. It does **not** compute
 //! `planned_qty`/`planned_price`/tick-rounded limit price/TIF: the
 //! blueprint assigns that to the lane (Phase 4), because those depend on
 //! live account state and market data, not on the event alone.
@@ -59,6 +60,14 @@ pub async fn plan_next_batch_with_limit(
     let mut summary = PlanSummary::default();
 
     for event in &events {
+        // Activity REST backfill is audit/recovery input only.  It must be
+        // consumed by the planner cursor so it cannot block later WS events,
+        // but it must never become a copy intent or a synthetic rejection.
+        if !event.realtime_observed {
+            advance_cursor(&pool, account_id, event.id).await?;
+            summary.processed += 1;
+            continue;
+        }
         let decision = evaluate_event(pool, account_id, event, &schedule).await?;
 
         let mut tx = pool
@@ -115,6 +124,25 @@ pub async fn plan_next_batch_with_limit(
     }
 
     Ok(summary)
+}
+
+async fn advance_cursor(
+    pool: &SqlitePool,
+    account_id: i64,
+    event_id: i64,
+) -> Result<(), PlanError> {
+    sqlx::query(
+        "INSERT INTO planner_cursor (account_id, last_event_id) VALUES (?, ?) \
+         ON CONFLICT(account_id) DO UPDATE SET \
+         last_event_id = excluded.last_event_id, \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+    )
+    .bind(account_id)
+    .bind(event_id)
+    .execute(pool)
+    .await
+    .map_err(|error| PlanError::Database(error.to_string()))?;
+    Ok(())
 }
 
 #[derive(Debug, FromRow)]
@@ -218,14 +246,6 @@ async fn evaluate_event(
     schedule: &ExecutionSchedule,
 ) -> Result<Decision, PlanError> {
     let shard_id = shard_for(account_id, &event.token_id, schedule.lane_count);
-
-    // REST backfill is retained for durable audit and recovery, but it is not
-    // permitted to create a realtime order. This makes the safety boundary
-    // explicit rather than relying on an incidental polling delay to exceed
-    // the signal-age window.
-    if !event.realtime_observed {
-        return Ok(reject(shard_id, "REST audit event is non-executable"));
-    }
 
     let leader_enabled: Option<bool> =
         sqlx::query_scalar("SELECT enabled FROM leader_config WHERE id = ?")
@@ -841,26 +861,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rest_audit_event_is_durably_rejected_even_when_it_is_fresh() {
+    async fn rest_audit_event_advances_cursor_without_creating_an_intent() {
         let db = TestDb::new().await;
         seed_account_and_leader(&db).await;
         seed_policy(&db, 3600, "1").await;
-        let event_id = insert_event(&db, "5", &chrono::Utc::now().to_rfc3339()).await;
+        let audit_event_id = insert_event(&db, "5", &chrono::Utc::now().to_rfc3339()).await;
         sqlx::query("UPDATE leader_events SET realtime_observed = 0 WHERE id = ?")
-            .bind(event_id)
+            .bind(audit_event_id)
             .execute(&*db)
             .await
             .unwrap();
+        let realtime_event_id = insert_event(&db, "5", &chrono::Utc::now().to_rfc3339()).await;
 
         let summary = plan_next_batch(&db, 1).await.unwrap();
-        assert_eq!(summary.pending, 0);
-        assert_eq!(summary.rejected, 1);
-        let reason: String =
-            sqlx::query_scalar("SELECT rejection_reason FROM copy_intents WHERE event_id = ?")
-                .bind(event_id)
+        assert_eq!(summary.processed, 2);
+        assert_eq!(summary.pending, 1);
+        assert_eq!(summary.rejected, 0);
+        let audit_intents: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM copy_intents WHERE event_id = ?")
+                .bind(audit_event_id)
                 .fetch_one(&*db)
                 .await
                 .unwrap();
-        assert_eq!(reason, "REST audit event is non-executable");
+        assert_eq!(audit_intents, 0);
+        let realtime_intents: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM copy_intents WHERE event_id = ?")
+                .bind(realtime_event_id)
+                .fetch_one(&*db)
+                .await
+                .unwrap();
+        assert_eq!(realtime_intents, 1);
+        let cursor: i64 =
+            sqlx::query_scalar("SELECT last_event_id FROM planner_cursor WHERE account_id = 1")
+                .fetch_one(&*db)
+                .await
+                .unwrap();
+        assert_eq!(cursor, realtime_event_id);
     }
 }
