@@ -22,6 +22,11 @@ use crate::{
     },
 };
 
+/// How long after this account's own fill a zero strict balance is read as
+/// the venue trailing its matching engine rather than as balance drift.
+/// See the sell branch of `size_decision` for the measurements behind it.
+const LOT_VISIBILITY_GRACE_SECONDS: f64 = 60.0;
+
 // P0-1 architecture inversion: `Side` and `SizedDecision` are venue-side
 // order-specification primitives; their canonical home is now
 // `venue::execution_contract` so `venue::intl_clob_exec` can implement
@@ -280,13 +285,14 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
 
     let (qty, limit_price) = match claimed.side {
         Side::Sell => {
-            let leader_lot = load_position_lot(
+            let lot = load_position_lot(
                 pool,
                 claimed.account_id,
                 claimed.leader_id,
                 &claimed.token_id,
             )
             .await?;
+            let leader_lot = lot.qty;
             // A leader can sell a token that this follower never mirrored.
             // That is an expected no-op, not evidence that a strict venue
             // balance read returned a false zero. Do not issue a balance read
@@ -317,6 +323,30 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
             let sell_qty =
                 round_order_qty_down(leader_lot.min(account_sellable).max(Decimal::ZERO));
             if sell_qty <= Decimal::ZERO {
+                // A lot this account filled moments ago is not drift: the
+                // venue's balance view simply trails its own matching engine.
+                // Measured on the live ledger, a mirrored exit read the new
+                // balance successfully 2.7s after the buy filled and read
+                // zero at 1.25s -- the two outcomes differ by 1.5 seconds.
+                // Before this branch existed, that race opened a
+                // balance_drift case, and because an open case fails the
+                // startup check, one leader re-entering and exiting inside
+                // two seconds stopped copying for every leader.
+                //
+                // The grace window is deliberately far wider than any
+                // propagation delay observed, because it is not trading off
+                // against much: genuine drift does not heal on its own, so a
+                // lot still missing from the venue a minute after this
+                // account filled it will be caught by the next sell on that
+                // token or by reconcile-preflight.
+                if lot
+                    .age_seconds
+                    .is_some_and(|age| age < LOT_VISIBILITY_GRACE_SECONDS)
+                {
+                    return Ok(SizingOutcome::Rejected(
+                        "leader sell arrived before this account's own fill was visible on the venue",
+                    ));
+                }
                 // A nonzero tracked lot but no strict sellable balance is a
                 // genuine discrepancy. Unlike a missing virtual lot above,
                 // it must remain blocked for reconciliation.
@@ -583,14 +613,28 @@ async fn load_policy_snapshot(
         .map_err(|_| ExecuteError::InvalidDecimal("copy_intents.config_snapshot_json"))
 }
 
+/// A leader's virtual lot, with how long ago this account's own accounted
+/// fill wrote it. The age separates two states a bare quantity cannot: a
+/// lot the venue has genuinely lost track of, and one the venue has simply
+/// not published yet.
+struct PositionLot {
+    qty: Decimal,
+    /// Seconds since `updated_at`, measured by SQLite's clock in the same
+    /// statement that reads the row. Doing it in SQL keeps wall-clock
+    /// plumbing out of this module for a value only one branch consults.
+    /// `None` when there is no row -- there is no fill to have been late.
+    age_seconds: Option<f64>,
+}
+
 async fn load_position_lot(
     pool: &SqlitePool,
     account_id: i64,
     leader_id: i64,
     token_id: &str,
-) -> Result<Decimal, ExecuteError> {
-    let qty: Option<String> = sqlx::query_scalar(
-        "SELECT qty FROM position_lots WHERE account_id = ? AND leader_id = ? AND token_id = ?",
+) -> Result<PositionLot, ExecuteError> {
+    let row: Option<(String, Option<f64>)> = sqlx::query_as(
+        "SELECT qty, (julianday('now') - julianday(updated_at)) * 86400.0 \
+         FROM position_lots WHERE account_id = ? AND leader_id = ? AND token_id = ?",
     )
     .bind(account_id)
     .bind(leader_id)
@@ -598,11 +642,17 @@ async fn load_position_lot(
     .fetch_optional(pool)
     .await
     .map_err(|error| ExecuteError::Database(error.to_string()))?;
-    match qty {
-        Some(qty) => qty
-            .parse()
-            .map_err(|_| ExecuteError::InvalidDecimal("position_lots.qty")),
-        None => Ok(Decimal::ZERO),
+    match row {
+        Some((qty, age_seconds)) => Ok(PositionLot {
+            qty: qty
+                .parse()
+                .map_err(|_| ExecuteError::InvalidDecimal("position_lots.qty"))?,
+            age_seconds,
+        }),
+        None => Ok(PositionLot {
+            qty: Decimal::ZERO,
+            age_seconds: None,
+        }),
     }
 }
 
@@ -1507,8 +1557,11 @@ mod tests {
         let db = TestDb::new().await;
         seed_account_and_schedule(&db).await;
         seed_leader(&db, 1).await;
+        // Dated well outside the visibility grace window: a lot this old
+        // that the venue cannot see is drift, not propagation lag.
         sqlx::query(
-            "INSERT INTO position_lots (account_id, leader_id, token_id, qty) VALUES (1, 1, '123456', '5')",
+            "INSERT INTO position_lots (account_id, leader_id, token_id, qty, updated_at) \
+             VALUES (1, 1, '123456', '5', '2020-01-01T00:00:00.000Z')",
         )
         .execute(&*db)
         .await
@@ -1527,6 +1580,57 @@ mod tests {
             outcome,
             ExecutionOutcome::NeedsReconcile("computed sell quantity is not positive")
         );
+    }
+
+    /// The live failure this branch exists for: leader 2 bought and sold the
+    /// same token 2.4 seconds apart, the venue had not published the buy yet,
+    /// and the resulting balance_drift case stopped copying for all seven
+    /// leaders. A just-written lot must reject the one signal instead.
+    #[tokio::test]
+    async fn a_sell_racing_this_account_s_own_fill_is_rejected_without_opening_a_case() {
+        let db = TestDb::new().await;
+        seed_account_and_schedule(&db).await;
+        seed_leader(&db, 1).await;
+        // No explicit updated_at: the column defaults to now, which is what
+        // an accounted fill writes moments before the leader's exit arrives.
+        sqlx::query(
+            "INSERT INTO position_lots (account_id, leader_id, token_id, qty) VALUES (1, 1, '123456', '5')",
+        )
+        .execute(&*db)
+        .await
+        .unwrap();
+        let intent = seed_pending_intent(&db, 1, "123456", "SELL", "5", "0.50").await;
+        let outcome = execute_intent(
+            &db,
+            &FixedBalanceReader::new(Decimal::ZERO, Decimal::new(100, 0)),
+            &FullFillSubmitter,
+            intent,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            ExecutionOutcome::Rejected(
+                "leader sell arrived before this account's own fill was visible on the venue"
+            )
+        );
+        // The point of the change: no case, so the next startup is clear and
+        // the other leaders keep copying.
+        let open_cases: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reconciliation_cases WHERE resolved_at IS NULL",
+        )
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        assert_eq!(open_cases, 0, "a propagation race must not open a case");
+        let status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+            .bind(intent)
+            .fetch_one(&*db)
+            .await
+            .unwrap();
+        assert_eq!(status, "rejected");
     }
 
     #[tokio::test]

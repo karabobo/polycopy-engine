@@ -64,7 +64,7 @@ pub async fn plan_next_batch_with_limit(
         // consumed by the planner cursor so it cannot block later WS events,
         // but it must never become a copy intent or a synthetic rejection.
         if !event.realtime_observed {
-            advance_cursor(&pool, account_id, event.id).await?;
+            advance_cursor(pool, account_id, event.id).await?;
             summary.processed += 1;
             continue;
         }
