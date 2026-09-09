@@ -107,12 +107,10 @@ impl PersistentRuntimeConfig {
         if !(max_order_notional > Decimal::ZERO
             && max_order_notional <= MAX_PERSISTENT_ORDER_NOTIONAL_USDC)
         {
-            return Err(PersistentError::Config(
-                format!(
-                    "persistent max order notional must be > 0 and \
+            return Err(PersistentError::Config(format!(
+                "persistent max order notional must be > 0 and \
                      <= {MAX_PERSISTENT_ORDER_NOTIONAL_USDC} USDC"
-                ),
-            ));
+            )));
         }
         let rolling_budget = parse_decimal(rolling_budget, ROLLING_BUDGET_ENV)?;
         if rolling_budget <= Decimal::ZERO {
@@ -128,8 +126,7 @@ impl PersistentRuntimeConfig {
         // against $141 of daily turnover. An operator who wants the budget to
         // bound exposure rather than turnover needs a window near the holding
         // period; one who wants a daily spend ceiling keeps 86400.
-        if !(MIN_BUDGET_WINDOW_SECONDS..=MAX_BUDGET_WINDOW_SECONDS)
-            .contains(&budget_window_seconds)
+        if !(MIN_BUDGET_WINDOW_SECONDS..=MAX_BUDGET_WINDOW_SECONDS).contains(&budget_window_seconds)
         {
             return Err(PersistentError::Config(format!(
                 "persistent budget window must be between {MIN_BUDGET_WINDOW_SECONDS} \
@@ -502,9 +499,9 @@ pub async fn reserve_budget_and_mark_submitting(
         .map_err(db_err)?;
 
     let result: Result<(), PersistentError> = async {
-        let row: (i64, Option<String>, Option<String>, String, i64) = sqlx::query_as(
-            "SELECT account_id, decision_deadline_at, planned_notional_usdc, status, leader_id \
-             FROM copy_intents WHERE id = ?",
+        let row: (i64, Option<String>, Option<String>, String, i64, String) = sqlx::query_as(
+            "SELECT account_id, decision_deadline_at, planned_notional_usdc, status, leader_id, \
+             side FROM copy_intents WHERE id = ?",
         )
         .bind(intent_id)
         .fetch_one(&mut *conn)
@@ -560,7 +557,19 @@ pub async fn reserve_budget_and_mark_submitting(
             .ok_or(PersistentError::MalformedBudgetState)?
             .parse::<Decimal>()
             .map_err(|_| PersistentError::MalformedBudgetState)?;
-        if amount <= Decimal::ZERO || amount > config.max_order_notional {
+        // The per-order ceiling bounds how much new exposure one signal may
+        // open, so it applies to buys only. A sell closes a position that
+        // already exists: it cannot lose more than is already at risk, and
+        // its notional is not something configuration controls -- it is the
+        // lot times whatever the outcome is now worth. Holding a sell to the
+        // buy ceiling therefore fails on exactly the positions that did well.
+        // It did: a 5 USDC buy of 11.36 shares at 0.50 became an 8.52 USDC
+        // exit at 0.75, tripped this check, and stopped copying for all seven
+        // Leaders -- the better the trade, the surer the halt. The sell stays
+        // bounded where it should be, by the tracked lot and the strict venue
+        // balance in execute.rs's sizing.
+        let closes_a_position = row.5 == "SELL";
+        if amount <= Decimal::ZERO || (!closes_a_position && amount > config.max_order_notional) {
             return Err(PersistentError::BudgetExceeded {
                 used: Decimal::ZERO,
                 requested: amount,
@@ -1335,8 +1344,7 @@ mod tests {
         let deadline = now + chrono::Duration::seconds(60);
 
         for key in ["none-a", "none-b", "none-c"] {
-            let (intent_id, attempt_id) =
-                seed_attempt_for_leader(&db, 1, key, "1", deadline).await;
+            let (intent_id, attempt_id) = seed_attempt_for_leader(&db, 1, key, "1", deadline).await;
             reserve_budget_and_mark_submitting(&db, &config, intent_id, attempt_id, now)
                 .await
                 .expect("no per-leader limit applies");
@@ -1369,6 +1377,43 @@ mod tests {
                 .await,
             Err(PersistentError::BudgetExceeded { .. })
         ));
+    }
+
+    /// A live halt: leader 2 bought 11.36 shares for 5.00 USDC at 0.50, the
+    /// price went to 0.75, and mirroring the exit meant an 8.52 USDC sell.
+    /// Held to the buy ceiling it tripped BudgetExceeded and stopped copying
+    /// for all seven Leaders -- so the better the position did, the surer the
+    /// halt. Closing a position opens no new exposure and its notional is not
+    /// configuration's to set, so the ceiling must not apply to it.
+    #[tokio::test]
+    async fn a_profitable_exit_above_the_per_order_ceiling_still_reserves() {
+        let db = TestDb::new().await;
+        seed_base(&db).await;
+        let config = PersistentRuntimeConfig::from_values(1, true, "1", "5", "1000", 86_400, 1, 60)
+            .expect("config");
+        init_config(&db, &config).await.expect("config persisted");
+        let now = Utc::now();
+        let deadline = now + chrono::Duration::seconds(60);
+
+        let (buy_intent, buy_attempt) = seed_attempt(&db, "entry", "8.52", deadline).await;
+        assert!(
+            matches!(
+                reserve_budget_and_mark_submitting(&db, &config, buy_intent, buy_attempt, now)
+                    .await,
+                Err(PersistentError::BudgetExceeded { .. })
+            ),
+            "a BUY above the ceiling must still be refused"
+        );
+
+        let (sell_intent, sell_attempt) = seed_attempt(&db, "exit", "8.52", deadline).await;
+        sqlx::query("UPDATE copy_intents SET side = 'SELL' WHERE id = ?")
+            .bind(sell_intent)
+            .execute(&*db)
+            .await
+            .expect("side");
+        reserve_budget_and_mark_submitting(&db, &config, sell_intent, sell_attempt, now)
+            .await
+            .expect("the same notional as an exit must be allowed through");
     }
 
     #[tokio::test]
