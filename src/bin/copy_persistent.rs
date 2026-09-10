@@ -18,7 +18,7 @@ mod live {
             PersistentError, PersistentRuntimeConfig, PersistentSubmitMarker, EXIT_CONFIG,
             EXIT_LOCK_COLLISION,
         },
-        venue::intl_clob_exec::IntlClobCopyAdapter,
+        venue::{intl_clob::TickCollateralCache, intl_clob_exec::IntlClobCopyAdapter},
         EngineLock, EngineLockError,
     };
     use rust_decimal::Decimal;
@@ -134,10 +134,15 @@ mod live {
                 Err(error) => return Err(RunnerError::Persistent(error)),
             };
 
+            // One cache per tick: every intent in this batch sees the same
+            // collateral, so the two account-level reads happen once here
+            // rather than once per intent. Rebuilt on the next tick so the
+            // figure never outlives the batch it was taken for.
+            let collateral = TickCollateralCache::new(adapter.read_adapter());
             for intent_id in intent_ids {
                 let outcome = execute_one_intent_with_marker(
                     &pool,
-                    adapter.read_adapter(),
+                    &collateral,
                     &adapter,
                     &adapter,
                     adapter.read_adapter(),

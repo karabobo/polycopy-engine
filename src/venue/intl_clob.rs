@@ -621,3 +621,190 @@ mod tests {
             .all(|request| request.contains("asset_id=123456")));
     }
 }
+
+/// Memoizes the two account-level collateral reads for the lifetime of one
+/// runner tick, passing per-token queries straight through.
+///
+/// Sizing reads collateral balance and allowance for every intent, and each
+/// is a venue round-trip of roughly half a second. That cost is per-intent
+/// while the answer is per-account: within one tick every intent sees the
+/// same collateral. Paying it repeatedly is what made a burst of signals
+/// arrive at the executor a second apart, so a Leader firing eight trades in
+/// five seconds had most of them cancelled on a three-second decision
+/// deadline they never got the chance to miss on their merits.
+///
+/// Reusing a read taken moments earlier is sound because sizing does not
+/// treat the venue figure as the final word: it subtracts this account's own
+/// active reservations from it. A reservation is written before submission
+/// and is not released at settlement, so a fill that has already reduced the
+/// venue balance is still being subtracted here -- the stale-read error and
+/// the reservation overlap, and they overlap in the safe direction, leaving
+/// less collateral available rather than more.
+///
+/// Only successes are kept. An error is returned untouched and nothing is
+/// stored, so one failed query fails its own intent and the next intent
+/// retries rather than inheriting it. Per-token positions are never cached:
+/// they differ by token and change as this account trades.
+pub struct TickCollateralCache<'a, B> {
+    inner: &'a B,
+    balance: tokio::sync::Mutex<Option<Decimal>>,
+    allowance: tokio::sync::Mutex<Option<Decimal>>,
+}
+
+impl<'a, B> TickCollateralCache<'a, B> {
+    /// Build one per tick. A longer-lived cache would keep serving a figure
+    /// the account has since moved past.
+    pub fn new(inner: &'a B) -> Self {
+        Self {
+            inner,
+            balance: tokio::sync::Mutex::new(None),
+            allowance: tokio::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait]
+impl<B: StrictTokenBalanceReader> StrictTokenBalanceReader for TickCollateralCache<'_, B> {
+    async fn position_for_token_strict(
+        &self,
+        token_id: &OutcomeTokenId,
+    ) -> Result<Decimal, StrictPositionError> {
+        self.inner.position_for_token_strict(token_id).await
+    }
+}
+
+#[async_trait]
+impl<B: StrictAccountBalanceReader> StrictAccountBalanceReader for TickCollateralCache<'_, B> {
+    async fn collateral_balance_strict(&self) -> Result<Decimal, StrictCollateralError> {
+        let mut slot = self.balance.lock().await;
+        if let Some(cached) = *slot {
+            return Ok(cached);
+        }
+        let value = self.inner.collateral_balance_strict().await?;
+        *slot = Some(value);
+        Ok(value)
+    }
+
+    async fn collateral_allowance_strict(&self) -> Result<Decimal, StrictCollateralError> {
+        let mut slot = self.allowance.lock().await;
+        if let Some(cached) = *slot {
+            return Ok(cached);
+        }
+        let value = self.inner.collateral_allowance_strict().await?;
+        *slot = Some(value);
+        Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tick_collateral_cache_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingReader {
+        balance_calls: AtomicUsize,
+        allowance_calls: AtomicUsize,
+        position_calls: AtomicUsize,
+        fail_first_balance: bool,
+    }
+
+    impl CountingReader {
+        fn new() -> Self {
+            Self {
+                balance_calls: AtomicUsize::new(0),
+                allowance_calls: AtomicUsize::new(0),
+                position_calls: AtomicUsize::new(0),
+                fail_first_balance: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StrictTokenBalanceReader for CountingReader {
+        async fn position_for_token_strict(
+            &self,
+            _token_id: &OutcomeTokenId,
+        ) -> Result<Decimal, StrictPositionError> {
+            self.position_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Decimal::new(7, 0))
+        }
+    }
+
+    #[async_trait]
+    impl StrictAccountBalanceReader for CountingReader {
+        async fn collateral_balance_strict(&self) -> Result<Decimal, StrictCollateralError> {
+            let seen = self.balance_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_first_balance && seen == 0 {
+                return Err(StrictCollateralError::MissingAllowance);
+            }
+            Ok(Decimal::new(100, 0))
+        }
+
+        async fn collateral_allowance_strict(&self) -> Result<Decimal, StrictCollateralError> {
+            self.allowance_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Decimal::new(50, 0))
+        }
+    }
+
+    /// The point of the cache: a burst of intents inside one tick costs two
+    /// venue round-trips, not two per intent. Eight signals arriving in five
+    /// seconds used to take eight seconds to work through and miss a
+    /// three-second deadline.
+    #[tokio::test]
+    async fn a_tick_pays_for_each_collateral_read_once_however_many_intents() {
+        let reader = CountingReader::new();
+        let cache = TickCollateralCache::new(&reader);
+
+        for _ in 0..8 {
+            assert_eq!(
+                cache.collateral_balance_strict().await.expect("balance"),
+                Decimal::new(100, 0)
+            );
+            assert_eq!(
+                cache
+                    .collateral_allowance_strict()
+                    .await
+                    .expect("allowance"),
+                Decimal::new(50, 0)
+            );
+        }
+
+        assert_eq!(reader.balance_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(reader.allowance_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Positions differ by token and move as this account trades, so they
+    /// must reach the venue every time even while collateral is being reused.
+    #[tokio::test]
+    async fn per_token_positions_are_never_served_from_the_cache() {
+        let reader = CountingReader::new();
+        let cache = TickCollateralCache::new(&reader);
+        let token = OutcomeTokenId::from_str("123456").expect("token");
+
+        for _ in 0..3 {
+            cache
+                .position_for_token_strict(&token)
+                .await
+                .expect("position");
+        }
+
+        assert_eq!(reader.position_calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// A failed read must fail its own intent and no other. Caching the
+    /// error would turn one transient venue blip into a whole silent tick.
+    #[tokio::test]
+    async fn a_failed_read_is_not_remembered_and_the_next_intent_retries() {
+        let mut reader = CountingReader::new();
+        reader.fail_first_balance = true;
+        let cache = TickCollateralCache::new(&reader);
+
+        assert!(cache.collateral_balance_strict().await.is_err());
+        assert_eq!(
+            cache.collateral_balance_strict().await.expect("retry"),
+            Decimal::new(100, 0),
+            "the retry must reach the venue rather than inherit the failure"
+        );
+        assert_eq!(reader.balance_calls.load(Ordering::SeqCst), 2);
+    }
+}
