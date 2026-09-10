@@ -259,8 +259,12 @@ where
             // reservation atomically with a durable pre-submit rejection;
             // never strand an in_progress intent or propagate an error that
             // a runner might blindly retry.
-            reject_pre_submit_intent(pool, intent_id, &format!("envelope preparation failed: {detail}"))
-                .await?;
+            reject_pre_submit_intent(
+                pool,
+                intent_id,
+                &format!("envelope preparation failed: {detail}"),
+            )
+            .await?;
             return Ok(OrchestrateOutcome::Rejected);
         }
     };
@@ -405,9 +409,33 @@ async fn submit_prepared<E>(
 where
     E: CopyExecution,
 {
-    marker
+    if let Err(error) = marker
         .mark_submitting(pool, intent_id, attempt.id, now)
-        .await?;
+        .await
+    {
+        // One Leader spending its own window budget is that limit working,
+        // not a fault. Every other error here is a reason to stop; this one
+        // is a reason to skip a signal. Without this arm it reaches the
+        // runner as EXIT_BUDGET_STATE, which systemd is told not to restart,
+        // so the busiest Leader silently halts copying for all the others --
+        // precisely the coupling per-Leader budgets exist to remove. It did:
+        // "leader 2 rolling budget exhausted: used=9.36 requested=9.3590
+        // cap=10" stopped the engine for eight hours. Nothing crossed the
+        // venue boundary, and no reservation was taken, so the attempt and
+        // its intent close out exactly like any other pre-submit rejection.
+        if matches!(
+            error,
+            OrchestrateError::Persistent(
+                crate::copytrading::persistent::PersistentError::LeaderBudgetExhausted { .. }
+            )
+        ) {
+            let reason = error.to_string();
+            mark_attempt_rejected(pool, intent_id, attempt.id, &reason).await?;
+            reject_pre_submit_intent(pool, intent_id, &reason).await?;
+            return Ok(OrchestrateOutcome::Rejected);
+        }
+        return Err(error);
+    }
     match execution.submit_exact_envelope(&attempt.envelope).await {
         Ok(receipt) => {
             mark_attempt_accepted(pool, intent_id, attempt.id).await?;
@@ -446,10 +474,7 @@ where
             // release and the case-open can no longer free the rolling-
             // budget USDC without leaving an audit case behind.
             crate::copytrading::reconcile::open_local_submission_failure_case(
-                pool,
-                intent_id,
-                attempt.id,
-                &detail,
+                pool, intent_id, attempt.id, &detail,
             )
             .await?;
             Ok(OrchestrateOutcome::NeedsReconcile(

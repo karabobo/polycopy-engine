@@ -2139,3 +2139,88 @@ async fn a_definitive_rejection_prepares_one_fresh_retry_without_phantom_lot() {
         .fetch_one(&db.pool).await.unwrap();
     assert_eq!(lot.parse::<Decimal>().unwrap(), Decimal::new(5, 0));
 }
+
+/// The per-Leader budget exists so one Leader running dry does not stop the
+/// others. That only holds if the runner's own path turns the error into a
+/// skipped signal; the variant was introduced with a comment saying the
+/// caller would intercept it, and nothing did. In production the error
+/// travelled up as EXIT_BUDGET_STATE -- which systemd is configured not to
+/// restart -- and "leader 2 rolling budget exhausted: used=9.36
+/// requested=9.3590 cap=10" halted copying for all seven Leaders for eight
+/// hours. This drives the real marker, so an `Err` here is that outage.
+#[tokio::test]
+async fn a_leader_out_of_budget_is_a_skipped_signal_not_a_halt() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+
+    // A budget this Leader cannot afford the pending order under, while the
+    // account ceiling stays generous: the per-Leader gate is what fires.
+    sqlx::query(
+        "INSERT INTO leader_policy \
+         (leader_id, max_signal_age_seconds, decision_window_seconds, price_tolerance_bps, \
+          tick_size, min_price, max_price, max_order_notional, min_leader_trade_size, \
+          rolling_budget_usdc, budget_window_seconds) \
+         VALUES (1, 3, 3, 100, '0.01', '0.01', '0.99', '5', '0', '0.5', 600)",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("leader policy");
+
+    let cfg = PersistentRuntimeConfig::from_values(1, true, "1", "5", "1000", 86_400, 1, 60)
+        .expect("valid persistent config");
+    init_config(&db, &cfg)
+        .await
+        .expect("init persistent config");
+
+    sqlx::query(
+        "UPDATE copy_intents SET status = 'in_progress', \
+         planned_qty = '5', planned_price = '0.55', planned_notional_usdc = '1' \
+         WHERE id = ?",
+    )
+    .bind(intent_id)
+    .execute(&db.pool)
+    .await
+    .expect("seed intent in_progress + planned fields");
+
+    let venue = FakeVenue::succeeding(Decimal::new(5, 0));
+    let outcome = execute_one_intent_with_marker(
+        &db,
+        &FixedBalance(Decimal::new(100, 0)),
+        &venue,
+        &venue,
+        &EmptyHistory,
+        &PersistentSubmitMarker { config: &cfg },
+        intent_id,
+        Utc::now(),
+    )
+    .await
+    .expect("an exhausted Leader budget must not propagate as a runner error");
+
+    assert_eq!(outcome, OrchestrateOutcome::Rejected);
+
+    let (status, reason): (String, Option<String>) =
+        sqlx::query_as("SELECT status, rejection_reason FROM copy_intents WHERE id = ?")
+            .bind(intent_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("intent row");
+    assert_eq!(status, "rejected", "the signal is skipped, durably");
+    assert!(
+        reason
+            .unwrap_or_default()
+            .contains("rolling budget exhausted"),
+        "the ledger must say which limit skipped it"
+    );
+
+    // Nothing was submitted and nothing was reserved: this is a pre-boundary
+    // refusal, so it must not consume budget it was just denied.
+    let reserved: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM persistent_budget_reservations WHERE state = 'reserved'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("reservation count");
+    assert_eq!(reserved, 0);
+}
