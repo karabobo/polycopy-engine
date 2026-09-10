@@ -169,7 +169,21 @@ mod live {
                         eprintln!("intent {intent_id}: expired before submission");
                     }
                     Err(OrchestrateError::Persistent(error)) => {
-                        if !matches!(error, PersistentError::BudgetExceeded { .. }) {
+                        // A budget refusal is a limit doing its job: the
+                        // ledger is consistent and nothing needs an operator,
+                        // so it stops this run without also latching the fuse
+                        // that would block the next one. Both budget variants
+                        // belong here; listing only the account one let a
+                        // per-Leader refusal latch the fuse on its way out,
+                        // so recovering from it needed a manual resume on top
+                        // of a restart. submit_prepared now intercepts the
+                        // per-Leader case long before this, and this arm is
+                        // the backstop agreeing with it.
+                        if !matches!(
+                            error,
+                            PersistentError::BudgetExceeded { .. }
+                                | PersistentError::LeaderBudgetExhausted { .. }
+                        ) {
                             open_runtime_fuse(&pool, config.account_id, &error.to_string()).await?;
                         }
                         return Err(RunnerError::Persistent(error));
