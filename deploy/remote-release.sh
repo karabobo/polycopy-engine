@@ -87,6 +87,9 @@ git archive --format=tar "$commit" | "${ssh_args[@]}" "tar -x -C '$release_dir'"
     # build scripts must resolve the same project-owned compiler as cargo.
     export RUSTC=\"\$rustc_bin\"
     export PATH=\"\$(dirname \"\$cargo_bin\"):\$PATH\"
+    # The release archive intentionally contains no .git directory. Preserve
+    # the source commit in the binary so each canary artifact is attributable.
+    export POLYCOPY_RELEASE_COMMIT='$commit'
     \"\$cargo_bin\" build --release --all-features --locked
     test -x target/release/ghost_verify
     test -x target/release/ghost_drift_report

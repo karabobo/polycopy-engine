@@ -1,10 +1,11 @@
 # Phase 0.5 CLOB submission-safety canary
 
-Status: **in progress — three real canary orders placed and observed across
-2026-08-31 and 2026-09-01 (one full fill, one killed-for-no-match, one full
-fill plus a rejected duplicate resubmission); two of the four gate boxes
-below are now checked, two are not, so this still does not authorize
-automated retry or a live-order path.**
+Status: **historical Phase 0.5 evidence was independently reviewed as passed
+on 2026-09-02, but revalidation is now required before that evidence can
+cover the current BUY construction path.** The earlier records did not retain
+a source commit or construction fingerprint; they remain evidence for the
+then-built envelope, duplicate, lookup, and receipt behavior, not for a
+subsequent implementation.
 
 This report is required by
 [`COPY_ENGINE_BLUEPRINT.md`](COPY_ENGINE_BLUEPRINT.md) before any automatic
@@ -22,6 +23,30 @@ unless `POLYCOPY_CANARY_CONFIRM_SUBMIT=yes` is set by the operator in their
 own shell. Nothing else can set that variable. Set
 `POLYCOPY_CANARY_CONFIRM_DUPLICATE=yes` in the same run to also submit a
 second, independently-signed copy of the identical order for Result 2 below.
+
+## Construction-version attestation (required for the next live canary)
+
+`canary_run.rs` and production `prepare.rs` intentionally retain separate SDK
+order builders. Before either builder is invoked, the all-features test
+`canary_production_construction_contract` compares their independent amount
+contracts: BUY is a cent-denominated maker-side USDC budget and SELL is a
+maker-side share quantity. This protects against the specific drift where one
+path independently rounds `qty` and `price` while the other does not; it does
+not claim the two builders are the same implementation.
+
+Every newly persisted `canary-artifacts/<label>/spec.json` contains
+`build_git_commit` and `construction_fingerprint`. The fingerprint is a
+build-time change detector over the two construction paths and their shared
+amount contract, not a cryptographic integrity assertion. A future reviewer
+must record both values alongside the live result and verify they match the
+release being approved. A missing or `unknown` value means the canary cannot
+attest to a production build and is not gate evidence.
+
+**Current attestation status: revalidation required.** No new order has been
+submitted for this change. The next operator-authorized, deliberately tiny
+BUY canary must use a cent-denominated `POLYCOPY_CANARY_SIZE` USDC budget and
+must retain its `spec.json`; only then can its result be attributed to this
+construction version.
 
 ## Authorization and bounds
 
@@ -298,11 +323,13 @@ It never builds, signs, submits, retries, or duplicates an order. Result 5
 provides the required known-matched live evidence; independent review remains
 the final gate.
 
-Decision: **passed after independent review on 2026-09-02.** The reviewer found
-no blocker: the mock makes GET requests only, the optional-fee normalization
-does not extend to accounting fields, and the exact-ID/no-resubmission recovery
-rules remain intact. All Phase 0.5 implementation and live-evidence checkboxes
-are complete.
+Historical decision: **passed after independent review on 2026-09-02.** The
+reviewer found no blocker: the mock makes GET requests only, the optional-fee
+normalization does not extend to accounting fields, and the exact-ID/no-
+resubmission recovery rules remain intact. That decision applies to the
+historical construction only. The current BUY construction change requires the
+new attested live canary described above before Phase 0.5 may again be cited
+as a gate for the current build.
 
 This decision validates the narrow Phase 0.5 canary gate only. It does not
 enable automated trading. The known limitation remains: an order ID lost before

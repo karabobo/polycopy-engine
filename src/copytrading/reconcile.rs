@@ -125,7 +125,7 @@ pub async fn load_or_prepare_attempt(
         .bind(intent_id)
         .bind(attempt_number)
         .bind(envelope_json)
-        .bind(&candidate.size)
+        .bind(candidate.buy_budget_usdc.as_deref().unwrap_or(&candidate.size))
         .execute(&mut *conn)
         .await
         .map_err(db_err)?;
@@ -805,6 +805,7 @@ mod tests {
             side: "BUY".to_owned(),
             price: "0.5".to_owned(),
             size: "5".to_owned(),
+            buy_budget_usdc: Some("2.50".to_owned()),
             salt,
             order_type: "FAK".to_owned(),
             expected_taker_order_id: "order-a".to_owned(),
@@ -1458,6 +1459,15 @@ mod tests {
         .unwrap()
         .get(0);
         assert_eq!(row_count, 1);
+
+        let requested_qty: String = sqlx::query_scalar(
+            "SELECT requested_qty FROM order_attempts WHERE intent_id = ? AND attempt_number = 1",
+        )
+        .bind(intent_id)
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        assert_eq!(requested_qty, "2.50");
     }
 
     #[tokio::test]

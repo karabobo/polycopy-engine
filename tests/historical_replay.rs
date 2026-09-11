@@ -377,7 +377,7 @@ async fn replays_a_real_production_batch_without_loss_or_a_panic() {
             &pool,
             &resolver,
             &trade,
-            "activity_backfill",
+            "activity_ws",
             &fixture_row.source_event_id,
             "{}",
         )

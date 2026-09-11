@@ -35,7 +35,10 @@ POLYCOPY_DB_PATH=/var/lib/polycopy-engine/polycopy.sqlite
 POLYCOPY_PERSISTENT_ACCOUNT_ID=1
 POLYCOPY_PERSISTENT_ALLOWED_LEADER_IDS=1,2,3
 POLYCOPY_PERSISTENT_MAX_ORDER_NOTIONAL=1
-POLYCOPY_PERSISTENT_ROLLING_BUDGET_USDC=[positive decimal, for example 50]
+# Account 24-hour cumulative-turnover circuit breaker, not an exposure cap.
+# Settled fills remain counted until this window rolls off; leader policies
+# below provide the normal 10-minute throughput limits.
+POLYCOPY_PERSISTENT_ROLLING_BUDGET_USDC=[positive decimal, for example 600]
 POLYCOPY_PERSISTENT_BUDGET_WINDOW_SECONDS=86400
 POLYCOPY_PERSISTENT_TICK_SECONDS=1
 # REST is low-frequency audit/reconciliation only; WS is the realtime trigger.
@@ -167,9 +170,12 @@ The runner startup then requires the runtime file to exactly match that
 database row. It refuses to start on config drift, an open account fuse, an
 unresolved reconciliation case, or any `submitting`/`uncertain` attempt. Before
 each order submit, it atomically reserves the persisted `planned_notional_usdc`
-and marks the attempt `submitting`; definitive rejections and uncertain
-submissions still count against the rolling budget until their 24-hour
-timestamp ages out.
+and marks the attempt `submitting`. A definitive rejection releases that
+reservation; an uncertain submission remains counted against the account
+24-hour cumulative-turnover circuit breaker until it is reconciled or its
+timestamp ages out. This is deliberately a daily turnover limit, not a
+position/exposure limit; per-leader budgets are the normal short-window
+throughput controls.
 
 Operator controls:
 

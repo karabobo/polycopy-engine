@@ -36,15 +36,37 @@ use alloy::primitives::U256;
 use polymarket_client_sdk_v2::{
     auth::{state::Authenticated, Normal, Signer},
     clob::{
-        types::{OrderType, Side as SdkSide},
+        types::{Amount, OrderType, Side as SdkSide},
         Client,
     },
 };
 
 use crate::{
     copytrading::{execute::SizedDecision, reconcile::PreparedOrderEnvelope},
-    venue::order_hash::{self, ExchangeAddresses},
+    venue::{
+        execution_contract::ClobOrderAmount,
+        order_hash::{self, ExchangeAddresses},
+    },
 };
+
+/// Production's order-side amount contract, exposed for the canary drift
+/// regression test. It contains no SDK client, signer, or network state.
+pub fn construction_amount(decision: &SizedDecision) -> Result<ClobOrderAmount, PrepareError> {
+    match (decision.side, decision.buy_budget) {
+        (crate::copytrading::execute::Side::Buy, Some(budget))
+            if budget > rust_decimal::Decimal::ZERO && budget.scale() <= 2 =>
+        {
+            Ok(ClobOrderAmount::BuyMakerUsdc(budget))
+        }
+        (crate::copytrading::execute::Side::Buy, Some(budget)) => {
+            Err(PrepareError::InvalidBuyBudget(budget))
+        }
+        (crate::copytrading::execute::Side::Buy, None) => Err(PrepareError::MissingBuyBudget),
+        (crate::copytrading::execute::Side::Sell, _) => {
+            Ok(ClobOrderAmount::SellMakerShares(decision.qty))
+        }
+    }
+}
 
 /// Abstraction over neg-risk resolution so `EnvelopePreparer` does not
 /// directly depend on `polymarket_client_sdk_v2::Client::neg_risk`.
@@ -55,7 +77,10 @@ use crate::{
 /// a prepare-time concern, not a general venue capability.
 #[async_trait::async_trait]
 pub trait NegRiskResolver: Send + Sync {
-    async fn resolve(&self, token_id: U256) -> Result<NegRiskResponse, polymarket_client_sdk_v2::error::Error>;
+    async fn resolve(
+        &self,
+        token_id: U256,
+    ) -> Result<NegRiskResponse, polymarket_client_sdk_v2::error::Error>;
 }
 
 /// The subset of the SDK's neg-risk response that `prepare` needs.
@@ -71,9 +96,14 @@ pub struct SdkNegRiskResolver<'a> {
 
 #[async_trait::async_trait]
 impl<'a> NegRiskResolver for SdkNegRiskResolver<'a> {
-    async fn resolve(&self, token_id: U256) -> Result<NegRiskResponse, polymarket_client_sdk_v2::error::Error> {
+    async fn resolve(
+        &self,
+        token_id: U256,
+    ) -> Result<NegRiskResponse, polymarket_client_sdk_v2::error::Error> {
         let resp = self.client.neg_risk(token_id).await?;
-        Ok(NegRiskResponse { neg_risk: resp.neg_risk })
+        Ok(NegRiskResponse {
+            neg_risk: resp.neg_risk,
+        })
     }
 }
 
@@ -119,29 +149,42 @@ impl<'a, S: Signer, R: NegRiskResolver> EnvelopePreparer<'a, S, R> {
         &self,
         decision: &SizedDecision,
     ) -> Result<PreparedEnvelope, PrepareError> {
-        let token_id =
-            U256::from_str(&decision.token_id)
-                .map_err(|e| PrepareError::InvalidTokenId(e.to_string()))?;
+        let token_id = U256::from_str(&decision.token_id)
+            .map_err(|e| PrepareError::InvalidTokenId(e.to_string()))?;
         let side = match decision.side {
             crate::copytrading::execute::Side::Buy => SdkSide::Buy,
             crate::copytrading::execute::Side::Sell => SdkSide::Sell,
         };
 
-        // Step 1: Build the SignableOrder. The SDK's `limit_order()` builder
-        // handles tick-size validation, size alignment, and V1/V2 version
-        // negotiation (neg-risk resolution). This is the exact same DSL that
-        // canary_run.rs::build_signable_order uses.
-        let signable = self
-            .client
-            .limit_order()
-            .token_id(token_id)
-            .side(side)
-            .price(decision.limit_price)
-            .size(decision.qty)
-            .order_type(OrderType::FAK)
-            .build()
-            .await
-            .map_err(PrepareError::OrderBuilding)?;
+        // Step 1: Build the SignableOrder. A BUY must be constructed with a
+        // cent-denominated maker-side USDC budget. Passing independently
+        // rounded shares to `limit_order()` makes its maker amount
+        // `shares * price`, commonly producing 3-4 decimal places that the
+        // CLOB rejects. SELLs remain share-denominated limit FAKs.
+        let signable = match construction_amount(decision)? {
+            ClobOrderAmount::BuyMakerUsdc(budget) => self
+                .client
+                .market_order()
+                .token_id(token_id)
+                .side(side)
+                .price(decision.limit_price)
+                .amount(Amount::usdc(budget).map_err(PrepareError::OrderBuilding)?)
+                .order_type(OrderType::FAK)
+                .build()
+                .await
+                .map_err(PrepareError::OrderBuilding)?,
+            ClobOrderAmount::SellMakerShares(shares) => self
+                .client
+                .limit_order()
+                .token_id(token_id)
+                .side(side)
+                .price(decision.limit_price)
+                .size(shares)
+                .order_type(OrderType::FAK)
+                .build()
+                .await
+                .map_err(PrepareError::OrderBuilding)?,
+        };
 
         // Step 2: Sign exactly once (blueprint invariant #5 — never rebuild).
         let signed_order = self
@@ -224,6 +267,7 @@ pub(crate) fn assemble_envelope(
         side: decision.side.as_str().to_owned(),
         price: decision.limit_price.to_string(),
         size: decision.qty.to_string(),
+        buy_budget_usdc: decision.buy_budget.map(|budget| budget.to_string()),
         salt: extract_salt(signed_order).unwrap_or(0),
         order_type: "FAK".to_owned(),
         expected_taker_order_id: expected_taker_order_id.to_owned(),
@@ -336,6 +380,7 @@ mod tests {
             side,
             qty: Decimal::from(100),
             limit_price: Decimal::from_str("0.55").unwrap(),
+            buy_budget: (side == crate::copytrading::execute::Side::Buy).then(|| Decimal::from(55)),
         }
     }
 
@@ -376,12 +421,18 @@ mod tests {
             "0x000000000000000000000000000000000000000000000000000000000000abcd".to_owned();
         let signed_order_json = "{\"signed\":true}".to_owned();
 
-        let env = assemble_envelope(&decision, &signed, &expected_taker_order_id, &signed_order_json);
+        let env = assemble_envelope(
+            &decision,
+            &signed,
+            &expected_taker_order_id,
+            &signed_order_json,
+        );
 
         assert_eq!(env.token_id, "12345");
         assert_eq!(env.side, "BUY");
         assert_eq!(env.price, "0.55");
         assert_eq!(env.size, "100");
+        assert_eq!(env.buy_budget_usdc.as_deref(), Some("55"));
         assert_eq!(env.salt, 2024);
         assert_eq!(env.order_type, "FAK");
         assert_eq!(env.expected_taker_order_id, expected_taker_order_id);
@@ -400,6 +451,7 @@ mod tests {
         assert_eq!(env.token_id, decision.token_id);
         assert_eq!(env.price, "0.55");
         assert_eq!(env.size, "100");
+        assert_eq!(env.buy_budget_usdc, None);
     }
 
     #[test]
@@ -452,20 +504,28 @@ mod tests {
     #[test]
     fn compute_expected_taker_order_id_returns_a_v2_formatted_id() {
         let signed = v2_signed_order(7);
-        let id =
-            compute_expected_taker_order_id(&signed.payload, &exchanges_with_v2(), 137u32 as ChainId)
-                .unwrap();
+        let id = compute_expected_taker_order_id(
+            &signed.payload,
+            &exchanges_with_v2(),
+            137u32 as ChainId,
+        )
+        .unwrap();
         assert!(id.starts_with("0x"));
         assert_eq!(id.len(), 66);
-        assert!(id[2..].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(id[2..]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
     fn compute_expected_taker_order_id_returns_a_v1_formatted_id() {
         let signed = v1_signed_order(7);
-        let id =
-            compute_expected_taker_order_id(&signed.payload, &exchanges_with_v2(), 137u32 as ChainId)
-                .unwrap();
+        let id = compute_expected_taker_order_id(
+            &signed.payload,
+            &exchanges_with_v2(),
+            137u32 as ChainId,
+        )
+        .unwrap();
         assert!(id.starts_with("0x"));
         assert_eq!(id.len(), 66);
     }
@@ -473,12 +533,18 @@ mod tests {
     #[test]
     fn compute_expected_taker_order_id_is_deterministic_for_a_v1_payload() {
         let signed = v1_signed_order(11);
-        let first =
-            compute_expected_taker_order_id(&signed.payload, &exchanges_with_v2(), 137u32 as ChainId)
-                .unwrap();
-        let second =
-            compute_expected_taker_order_id(&signed.payload, &exchanges_with_v2(), 137u32 as ChainId)
-                .unwrap();
+        let first = compute_expected_taker_order_id(
+            &signed.payload,
+            &exchanges_with_v2(),
+            137u32 as ChainId,
+        )
+        .unwrap();
+        let second = compute_expected_taker_order_id(
+            &signed.payload,
+            &exchanges_with_v2(),
+            137u32 as ChainId,
+        )
+        .unwrap();
         assert_eq!(first, second);
     }
 
@@ -566,6 +632,8 @@ mod tests {
 #[derive(Debug)]
 pub enum PrepareError {
     InvalidTokenId(String),
+    MissingBuyBudget,
+    InvalidBuyBudget(rust_decimal::Decimal),
     OrderBuilding(polymarket_client_sdk_v2::error::Error),
     OrderSigning(polymarket_client_sdk_v2::error::Error),
     NegRiskQuery(polymarket_client_sdk_v2::error::Error),
@@ -578,7 +646,16 @@ pub enum PrepareError {
 impl std::fmt::Display for PrepareError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidTokenId(detail) => write!(f, "invalid outcome token ID in decision: {detail}"),
+            Self::InvalidTokenId(detail) => {
+                write!(f, "invalid outcome token ID in decision: {detail}")
+            }
+            Self::MissingBuyBudget => {
+                write!(f, "BUY decision is missing its maker-side USDC budget")
+            }
+            Self::InvalidBuyBudget(budget) => write!(
+                f,
+                "BUY maker-side USDC budget must be positive with at most two decimals: {budget}"
+            ),
             Self::OrderBuilding(source) => write!(f, "order building failed: {source}"),
             Self::OrderSigning(source) => write!(f, "order signing failed: {source}"),
             Self::NegRiskQuery(source) => write!(f, "neg-risk query failed: {source}"),

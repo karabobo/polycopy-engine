@@ -1,8 +1,9 @@
 //! Persistent live-copy safety state.
 //!
 //! This module is database-only. It owns the persistent-mode config row,
-//! account fuse, and the rolling budget reservation that must be written in
-//! the same transaction that moves an attempt to `submitting`.
+//! account fuse, and the account cumulative-turnover circuit-breaker
+//! reservation that must be written in the same transaction that moves an
+//! attempt to `submitting`.
 
 use std::{collections::BTreeSet, env, fmt, time::Duration};
 
@@ -23,6 +24,11 @@ pub const ENGINE_EXECUTE_ENV: &str = "POLYCOPY_ENGINE_EXECUTE";
 pub const ACCOUNT_ID_ENV: &str = "POLYCOPY_PERSISTENT_ACCOUNT_ID";
 pub const ALLOWED_LEADERS_ENV: &str = "POLYCOPY_PERSISTENT_ALLOWED_LEADER_IDS";
 pub const MAX_ORDER_NOTIONAL_ENV: &str = "POLYCOPY_PERSISTENT_MAX_ORDER_NOTIONAL";
+/// Account-level cap on cumulative submitted notional inside
+/// [`BUDGET_WINDOW_ENV`]. Settled fills intentionally remain counted until the
+/// window rolls off, so this is a turnover circuit breaker, not an exposure or
+/// available-collateral limit. Per-leader policies provide the ordinary,
+/// shorter-window rate limits.
 pub const ROLLING_BUDGET_ENV: &str = "POLYCOPY_PERSISTENT_ROLLING_BUDGET_USDC";
 pub const BUDGET_WINDOW_ENV: &str = "POLYCOPY_PERSISTENT_BUDGET_WINDOW_SECONDS";
 pub const TICK_SECONDS_ENV: &str = "POLYCOPY_PERSISTENT_TICK_SECONDS";
@@ -115,18 +121,17 @@ impl PersistentRuntimeConfig {
         let rolling_budget = parse_decimal(rolling_budget, ROLLING_BUDGET_ENV)?;
         if rolling_budget <= Decimal::ZERO {
             return Err(PersistentError::Config(
-                "persistent rolling budget must be greater than 0 USDC".to_owned(),
+                "account cumulative-turnover circuit breaker must be greater than 0 USDC"
+                    .to_owned(),
             ));
         }
-        // A single permitted value made this control unusable for the markets
-        // it guards. Five-minute markets settle and recycle capital about
-        // seventy times a day, so a 24-hour window bounds turnover while the
-        // notional actually exposed at any instant stays two orders of
-        // magnitude below it -- measured on this account: $17 peak concurrent
-        // against $141 of daily turnover. An operator who wants the budget to
-        // bound exposure rather than turnover needs a window near the holding
-        // period; one who wants a daily spend ceiling keeps 86400.
-        if !(MIN_BUDGET_WINDOW_SECONDS..=MAX_BUDGET_WINDOW_SECONDS).contains(&budget_window_seconds)
+        // This cap bounds cumulative turnover, not exposure: settled fills
+        // retain their reservation until the window rolls off. A shorter
+        // window makes it an account-level burst circuit breaker; 86,400
+        // seconds makes it the account's 24-hour cumulative-turnover circuit
+        // breaker. Per-leader policies normally carry the tighter rate limits.
+        if !(MIN_BUDGET_WINDOW_SECONDS..=MAX_BUDGET_WINDOW_SECONDS)
+            .contains(&budget_window_seconds)
         {
             return Err(PersistentError::Config(format!(
                 "persistent budget window must be between {MIN_BUDGET_WINDOW_SECONDS} \
@@ -1062,7 +1067,7 @@ impl fmt::Display for PersistentError {
                 cap,
             } => write!(
                 formatter,
-                "persistent rolling budget exceeded: used={used} requested={requested} cap={cap}"
+                "account cumulative-turnover circuit breaker exceeded: used={used} requested={requested} cap={cap}"
             ),
             Self::LeaderBudgetExhausted {
                 leader_id,
@@ -1194,6 +1199,7 @@ mod tests {
             side: "BUY".to_owned(),
             price: "1".to_owned(),
             size: notional.to_owned(),
+            buy_budget_usdc: Some(notional.to_owned()),
             salt: intent_id as u64,
             order_type: "FAK".to_owned(),
             expected_taker_order_id: format!("0x{intent_id:x}"),
@@ -1252,6 +1258,7 @@ mod tests {
             side: "BUY".to_owned(),
             price: "1".to_owned(),
             size: notional.to_owned(),
+            buy_budget_usdc: Some(notional.to_owned()),
             salt: intent_id as u64,
             order_type: "FAK".to_owned(),
             expected_taker_order_id: format!("0x{intent_id:x}"),

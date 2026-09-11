@@ -46,7 +46,7 @@ async fn main() {
                 let config = PersistentRuntimeConfig::from_env()?;
                 init_persistent_config(&pool, &config).await?;
                 println!(
-                    "persistent config initialized: account_id={} allowed_leaders={} max_order={} rolling_24h={}",
+                    "persistent config initialized: account_id={} allowed_leaders={} max_order={} account_24h_turnover_circuit_breaker={}",
                     config.account_id,
                     config.allowed_leaders_text(),
                     config.max_order_notional,
@@ -62,7 +62,7 @@ async fn main() {
                 let config = PersistentRuntimeConfig::from_env()?;
                 reconfigure_persistent_config(&pool, &config).await?;
                 println!(
-                    "persistent config reconfigured: account_id={} allowed_leaders={} max_order={} rolling_24h={}",
+                    "persistent config reconfigured: account_id={} allowed_leaders={} max_order={} account_24h_turnover_circuit_breaker={}",
                     config.account_id,
                     config.allowed_leaders_text(),
                     config.max_order_notional,

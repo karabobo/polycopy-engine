@@ -17,7 +17,7 @@
 //! POLYCOPY_CANARY_TOKEN_ID=<decimal outcome token ID>
 //! POLYCOPY_CANARY_SIDE=BUY|SELL
 //! POLYCOPY_CANARY_PRICE=<decimal, strictly between 0 and 1>
-//! POLYCOPY_CANARY_SIZE=<decimal, positive>
+//! POLYCOPY_CANARY_SIZE=<decimal, positive; BUY is USDC, SELL is shares>
 //! POLYCOPY_CANARY_CONFIRM_SUBMIT=yes      # only this exact value submits the first order
 //! POLYCOPY_CANARY_CONFIRM_DUPLICATE=yes   # only this exact value also submits the duplicate
 //! POLYCOPY_CANARY_VERIFY_TRADE_LOOKUP=yes # read-only exact taker_order_id check; never submits
@@ -28,7 +28,7 @@
 //! The order is always Fill-And-Kill: this project has no cancel-order
 //! client, so a resting GTC canary could be filled later with nothing able to
 //! close it. Choose `POLYCOPY_CANARY_PRICE` away from the current market and
-//! `POLYCOPY_CANARY_SIZE` at the venue's minimum to keep an accidental match
+//! the smallest permitted `POLYCOPY_CANARY_SIZE` to keep an accidental match
 //! astronomically unlikely.
 
 #[cfg(feature = "intl_clob")]
@@ -36,7 +36,9 @@
 async fn main() {
     use std::path::PathBuf;
 
-    use polycopy_engine::canary::{write_new_record, CanaryLookupRecord, CanarySubmissionRecord};
+    use polycopy_engine::canary::{
+        canary_build_provenance, write_new_record, CanaryLookupRecord, CanarySubmissionRecord,
+    };
     use polycopy_engine::canary_run::{
         build_signable_order, expected_order_id, lookup_by_id, sign_twice, submit, CanaryRunConfig,
     };
@@ -60,6 +62,11 @@ async fn main() {
             config.spec.side(),
             config.spec.price(),
             config.spec.size()
+        );
+        let provenance = canary_build_provenance();
+        println!(
+            "build_commit={} construction_fingerprint={}",
+            provenance.git_commit, provenance.construction_fingerprint
         );
 
         let client = config

@@ -256,13 +256,14 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
         },
     }
 
-    if let Some((qty, price, _notional)) = claimed.existing_decision {
+    if let Some((qty, price, notional)) = claimed.existing_decision {
         return Ok(SizingOutcome::Decision(SizedDecision {
             intent_id: claimed.intent_id,
             token_id: claimed.token_id.clone(),
             side: claimed.side,
             qty,
             limit_price: price,
+            buy_budget: (claimed.side == Side::Buy).then_some(notional),
         }));
     }
 
@@ -283,7 +284,7 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
         .parse()
         .map_err(|_| ExecuteError::InvalidDecimal("leader_policy.max_price"))?;
 
-    let (qty, limit_price) = match claimed.side {
+    let (qty, limit_price, buy_budget) = match claimed.side {
         Side::Sell => {
             let lot = load_position_lot(
                 pool,
@@ -381,7 +382,7 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
                     return Ok(SizingOutcome::Rejected(reason));
                 }
             };
-            (sell_qty, price)
+            (sell_qty, price, None)
         }
         Side::Buy => {
             let event_size = load_event_size(pool, claimed.intent_id).await?;
@@ -433,27 +434,26 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
                 .max_order_notional
                 .parse()
                 .map_err(|_| ExecuteError::InvalidDecimal("leader_policy.max_order_notional"))?;
+            // A marketable BUY is denominated by the CLOB maker-side USDC
+            // amount. Round that budget down to cents *before* signing;
+            // rounding shares and price independently leaves a maker amount
+            // such as 1.72 * 0.58 = 0.9976, which the CLOB rejects.
             let order_notional = max_notional.min(available_collateral);
-            let notional_capped_qty = if limit_price > Decimal::ZERO {
-                order_notional / limit_price
-            } else {
-                Decimal::ZERO
-            };
-            let qty = round_order_qty_down(event_size.min(notional_capped_qty));
+            let buy_budget = round_usdc_down((event_size * limit_price).min(order_notional));
+            let qty = market_buy_shares_for_budget(buy_budget, limit_price, tick_size);
             if qty <= Decimal::ZERO {
                 return Ok(SizingOutcome::NeedsReconcile(
                     "computed buy quantity is not positive",
                 ));
             }
-            (qty, limit_price)
+            (qty, limit_price, Some(buy_budget))
         }
     };
 
-    let planned_notional = qty * limit_price;
-    // The CLOB refuses a marketable BUY below one USDC. With the configured
-    // cap at exactly one USDC, quantity truncation can make a candidate such
-    // as 1.72 * 0.58 = 0.9976. It is a deterministic local policy rejection,
-    // never a reason to cross the order-submission boundary.
+    let planned_notional = buy_budget.unwrap_or(qty * limit_price);
+    // The CLOB refuses a marketable BUY below one USDC. This check is against
+    // the exact cent-denominated maker budget that will be signed, never an
+    // independently rounded shares-times-price estimate.
     if claimed.side == Side::Buy && planned_notional < Decimal::ONE {
         return Ok(SizingOutcome::Rejected(
             "computed buy notional is below the CLOB minimum of 1 USDC",
@@ -498,6 +498,7 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
         side: claimed.side,
         qty,
         limit_price,
+        buy_budget,
     }))
 }
 
@@ -525,6 +526,24 @@ fn apply_tolerance(event_price: Decimal, tolerance_bps: i64, side: Side) -> Deci
 /// never exceed its confirmed available position.
 fn round_order_qty_down(qty: Decimal) -> Decimal {
     qty.round_dp_with_strategy(2, RoundingStrategy::ToZero)
+}
+
+/// The venue accepts at most cents on a market BUY's maker (USDC) side.
+/// Rounding toward zero guarantees a signed order cannot exceed collateral,
+/// policy, or the persisted rolling-budget reservation.
+fn round_usdc_down(amount: Decimal) -> Decimal {
+    amount.round_dp_with_strategy(2, RoundingStrategy::ToZero)
+}
+
+/// Derives the expected market-BUY taker shares from its already-cent-rounded
+/// maker budget. The CLOB permits `tick decimal places + 2` here (four places
+/// for a 0.01 tick, five for 0.001); this value is informational/persisted
+/// sizing, while the signed maker budget remains authoritative for spend.
+fn market_buy_shares_for_budget(budget: Decimal, price: Decimal, tick_size: Decimal) -> Decimal {
+    if budget <= Decimal::ZERO || price <= Decimal::ZERO || tick_size <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    (budget / price).round_dp_with_strategy(tick_size.scale() + 2, RoundingStrategy::ToZero)
 }
 
 fn round_price(price: Decimal, tick_size: Decimal, side: Side) -> Decimal {
@@ -665,8 +684,8 @@ async fn sum_other_active_buy_reservation_notional(
     account_id: i64,
     exclude_intent_id: i64,
 ) -> Result<Decimal, ExecuteError> {
-    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT reserved_qty, planned_price FROM copy_intents \
+    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT reserved_qty, planned_price, planned_notional_usdc FROM copy_intents \
          WHERE account_id = ? AND id != ? AND side = 'BUY' \
          AND status IN ('in_progress', 'partially_filled')",
     )
@@ -677,7 +696,7 @@ async fn sum_other_active_buy_reservation_notional(
     .map_err(|error| ExecuteError::Database(error.to_string()))?;
 
     let mut total = Decimal::ZERO;
-    for (reserved_qty, planned_price) in rows {
+    for (reserved_qty, planned_price, planned_notional) in rows {
         let reserved_qty = reserved_qty
             .parse::<Decimal>()
             .map_err(|_| ExecuteError::InvalidDecimal("copy_intents.reserved_qty"))?;
@@ -685,7 +704,15 @@ async fn sum_other_active_buy_reservation_notional(
             .ok_or(ExecuteError::InvalidDecimal("copy_intents.planned_price"))?
             .parse::<Decimal>()
             .map_err(|_| ExecuteError::InvalidDecimal("copy_intents.planned_price"))?;
-        total += reserved_qty * planned_price;
+        // New decisions persist the exact cent-denominated maker budget.
+        // Keep the multiplication fallback only for historical rows created
+        // before migration 0007 introduced planned_notional_usdc.
+        total += match planned_notional {
+            Some(notional) => notional
+                .parse::<Decimal>()
+                .map_err(|_| ExecuteError::InvalidDecimal("copy_intents.planned_notional_usdc"))?,
+            None => reserved_qty * planned_price,
+        };
     }
     Ok(total)
 }
@@ -1128,6 +1155,21 @@ mod tests {
             "a sell quantity is also truncated, never rounded above availability"
         );
     }
+
+    #[test]
+    fn market_buy_uses_a_cent_budget_and_allows_venue_taker_precision() {
+        let budget = round_usdc_down(Decimal::new(172, 2) * Decimal::new(58, 2));
+        assert_eq!(budget, Decimal::new(99, 2));
+        assert_eq!(budget.scale(), 2);
+
+        let shares = market_buy_shares_for_budget(
+            Decimal::ONE,
+            Decimal::new(58, 2),
+            Decimal::new(1, 2),
+        );
+        assert_eq!(shares, Decimal::new(17241, 4));
+        assert!(shares <= Decimal::ONE / Decimal::new(58, 2));
+    }
     use crate::{
         copytrading::db::open_and_migrate,
         venue::intl_clob::{StrictCollateralError, StrictPositionError, StrictTokenBalanceReader},
@@ -1262,7 +1304,8 @@ mod tests {
         async fn submit(&self, decision: &SizedDecision) -> Result<OrderReceipt, String> {
             match decision.side {
                 Side::Buy => {
-                    OrderReceipt::from_fak_buy_budget(decision.qty, decision.qty, decision.qty)
+                    let budget = decision.buy_budget.ok_or("BUY decision missing budget")?;
+                    OrderReceipt::from_fak_buy_budget(budget, budget, decision.qty)
                 }
                 Side::Sell => {
                     OrderReceipt::from_fak_sell_shares(decision.qty, decision.qty, decision.qty)
@@ -1765,8 +1808,8 @@ mod tests {
         else {
             panic!("must size successfully");
         };
-        let receipt =
-            OrderReceipt::from_fak_buy_budget(decision.qty, decision.qty, decision.qty).unwrap();
+        let budget = decision.buy_budget.expect("BUY decision has a budget");
+        let receipt = OrderReceipt::from_fak_buy_budget(budget, budget, decision.qty).unwrap();
         let attempt_id = record_attempt(&db, &decision, 1, &receipt).await.unwrap();
 
         // First pass: applies the fill.
@@ -1905,7 +1948,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_buy_below_the_clob_minimum_is_rejected_before_any_attempt_exists() {
+    async fn a_one_usdc_buy_is_not_lost_to_independent_share_price_rounding() {
         let db = TestDb::new().await;
         seed_account_and_schedule(&db).await;
         seed_leader(&db, 1).await;
@@ -1928,29 +1971,22 @@ mod tests {
             .unwrap();
         let balance_reader = FixedBalanceReader::new(Decimal::ZERO, Decimal::new(100, 0));
         let claimed = claim_or_resume_intent(&db, intent).await.unwrap().unwrap();
-        assert!(matches!(
-            size_and_reserve(&db, &balance_reader, &claimed)
-                .await
-                .unwrap(),
-            SizingOutcome::Rejected("computed buy notional is below the CLOB minimum of 1 USDC")
-        ));
-        reject_pre_submit_intent(
-            &db,
-            intent,
-            "computed buy notional is below the CLOB minimum of 1 USDC",
-        )
-        .await
-        .unwrap();
-        let (status, attempts): (String, i64) = sqlx::query_as(
-            "SELECT ci.status, COUNT(oa.id) FROM copy_intents ci LEFT JOIN order_attempts oa \
-             ON oa.intent_id = ci.id WHERE ci.id = ? GROUP BY ci.id",
+        let SizingOutcome::Decision(decision) = size_and_reserve(&db, &balance_reader, &claimed)
+            .await
+            .unwrap()
+        else {
+            panic!("a one-USDC budget must be eligible for submission");
+        };
+        assert_eq!(decision.buy_budget, Some(Decimal::ONE));
+        assert_eq!(decision.qty, Decimal::new(17241, 4));
+        let planned: String = sqlx::query_scalar(
+            "SELECT planned_notional_usdc FROM copy_intents WHERE id = ?",
         )
         .bind(intent)
         .fetch_one(&*db)
         .await
         .unwrap();
-        assert_eq!(status, "rejected");
-        assert_eq!(attempts, 0);
+        assert_eq!(planned, "1");
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@ use std::{
     path::Path,
 };
 
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
 
 /// The fixed parameters of one canary order, validated before any network call.
@@ -74,9 +74,25 @@ impl CanaryOrderSpec {
         self.size
     }
 
+    /// BUY canaries are maker-USDC-budget requests, matching the production
+    /// market-FAK path. The environment field remains named `SIZE` for
+    /// compatibility, but BUY callers must provide a cent-denominated budget.
+    pub fn buy_maker_budget(&self) -> Result<Decimal, CanarySpecError> {
+        if self.side != CanarySide::Buy {
+            return Err(CanarySpecError::BuyBudgetForSell);
+        }
+        if self.size.scale() > 2 {
+            return Err(CanarySpecError::BuyBudgetPrecision { budget: self.size });
+        }
+        Ok(self
+            .size
+            .round_dp_with_strategy(2, RoundingStrategy::ToZero))
+    }
+
     /// The plain, serializable form persisted to `canary-artifacts/` before
     /// this spec is ever built into a signable order.
     pub fn to_record(&self, label: &str, prepared_at_utc: &str) -> CanarySpecRecord {
+        let provenance = canary_build_provenance();
         CanarySpecRecord {
             label: label.to_owned(),
             prepared_at_utc: prepared_at_utc.to_owned(),
@@ -85,7 +101,25 @@ impl CanaryOrderSpec {
             price: self.price.to_string(),
             size: self.size.to_string(),
             order_type: "FAK".to_owned(),
+            build_git_commit: provenance.git_commit.to_owned(),
+            construction_fingerprint: provenance.construction_fingerprint.to_owned(),
         }
+    }
+}
+
+/// Identifies the source used to construct this canary. The fingerprint is a
+/// build-time change detector, not a cryptographic integrity assertion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CanaryBuildProvenance {
+    pub git_commit: &'static str,
+    pub construction_fingerprint: &'static str,
+}
+
+pub fn canary_build_provenance() -> CanaryBuildProvenance {
+    CanaryBuildProvenance {
+        git_commit: option_env!("POLYCOPY_BUILD_GIT_COMMIT").unwrap_or("unknown"),
+        construction_fingerprint: option_env!("POLYCOPY_CONSTRUCTION_FINGERPRINT")
+            .unwrap_or("unknown"),
     }
 }
 
@@ -122,6 +156,8 @@ pub enum CanarySpecError {
     InvalidSide,
     PriceOutOfRange { price: Decimal },
     NonPositiveSize { size: Decimal },
+    BuyBudgetForSell,
+    BuyBudgetPrecision { budget: Decimal },
 }
 
 impl fmt::Display for CanarySpecError {
@@ -136,6 +172,11 @@ impl fmt::Display for CanarySpecError {
             Self::NonPositiveSize { size } => {
                 write!(formatter, "canary size ({size}) must be positive")
             }
+            Self::BuyBudgetForSell => write!(formatter, "a SELL canary has no BUY maker budget"),
+            Self::BuyBudgetPrecision { budget } => write!(
+                formatter,
+                "BUY canary USDC budget ({budget}) must have at most two decimals"
+            ),
         }
     }
 }
@@ -154,6 +195,18 @@ pub struct CanarySpecRecord {
     pub price: String,
     pub size: String,
     pub order_type: String,
+    /// Commit embedded by `build.rs`; `unknown` means this binary was built
+    /// outside Git and without a release-provided commit.
+    #[serde(default = "unknown_provenance")]
+    pub build_git_commit: String,
+    /// Build-time source fingerprint for both construction paths and their
+    /// shared value contract. Historical artifacts lack this value.
+    #[serde(default = "unknown_provenance")]
+    pub construction_fingerprint: String,
+}
+
+fn unknown_provenance() -> String {
+    "unknown".to_owned()
 }
 
 /// A redacted-safe summary of one `post_order` response, persisted after a
@@ -496,6 +549,31 @@ mod tests {
 
         assert_eq!(restored, record);
         assert_eq!(restored.order_type, "FAK");
+        assert_eq!(
+            restored.build_git_commit,
+            canary_build_provenance().git_commit
+        );
+        assert_eq!(
+            restored.construction_fingerprint,
+            canary_build_provenance().construction_fingerprint
+        );
+    }
+
+    #[test]
+    fn historical_spec_record_without_provenance_is_marked_unknown() {
+        let record: CanarySpecRecord = serde_json::from_value(serde_json::json!({
+            "label": "historical-attempt",
+            "prepared_at_utc": "2026-09-01T00:00:00Z",
+            "token_id": "123456",
+            "side": "BUY",
+            "price": "0.55",
+            "size": "5",
+            "order_type": "FAK"
+        }))
+        .expect("historical records remain readable");
+
+        assert_eq!(record.build_git_commit, "unknown");
+        assert_eq!(record.construction_fingerprint, "unknown");
     }
 
     #[test]
@@ -622,7 +700,11 @@ mod tests {
         let permission_denied =
             io::Error::new(io::ErrorKind::PermissionDenied, "ERROR_INVALID_FUNCTION");
         assert!(is_unsupported_directory_sync(&permission_denied));
-        for kind in [io::ErrorKind::Other, io::ErrorKind::BrokenPipe, io::ErrorKind::InvalidInput] {
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::InvalidInput,
+        ] {
             let other = io::Error::new(kind, "real disk error");
             assert!(
                 !is_unsupported_directory_sync(&other),

@@ -137,8 +137,11 @@ POLYCOPY_CANARY_CONFIRM_SUBMIT=yes      # only this exact value submits the firs
 POLYCOPY_CANARY_CONFIRM_DUPLICATE=yes   # only this exact value also submits a second, independently-signed copy
 ```
 
-Choose `POLYCOPY_CANARY_PRICE` away from the current market and
-`POLYCOPY_CANARY_SIZE` at the venue's minimum: the order is always
+For a BUY, `POLYCOPY_CANARY_SIZE` is the maximum maker-side USDC budget and
+must have at most two decimal places; the probe constructs a marketable FAK
+at `POLYCOPY_CANARY_PRICE`. For a SELL, it remains the outcome-token share
+quantity. Choose `POLYCOPY_CANARY_PRICE` away from the current market and
+the smallest permitted `POLYCOPY_CANARY_SIZE`: the order is always
 Fill-And-Kill (this project has no cancel-order client, so a resting GTC
 canary could be filled later with nothing able to close it), and a price far
 from the market keeps an accidental match astronomically unlikely.
@@ -146,7 +149,9 @@ from the market keeps an accidental match astronomically unlikely.
 Run `cargo run --locked --features intl_clob --bin canary_probe`. Every
 persisted record lands under the gitignored `canary-artifacts/<label>/`
 directory (spec, submission, and lookup records only — never a private key,
-full envelope, or raw response body). Record the redacted result using
+full envelope, or raw response body). Each new `spec.json` records the build
+Git commit and a construction-contract fingerprint; a canary result is valid
+only for that recorded construction version. Record the redacted result using
 [`docs/PHASE_0_5_CANARY_REPORT.md`](docs/PHASE_0_5_CANARY_REPORT.md).
 
 ## Database (Phase 1)

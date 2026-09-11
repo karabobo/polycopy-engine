@@ -36,12 +36,26 @@ use std::fmt;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::venue::{types::{OrderId, VenueOrderState}, OrderReceipt};
+use crate::venue::{
+    types::{OrderId, VenueOrderState},
+    OrderReceipt,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Buy,
     Sell,
+}
+
+/// The request-side amount handed to the CLOB builder. This deliberately
+/// models the venue contract rather than a policy decision: a marketable BUY
+/// is maker-side USDC, while a SELL is maker-side outcome-token shares.
+/// Canary and production keep independent SDK construction code, but must
+/// agree on this value before either signs an order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClobOrderAmount {
+    BuyMakerUsdc(Decimal),
+    SellMakerShares(Decimal),
 }
 
 impl Side {
@@ -72,6 +86,10 @@ pub struct SizedDecision {
     pub side: Side,
     pub qty: Decimal,
     pub limit_price: Decimal,
+    /// BUYs are submitted as a USDC-denominated marketable FAK. This is the
+    /// exact maximum maker amount, rounded down to cents before signing. It
+    /// is absent for SELLs, whose request unit remains outcome-token shares.
+    pub buy_budget: Option<Decimal>,
 }
 
 /// The exact, plainly-serializable fields of one signed order attempt.
@@ -85,6 +103,12 @@ pub struct PreparedOrderEnvelope {
     pub side: String,
     pub price: String,
     pub size: String,
+    /// Exact BUY maker budget in USDC. Kept separately from `size`, which is
+    /// the expected taker/share quantity in the signed order. `None` is
+    /// retained only to deserialize historical share-denominated envelopes;
+    /// new BUY envelopes must populate it.
+    #[serde(default)]
+    pub buy_budget_usdc: Option<String>,
     pub salt: u64,
     /// Always "FAK" in v1 (blueprint section 8's stated v1-wide policy).
     pub order_type: String,

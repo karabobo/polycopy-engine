@@ -155,17 +155,30 @@ fn parsed_envelope_size(envelope: &PreparedOrderEnvelope) -> Result<Decimal, Str
         .map_err(|_| format!("invalid envelope size: {}", envelope.size))
 }
 
+/// New BUY envelopes carry the maker-side USDC budget separately from the
+/// signed taker/share size. Fall back only for historical envelopes so an
+/// already-submitted attempt remains queryable without rebuilding it.
+fn parsed_buy_budget(envelope: &PreparedOrderEnvelope) -> Result<Decimal, String> {
+    let raw = envelope.buy_budget_usdc.as_deref().unwrap_or(&envelope.size);
+    Decimal::from_str(raw).map_err(|_| format!("invalid BUY budget: {raw}"))
+}
+
 pub fn receipt_from_submitted_envelope(
     envelope: &PreparedOrderEnvelope,
     making_amount: Decimal,
     taking_amount: Decimal,
 ) -> Result<OrderReceipt, String> {
-    let requested = parsed_envelope_size(envelope)?;
     match envelope.side.as_str() {
-        "BUY" => OrderReceipt::from_fak_buy_budget(requested, requested, taking_amount)
-            .map_err(|error| error.to_string()),
-        "SELL" => OrderReceipt::from_fak_sell_shares(requested, requested, making_amount)
-            .map_err(|error| error.to_string()),
+        "BUY" => {
+            let budget = parsed_buy_budget(envelope)?;
+            OrderReceipt::from_fak_buy_budget(budget, budget, taking_amount)
+                .map_err(|error| error.to_string())
+        }
+        "SELL" => {
+            let requested = parsed_envelope_size(envelope)?;
+            OrderReceipt::from_fak_sell_shares(requested, requested, making_amount)
+                .map_err(|error| error.to_string())
+        }
         other => Err(format!("unsupported envelope side: {other}")),
     }
 }
@@ -238,10 +251,15 @@ impl CopyExecution for IntlClobCopyAdapter {
                     // strict parse mirrors receipt_from_submitted_envelope,
                     // and OrderReceipt's FillOnZeroRequest guard now backs
                     // this up as defense in depth.
-                    let size = parsed_envelope_size(&envelope)?;
                     let receipt = match envelope.side.as_str() {
-                        "BUY" => OrderReceipt::from_fak_buy_budget(size, size, filled_qty),
-                        "SELL" => OrderReceipt::from_fak_sell_shares(size, size, filled_qty),
+                        "BUY" => {
+                            let budget = parsed_buy_budget(&envelope)?;
+                            OrderReceipt::from_fak_buy_budget(budget, budget, filled_qty)
+                        }
+                        "SELL" => {
+                            let size = parsed_envelope_size(&envelope)?;
+                            OrderReceipt::from_fak_sell_shares(size, size, filled_qty)
+                        }
                         other => return Err(format!("unsupported envelope side: {other}")),
                     }
                     .map_err(|error| error.to_string())?;
@@ -551,6 +569,7 @@ mod tests {
             side: side.to_owned(),
             price: "0.55".to_owned(),
             size: size.to_owned(),
+            buy_budget_usdc: (side == "BUY").then(|| size.to_owned()),
             salt: 1,
             order_type: "FAK".to_owned(),
             expected_taker_order_id: "0xabc".to_owned(),
@@ -632,7 +651,7 @@ mod tests {
             RustDecimal::ONE,
         )
         .expect_err("submit path must also fail closed on a malformed size");
-        assert_eq!(error, "invalid envelope size: garbage");
+        assert_eq!(error, "invalid BUY budget: garbage");
     }
 
     #[test]

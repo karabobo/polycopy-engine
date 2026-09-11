@@ -21,7 +21,7 @@ use polymarket_client_sdk_v2::{
     clob::{
         types::{
             response::{OpenOrderResponse, PostOrderResponse},
-            OrderPayload, OrderType, Side, SignableOrder, SignatureType, SignedOrder,
+            Amount, OrderPayload, OrderType, Side, SignableOrder, SignatureType, SignedOrder,
         },
         Client, Config,
     },
@@ -32,7 +32,10 @@ use polymarket_client_sdk_v2::{
 };
 
 use crate::canary::{CanaryOrderSpec, CanarySide};
-use crate::venue::order_hash::{self, ExchangeAddresses, OrderHashError};
+use crate::venue::{
+    execution_contract::ClobOrderAmount,
+    order_hash::{self, ExchangeAddresses, OrderHashError},
+};
 
 type AuthenticatedClient = Client<Authenticated<Normal>>;
 
@@ -113,6 +116,10 @@ impl CanaryRunConfig {
         let size = parse_decimal(&required(&lookup, SIZE_ENV)?, SIZE_ENV)?;
         let spec = CanaryOrderSpec::new(token_id, side, price, size)
             .map_err(CanaryRunConfigError::Spec)?;
+        if side == CanarySide::Buy {
+            spec.buy_maker_budget()
+                .map_err(CanaryRunConfigError::Spec)?;
+        }
         let label = required(&lookup, LABEL_ENV)?;
 
         Ok(Self {
@@ -189,21 +196,41 @@ pub async fn build_signable_order(
 ) -> Result<SignableOrder, CanaryRunError> {
     let token_id =
         U256::from_str(spec.token_id()).map_err(|_| CanaryRunError::InvalidCanaryTokenId)?;
-    let side = match spec.side() {
-        CanarySide::Buy => Side::Buy,
-        CanarySide::Sell => Side::Sell,
-    };
+    match construction_amount(spec)? {
+        ClobOrderAmount::BuyMakerUsdc(budget) => client
+            .market_order()
+            .token_id(token_id)
+            .side(Side::Buy)
+            .price(spec.price())
+            .amount(Amount::usdc(budget).map_err(CanaryRunError::Building)?)
+            .order_type(OrderType::FAK)
+            .build()
+            .await
+            .map_err(CanaryRunError::Building),
+        ClobOrderAmount::SellMakerShares(shares) => client
+            .limit_order()
+            .token_id(token_id)
+            .side(Side::Sell)
+            .price(spec.price())
+            .size(shares)
+            .order_type(OrderType::FAK)
+            .build()
+            .await
+            .map_err(CanaryRunError::Building),
+    }
+}
 
-    client
-        .limit_order()
-        .token_id(token_id)
-        .side(side)
-        .price(spec.price())
-        .size(spec.size())
-        .order_type(OrderType::FAK)
-        .build()
-        .await
-        .map_err(CanaryRunError::Building)
+/// Canary's independently-maintained construction contract. It deliberately
+/// does not call production preparation; the all-features drift test compares
+/// the two results before either path can reach an SDK builder.
+pub fn construction_amount(spec: &CanaryOrderSpec) -> Result<ClobOrderAmount, CanaryRunError> {
+    match spec.side() {
+        CanarySide::Buy => spec
+            .buy_maker_budget()
+            .map(ClobOrderAmount::BuyMakerUsdc)
+            .map_err(CanaryRunError::Spec),
+        CanarySide::Sell => Ok(ClobOrderAmount::SellMakerShares(spec.size())),
+    }
 }
 
 /// Signs `signable` twice from two independent clones. Both signatures are
@@ -558,6 +585,7 @@ pub enum CanaryRunError {
     InvalidPrivateKey,
     InvalidApiKey,
     InvalidCanaryTokenId,
+    Spec(crate::canary::CanarySpecError),
     ClientInitialization(SdkError),
     CredentialDerivation(SdkError),
     Authentication(SdkError),
@@ -576,6 +604,7 @@ impl fmt::Display for CanaryRunError {
             Self::InvalidPrivateKey => write!(formatter, "invalid CLOB signing key"),
             Self::InvalidApiKey => write!(formatter, "invalid CLOB L2 API key"),
             Self::InvalidCanaryTokenId => write!(formatter, "invalid canary outcome token ID"),
+            Self::Spec(source) => source.fmt(formatter),
             Self::ClientInitialization(source) => {
                 write!(formatter, "unable to initialize the CLOB client: {source}")
             }
@@ -613,6 +642,7 @@ impl Error for CanaryRunError {
             | Self::InvalidApiKey
             | Self::InvalidCanaryTokenId
             | Self::MissingContractConfig => None,
+            Self::Spec(source) => Some(source),
             Self::ClientInitialization(source)
             | Self::CredentialDerivation(source)
             | Self::Authentication(source)
