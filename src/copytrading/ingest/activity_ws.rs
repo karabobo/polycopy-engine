@@ -28,8 +28,14 @@ use super::{
 
 pub const RTDS_URL: &str = "wss://ws-live-data.polymarket.com";
 const SUBSCRIBE_MESSAGE: &str = r#"{"action":"subscribe","subscriptions":[{"topic":"activity","type":"trades"},{"topic":"activity","type":"orders_matched"}]}"#;
-const PING_INTERVAL: Duration = Duration::from_secs(10);
-const STALE_AFTER: Duration = Duration::from_secs(30);
+// The Activity topic can legitimately be quiet for much longer than a
+// heartbeat interval. Its silence is useful telemetry, but cannot establish
+// that the transport is dead. The venue's application-level PING/PONG is the
+// liveness contract (the vendored SDK uses the same convention). A standard
+// WebSocket control ping is sent alongside it so either supported heartbeat
+// form proves transport health.
+const PING_INTERVAL: Duration = Duration::from_secs(5);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(3);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 
@@ -61,6 +67,43 @@ impl WsExecutionGate {
 /// asserted directly without running the full connection loop.
 pub fn reset_backoff(delay: &mut Duration) {
     *delay = INITIAL_RECONNECT_DELAY;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeartbeatTick {
+    SendPing,
+    AwaitingPong,
+    TimedOut,
+}
+
+/// Transport health is deliberately independent from activity-topic traffic:
+/// a quiet leader must not make a healthy socket look stale.
+#[derive(Debug, Default)]
+struct ApplicationHeartbeat {
+    awaiting_pong_since: Option<tokio::time::Instant>,
+}
+
+impl ApplicationHeartbeat {
+    fn tick(&mut self, now: tokio::time::Instant) -> HeartbeatTick {
+        match self.awaiting_pong_since {
+            Some(sent_at) if now.duration_since(sent_at) >= HEARTBEAT_TIMEOUT => {
+                HeartbeatTick::TimedOut
+            }
+            Some(_) => HeartbeatTick::AwaitingPong,
+            None => {
+                self.awaiting_pong_since = Some(now);
+                HeartbeatTick::SendPing
+            }
+        }
+    }
+
+    fn observe_pong(&mut self) {
+        self.awaiting_pong_since = None;
+    }
+}
+
+fn is_application_pong(text: &str) -> bool {
+    text.trim().eq_ignore_ascii_case("pong")
 }
 
 /// `rustls` 0.23+ does not pick a default crypto backend on its own; without
@@ -137,7 +180,7 @@ fn now_utc() -> String {
 
 /// Runs the activity WebSocket connection forever, reconnecting with
 /// exponential backoff (3s, 6s, 12s, 24s, capped at 60s, matching the
-/// reference implementation) on any disconnect, error, or detected staleness.
+/// reference implementation) on any disconnect, error, or missed heartbeat.
 /// The backoff resets to INITIAL_RECONNECT_DELAY on every successful
 /// connection establishment (Connected event emitted). Never returns under
 /// normal operation; only returns if `pool` itself becomes unusable in a way
@@ -213,39 +256,45 @@ async fn run_once(
 
     let mut ping_interval = tokio::time::interval(PING_INTERVAL);
     ping_interval.tick().await; // the first tick fires immediately; skip it.
-    let mut last_activity = tokio::time::Instant::now();
+    let mut heartbeat = ApplicationHeartbeat::default();
 
     loop {
         tokio::select! {
             _ = ping_interval.tick() => {
-                if last_activity.elapsed() > STALE_AFTER {
-                    return Err(ActivityWsError::Stale);
+                match heartbeat.tick(tokio::time::Instant::now()) {
+                    HeartbeatTick::SendPing => {
+                        writer
+                            .send(Message::Text("PING".into()))
+                            .await
+                            .map_err(|error| ActivityWsError::Send(Box::new(error)))?;
+                        writer
+                            .send(Message::Ping(Vec::new().into()))
+                            .await
+                            .map_err(|error| ActivityWsError::Send(Box::new(error)))?;
+                    }
+                    HeartbeatTick::AwaitingPong => {}
+                    HeartbeatTick::TimedOut => return Err(ActivityWsError::HeartbeatTimedOut),
                 }
-                writer
-                    .send(Message::Text("ping".into()))
-                    .await
-                    .map_err(|error| ActivityWsError::Send(Box::new(error)))?;
             }
             message = reader.next() => {
                 match message {
                     Some(Ok(Message::Text(text))) => {
-                        let outcome = process_message(pool, resolver, &text).await;
-                        if outcome != ProcessOutcome::Skip {
-                            // A real activity-topic message, whether or not
-                            // it belonged to a watched leader: proves the
-                            // subscription is actually delivering data, not
-                            // just that the socket is open (a plain pong
-                            // would not prove that).
-                            last_activity = tokio::time::Instant::now();
-                        }
-                        if let ProcessOutcome::DatabaseError(_) = &outcome {
-                            eprintln!("activity ws: {outcome}");
+                        if is_application_pong(&text) {
+                            heartbeat.observe_pong();
+                        } else {
+                            let outcome = process_message(pool, resolver, &text).await;
+                            if let ProcessOutcome::DatabaseError(_) = &outcome {
+                                eprintln!("activity ws: {outcome}");
+                            }
                         }
                     }
+                    Some(Ok(Message::Pong(_))) => heartbeat.observe_pong(),
+                    Some(Ok(Message::Ping(payload))) => writer
+                        .send(Message::Pong(payload))
+                        .await
+                        .map_err(|error| ActivityWsError::Send(Box::new(error)))?,
                     Some(Ok(Message::Close(_))) | None => return Err(ActivityWsError::ConnectionClosed),
-                    // Binary/native ping/pong frames: this protocol uses
-                    // application-level text "ping"/"PONG", not WS control
-                    // frames, so there is nothing to act on here.
+                    // Binary frames carry no activity or heartbeat semantics.
                     Some(Ok(_)) => {}
                     Some(Err(error)) => return Err(ActivityWsError::Stream(Box::new(error))),
                 }
@@ -262,7 +311,7 @@ pub enum ActivityWsError {
     Send(Box<tokio_tungstenite::tungstenite::Error>),
     Stream(Box<tokio_tungstenite::tungstenite::Error>),
     ConnectionClosed,
-    Stale,
+    HeartbeatTimedOut,
 }
 
 impl fmt::Display for ActivityWsError {
@@ -272,9 +321,9 @@ impl fmt::Display for ActivityWsError {
             Self::Send(source) => write!(formatter, "unable to send: {source}"),
             Self::Stream(source) => write!(formatter, "stream error: {source}"),
             Self::ConnectionClosed => write!(formatter, "connection closed"),
-            Self::Stale => write!(
+            Self::HeartbeatTimedOut => write!(
                 formatter,
-                "no activity-topic message received within {STALE_AFTER:?}"
+                "no application PONG received within {HEARTBEAT_TIMEOUT:?}"
             ),
         }
     }
@@ -284,7 +333,7 @@ impl StdError for ActivityWsError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Connect(source) | Self::Send(source) | Self::Stream(source) => Some(source),
-            Self::ConnectionClosed | Self::Stale => None,
+            Self::ConnectionClosed | Self::HeartbeatTimedOut => None,
         }
     }
 }
@@ -339,6 +388,50 @@ mod tests {
         assert!(gate.is_connected());
         gate.mark_disconnected();
         assert!(!gate.is_connected());
+    }
+
+    #[test]
+    fn quiet_activity_with_timely_pongs_never_times_out() {
+        let start = tokio::time::Instant::now();
+        let mut heartbeat = ApplicationHeartbeat::default();
+
+        // This models 45 seconds without a single activity-topic message.
+        // Each matching PONG is sufficient transport evidence to keep the
+        // realtime gate open; leader silence is not a disconnect.
+        for elapsed in [0_u64, 10, 20, 30, 40] {
+            assert_eq!(
+                heartbeat.tick(start + Duration::from_secs(elapsed)),
+                HeartbeatTick::SendPing
+            );
+            heartbeat.observe_pong();
+        }
+        assert_eq!(
+            heartbeat.tick(start + Duration::from_secs(45)),
+            HeartbeatTick::SendPing
+        );
+    }
+
+    #[test]
+    fn missing_pong_is_the_only_heartbeat_timeout() {
+        let start = tokio::time::Instant::now();
+        let mut heartbeat = ApplicationHeartbeat::default();
+
+        assert_eq!(heartbeat.tick(start), HeartbeatTick::SendPing);
+        assert_eq!(
+            heartbeat.tick(start + HEARTBEAT_TIMEOUT - Duration::from_millis(1)),
+            HeartbeatTick::AwaitingPong
+        );
+        assert_eq!(
+            heartbeat.tick(start + HEARTBEAT_TIMEOUT),
+            HeartbeatTick::TimedOut
+        );
+    }
+
+    #[test]
+    fn application_pong_is_case_insensitive_and_not_an_activity_message() {
+        assert!(is_application_pong(" PONG "));
+        assert!(is_application_pong("pong"));
+        assert!(!is_application_pong("{\"topic\":\"activity\"}"));
     }
 
     // Mirrors src/copytrading/db.rs's TestDb: a migrated pool at a unique

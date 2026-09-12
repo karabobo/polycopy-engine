@@ -698,6 +698,40 @@ async fn open_reconciliation_for_account_token_excludes_and_blocks_later_intents
 }
 
 #[tokio::test]
+async fn runnable_intents_are_prioritized_by_earliest_deadline_not_token_name() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let later_deadline = seed_pending_buy_with_event_key(&db, "activity:1:tok:BUY:5:later").await;
+    let earlier_deadline =
+        seed_pending_buy_with_event_key(&db, "activity:1:tok:BUY:5:earlier").await;
+
+    // Deliberately make the later deadline sort first lexicographically by
+    // token. The old ORDER BY token_id, id would starve the urgent intent.
+    sqlx::query("UPDATE copy_intents SET token_id = ?, decision_deadline_at = ? WHERE id = ?")
+        .bind("aaa-later-deadline")
+        .bind("2030-01-01T00:01:00.000Z")
+        .bind(later_deadline)
+        .execute(&db.pool)
+        .await
+        .expect("later deadline must update");
+    sqlx::query("UPDATE copy_intents SET token_id = ?, decision_deadline_at = ? WHERE id = ?")
+        .bind("zzz-earlier-deadline")
+        .bind("2030-01-01T00:00:01.000Z")
+        .bind(earlier_deadline)
+        .execute(&db.pool)
+        .await
+        .expect("earlier deadline must update");
+
+    assert_eq!(
+        list_runnable_intents(&db, 1)
+            .await
+            .expect("runnable intents"),
+        vec![earlier_deadline, later_deadline]
+    );
+}
+
+#[tokio::test]
 async fn recovered_order_id_with_non_terminal_order_state_opens_reconciliation() {
     let db = TestDb::new().await;
     seed_account_and_schedule(&db).await;

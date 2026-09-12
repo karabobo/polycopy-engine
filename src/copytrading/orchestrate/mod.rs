@@ -148,7 +148,13 @@ pub async fn list_runnable_intents(
                  AND rc.token_id = ci.token_id \
                  AND rc.resolved_at IS NULL \
            ) \
-         ORDER BY token_id, id",
+         -- A short decision window is a freshness bound, not a queueing
+         -- hint. Token ordering can put an almost-expired intent behind an
+         -- unrelated, later-deadline token and make expiry deterministic
+         -- during a burst. Null is last for legacy/corrupt rows; normal
+         -- planned intents always carry a durable deadline.
+         ORDER BY CASE WHEN ci.decision_deadline_at IS NULL THEN 1 ELSE 0 END, \
+                  ci.decision_deadline_at ASC, ci.id ASC",
     )
     .bind(account_id)
     .fetch_all(pool)

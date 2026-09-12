@@ -262,12 +262,12 @@ available field rules that out entirely.
   between sources; testable against a real (temp-file) database without a
   live WebSocket or REST call.
 - [`activity_ws.rs`](src/copytrading/ingest/activity_ws.rs) — connects,
-  subscribes, sends an application-level `"ping"` every 10s (the venue's
-  convention, not a WebSocket protocol ping), and reconnects with
-  exponential backoff (3s → 6s → ... → 60s) on any error or on 30 seconds
-  without an activity-topic message. The connection loop itself isn't
-  unit-tested, matching this project's existing precedent for
-  network-touching code.
+  subscribes, sends both the venue's application-level `PING` and a standard
+  WebSocket control Ping every 5s, and reconnects with
+  exponential backoff (3s → 6s → ... → 60s) only on a transport error or a
+  missing `PONG` for 15s. Activity-topic silence is telemetry, not a
+  disconnect. The heartbeat state machine is unit-tested without a live
+  network connection.
 - [`backfill.rs`](src/copytrading/ingest/backfill.rs) — `backfill_leader`:
   catches up a watched leader via the *documented, typed*
   `polymarket_client_sdk_v2::data::Client` (`data-api.polymarket.com`,
