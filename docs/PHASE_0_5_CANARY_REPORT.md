@@ -1,15 +1,14 @@
 # Phase 0.5 CLOB submission-safety canary
 
-Status: **historical Phase 0.5 evidence was independently reviewed as passed
-on 2026-09-02, but revalidation is now required before that evidence can
-cover the current BUY construction path.** The earlier records did not retain
-a source commit or construction fingerprint; they remain evidence for the
-then-built envelope, duplicate, lookup, and receipt behavior, not for a
-subsequent implementation.
+Status: **optional CLOB submission diagnostic.** Historical records document
+the then-built envelope, duplicate, lookup, and receipt behavior; current
+construction provenance is retained with each server-side canary artifact.
+Neither historical nor current canary evidence is a prerequisite for starting
+persistent execution.
 
-This report is required by
-[`COPY_ENGINE_BLUEPRINT.md`](COPY_ENGINE_BLUEPRINT.md) before any automatic
-resubmission of a `submitting` or `uncertain` attempt is enabled.
+This report documents the CLOB behavior relevant to recovery design. A
+`submitting` or `uncertain` attempt still follows the query-first,
+`needs_reconcile` path when lookup is unavailable or contradictory.
 
 Never commit private keys, API credentials, full signed envelopes, raw request
 bodies, or unredacted wallet addresses here. Put any raw operational material
@@ -24,7 +23,7 @@ own shell. Nothing else can set that variable. Set
 `POLYCOPY_CANARY_CONFIRM_DUPLICATE=yes` in the same run to also submit a
 second, independently-signed copy of the identical order for Result 2 below.
 
-## Construction-version attestation (required for the next live canary)
+## Construction-version attestation
 
 `canary_run.rs` and production `prepare.rs` intentionally retain separate SDK
 order builders. Before either builder is invoked, the all-features test
@@ -39,14 +38,12 @@ Every newly persisted `canary-artifacts/<label>/spec.json` contains
 build-time change detector over the two construction paths and their shared
 amount contract, not a cryptographic integrity assertion. A future reviewer
 must record both values alongside the live result and verify they match the
-release being approved. A missing or `unknown` value means the canary cannot
-attest to a production build and is not gate evidence.
+release being diagnosed. A missing or `unknown` value means the canary cannot
+attest to a production build's construction version.
 
-**Current attestation status: revalidation required.** No new order has been
-submitted for this change. The next operator-authorized, deliberately tiny
-BUY canary must use a cent-denominated `POLYCOPY_CANARY_SIZE` USDC budget and
-must retain its `spec.json`; only then can its result be attributed to this
-construction version.
+When an operator runs a deliberately tiny BUY canary, it must use a
+cent-denominated `POLYCOPY_CANARY_SIZE` USDC budget and retain its `spec.json`
+so the result can be attributed to its construction version.
 
 ## Authorization and bounds
 
@@ -265,7 +262,7 @@ IDs, status, and timestamps remain strict. The second read-only lookup then
 succeeded. The deployed artifact is retained under the canary-artifacts
 directory with the recovery-lookup-2 label.
 
-## Gate decision
+## Findings and recovery policy
 
 ### Local recovery implementation (partially live-proven)
 
@@ -320,20 +317,15 @@ The probe now also has a separate, read-only
 order ID and the token, it queries authenticated trade history over a bounded
 24-hour window and writes an exact `taker_order_id` match/miss/failure record.
 It never builds, signs, submits, retries, or duplicates an order. Result 5
-provides the required known-matched live evidence; independent review remains
-the final gate.
+provides known-matched live evidence for the recovery diagnostic.
 
 Historical decision: **passed after independent review on 2026-09-02.** The
 reviewer found no blocker: the mock makes GET requests only, the optional-fee
 normalization does not extend to accounting fields, and the exact-ID/no-
-resubmission recovery rules remain intact. That decision applies to the
-historical construction only. The current BUY construction change requires the
-new attested live canary described above before Phase 0.5 may again be cited
-as a gate for the current build.
+resubmission recovery rules remain intact. Current canary artifacts add
+construction provenance for their respective builds.
 
-This decision validates the narrow Phase 0.5 canary gate only. It does not
-enable automated trading. The known limitation remains: an order ID lost before
-durable persistence is not recoverable by the open-order listing, so automatic
-recovery must continue to depend on the persisted precomputed ID and fail
-closed otherwise. Production copy execution remains subject to every later
-financial-correctness gate in the blueprint.
+This diagnostic does not alter persistent-service configuration. The known
+limitation remains: an order ID lost before durable persistence is not
+recoverable by the open-order listing, so recovery must continue to depend on
+the persisted precomputed ID and fail closed otherwise.

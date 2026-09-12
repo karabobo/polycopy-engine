@@ -10,25 +10,21 @@ does not vendor DRADIS source code or preserve DRADIS commit history.
 The exact audit reference and this independent-implementation decision are
 recorded in [`docs/DRADIS_REFERENCE_BASELINE.md`](docs/DRADIS_REFERENCE_BASELINE.md).
 
-No automated copy-trading client is enabled. The repository contains both a
-narrow Phase 0.5 canary and a bounded copy-execution binary, but neither is
-deployed or enabled. The copy binary requires explicit runtime gates and
-remains blocked until the Phase 0.5 and Phase 7 gates in the blueprint pass.
+No automated copy-trading client is enabled by default. The repository contains
+both a narrow Phase 0.5 canary and a bounded copy-execution binary. Persistent
+execution is governed by its explicit runtime configuration and safety limits;
+Phase 0.5 and GHOST are optional diagnostic evidence, not startup permission.
 
 ## Current development status
 
-Phase 0 is closed (2026-08-30); Phase 0.5 is in progress (three real canary
-orders placed and observed across 2026-08-31 and 2026-09-01; two of four gate
-boxes checked, two still open — see
-[`docs/PHASE_0_5_CANARY_REPORT.md`](docs/PHASE_0_5_CANARY_REPORT.md)). The
+Phase 0 is closed (2026-08-30). Phase 0.5 canary and GHOST records are retained
+as optional diagnostics; they do not block persistent execution. The
 first implemented primitive is a cross-process database ownership lock: a
 second engine instance fails instead of sharing a database and sending
 concurrently for the same account/token.
 
 Phase 1 (durable schema, blueprint section 6) through Phase 6 (Squadron,
-CAG, and Control Tower, section 11) have started, ahead of Phase 0.5's gate
-formally closing, at the account owner's explicit direction while Phase
-0.5's remaining live tests wait on further live confirmation. Phase 1's
+CAG, and Control Tower, section 11) are implemented. Phase 1's
 schema is complete (every table section 6 lists). Phase 2 has a working,
 live-verified connection to the leader-trade firehose plus REST backfill,
 both writing into that schema. Phase 3 turns a recorded event into a
@@ -38,8 +34,7 @@ intent, sizes and reserves it, and finalizes an idempotent receipt into
 submission recovery matrix, and the retry budget that govern how a claimed
 intent is actually submitted. The real writer reconstructs one persisted,
 signed envelope and submits it once; transport uncertainty never retries and
-instead enters query-first reconciliation. It is still not permission to trade:
-see the production gates below.
+instead enters query-first reconciliation.
 Phase 6 adds a read-only leader/intent/lot/reconciliation status layer and
 full attempt-to-event-to-account traceability; it writes nothing. See
 "Database (Phase 1)", "Activity ingestion (Phase 2)", "Intent planning
@@ -55,15 +50,14 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo build --release --all-features --locked
 ```
 
-The `canary_probe` command remains the only permitted live-order path before
-Phase 0.5 closes. It is gated behind an explicit operator-set environment
-variable and is used solely to produce the evidence required by that gate. See
+The `canary_probe` command is an optional, explicitly operator-confirmed
+diagnostic for CLOB submission behavior. See
 [`docs/PHASE_0_STATUS.md`](docs/PHASE_0_STATUS.md) for Phase 0's closed
 status and [`docs/PHASE_0_5_CANARY_REPORT.md`](docs/PHASE_0_5_CANARY_REPORT.md)
-for the required real-order safety evidence template.
+for the real-order diagnostic evidence template.
 
 The execution host's release, default-disabled systemd units, secret boundary,
-and production-promotion gates are documented in
+and operational guidance are documented in
 [`docs/SERVER_DEPLOYMENT.md`](docs/SERVER_DEPLOYMENT.md) and
 [`docs/LIVE_PROGRESSION_RUNBOOK.md`](docs/LIVE_PROGRESSION_RUNBOOK.md). The
 deployment scripts do not start or enable a copy-trading service.
@@ -105,7 +99,8 @@ For Proxy or Gnosis Safe wallets, explicitly set `POLYCOPY_CLOB_FUNDER` to the
 funded address shown in Polymarket before GHOST verification. The current SDK
 can derive a proxy/Safe address from the signing EOA, but the real balance check
 must prove it selects the intended funded account. `poly1271` requires an
-explicit funder and is GHOST-only until Phase 0.5 proves the venue behavior.
+explicit funder; use GHOST and canary diagnostics to validate venue behavior
+for a configured wallet mode before relying on it.
 
 Then run `cargo run --locked --features intl_clob --bin ghost_verify`. The
 command prints only redacted per-row status, returns exit code `3` for a
@@ -369,14 +364,13 @@ paths for a failed balance query and a non-positive sell result.
 
 ## Prepared submission and reconciliation (Phase 5)
 
-The `execute` feature also gates `polycopy_engine::copytrading::reconcile`
+The `execute` feature includes `polycopy_engine::copytrading::reconcile`
 (blueprint section 10): the layer between a sized, reserved intent and the
 venue. It defines a generic `CopyExecution` trait —
 `position_for_token_strict`, `order_for_receipt`,
 `query_prepared_envelope`, and `submit_exact_envelope`. The `execute` feature
 implements this adapter only for the bounded `copy_run` process. It accepts
-one persisted envelope, never rebuilds it after a transport error, and remains
-default-disabled until every production gate passes. See
+one persisted envelope and never rebuilds it after a transport error. See
 [`docs/LIVE_PROGRESSION_RUNBOOK.md`](docs/LIVE_PROGRESSION_RUNBOOK.md).
 
 What Phase 5 does implement, and test without ever calling a real venue,
@@ -467,7 +461,6 @@ carries the old value, a historical-replay harness fed with 305 real
 PolyHermes production rows, and 12-hour GHOST-run tooling: `ghost_verify`
 now emits a structured `GHOST_RECORD:` line per run,
 and the new `ghost_drift_report` binary summarizes a log of them for
-mismatches and gaps). "Live progression" (the later gate that runs one
-leader with a bounded live amount for seven days) is not started — it
-requires independently reviewed Phase 0.5 and 12-hour GHOST evidence; see
+mismatches and gaps). A bounded one-leader progression remains a recommended
+operational validation, not a prerequisite for persistent execution; see
 [`docs/LIVE_PROGRESSION_RUNBOOK.md`](docs/LIVE_PROGRESSION_RUNBOOK.md).

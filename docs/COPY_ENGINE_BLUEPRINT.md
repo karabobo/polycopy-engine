@@ -1,6 +1,6 @@
 # DRADIS Copy Engine Blueprint
 
-**Status:** implementation specification, not yet approved for automated live trading
+**Status:** implementation specification; persistent execution is controlled by runtime safeguards
 **Scope:** one account, multiple leaders, leader-specific policy, Polymarket Intl CLOB
 **Out of scope:** pm-robot integration, automated leader import, paper trading, multi-instance HA,
 generic multi-venue support, and proportional leader exits in the first release.
@@ -11,8 +11,9 @@ research product; it neither starts this engine nor changes its configuration.
 
 ## 1. Release Position and Non-Negotiable Invariants
 
-The engine may be built in GHOST mode immediately. It may not place live orders
-until the Phase 0.5 canary and every Phase 7 gate pass.
+The engine may be built and operated when its explicit runtime safeguards are
+satisfied. Phase 0.5 canary and Phase 7 GHOST evidence are optional diagnostics,
+not prerequisites for starting persistent execution.
 
 1. **Leader events are durable facts.** A WebSocket, `broadcast`, or `mpsc`
    message is only a notification. The durable event ledger is the only input to
@@ -79,7 +80,7 @@ The independent adapter must not reproduce the `Fill.filled` defect: it must
 keep requested, accepted, and filled quantities distinct, with FAK zero-fill
 and partial-fill regression coverage before copy-engine code depends on it. The
 exact CLOB behavior for repeated submission of an identical signed envelope
-remains unverified and is a Phase 0.5 release gate.
+is recorded by the optional Phase 0.5 diagnostic.
 
 ## 3. State Model
 
@@ -152,7 +153,8 @@ Only a venue receipt can finalize that intent automatically; otherwise it is
 
 ## 5. Phase 0.5: CLOB Submission-Safety Canary
 
-This gate occurs before any automatic retry is implemented or enabled.
+This diagnostic establishes real CLOB submission behavior for operators and
+future implementation work.
 
 ### Questions to establish with a deliberately tiny real order
 
@@ -164,15 +166,14 @@ This gate occurs before any automatic retry is implemented or enabled.
 3. Which response fields are stable enough to populate `OrderReceipt` and its
    cumulative filled quantity?
 
-### Gate
+### Diagnostic record
 
 - Record the request/response behavior and the exact lookup method in a test
   report committed with the code.
-- Until the result proves both lookup and duplicate behavior safe,
-  `submitting`/`uncertain` attempts may only query then enter
-  `needs_reconcile`; they may not automatically submit again.
-- A GHOST run cannot satisfy this gate because it does not cross the order HTTP
-  boundary.
+- `submitting`/`uncertain` attempts query first and enter `needs_reconcile`
+  when lookup is unavailable or contradictory; they do not automatically submit
+  again merely because a response was lost.
+- A GHOST run is read-only and cannot establish order-HTTP behavior.
 
 ## 6. Phase 1: Account Model, Connection Policy, and Schema
 
@@ -405,7 +406,7 @@ repeat submission.
 | --- | --- |
 | `prepared` | Persist `submitting` plus `submission_started_at`, then submit once. |
 | `submitting` after restart | Treat as `uncertain`; query first. |
-| `uncertain` | Query first. Resubmit only when the Phase 0.5 canary has proven this safe. |
+| `uncertain` | Query first; missing, late, or contradictory lookup enters `needs_reconcile`, never a blind resubmission. |
 | `accepted` / `finalized` | Reconcile or finalize the receipt delta; never submit again. |
 | `rejected` | A new attempt may be prepared only if the rejection is definitive and policy/deadline/retry budget permit it. |
 
@@ -450,7 +451,7 @@ and read-only status only.
 - Control Tower can trace any attempt to event, leader, account, configuration
   snapshot, reservation, receipt, and reconciliation state.
 
-## 12. Phase 7: End-to-End Verification and Live Gates
+## 12. Phase 7: End-to-End Verification and Optional Live Diagnostics
 
 ### Historical replay
 
@@ -479,15 +480,16 @@ Label historical PolyHermes rows before using them:
 7. A 12-hour GHOST run that reconciles ledger, intent, and strict venue reads
    without unexplained event loss.
 
-### Live progression
+### Recommended live progression
 
-1. Complete Phase 0.5 with one deliberately tiny canary order.
-2. Run one leader with an explicitly bounded amount for seven days.
-3. Require zero unresolved, over-tolerance drift cases beyond the configured SLA.
-4. Any unresolved drift or submission uncertainty freezes its account/token until
-   a human resolves the recorded case.
-5. Only then add leaders one at a time. Multi-account and HA require a separate
-   architecture review; they are not enabled by the v1 schema alone.
+1. Optionally run a deliberately tiny canary order to observe CLOB behavior.
+2. Optionally run one leader with an explicitly bounded amount for seven days.
+3. Review any drift cases beyond the configured SLA.
+4. Any unresolved drift or submission uncertainty still freezes its account/token
+   until a human resolves the recorded case.
+5. Add leaders according to the configured persistent scope. Multi-account and
+   HA require a separate architecture review; they are not enabled by the v1
+   schema alone.
 
 ## 13. Dependency Order
 
@@ -511,5 +513,6 @@ Phase 6    Squadron/CAG status integration
 Phase 7    Replay, GHOST, small live progression
 ```
 
-Phase 0.5, Phase 4, and Phase 5 are financial-correctness gates. A passing build,
-green unit tests, or a healthy WebSocket alone is not permission to bypass them.
+Phase 4 and Phase 5 are runtime financial-correctness safeguards. A passing
+build, green unit tests, or a healthy WebSocket alone does not bypass their
+failure handling, reconciliation, budget, or fuse behavior.

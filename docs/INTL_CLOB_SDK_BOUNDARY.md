@@ -58,9 +58,9 @@ submission, cancellation, retries, automatic envelope lookup, or credential
 persistence. No test contacts Polymarket; the tests use an in-memory strict
 reader to lock the error-versus-zero and fail-closed recovery contracts.
 
-## Remaining gate
+## Remaining diagnostic question
 
-Before a write-capable adapter exists, Phase 0.5 must prove deterministic
-post-boundary lookup and byte-identical duplicate-envelope behavior with an
-explicitly authorized tiny canary order. Until then, unknown submissions must
+Phase 0.5 can observe deterministic post-boundary lookup and byte-identical
+duplicate-envelope behavior with an explicitly authorized tiny canary order.
+Regardless of whether that diagnostic is run, unknown submissions must
 only query and then enter `needs_reconcile`.

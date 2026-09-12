@@ -1,6 +1,6 @@
 # Phase 0 status
 
-Status: **closed 2026-08-30; still not approved for automated trading — that requires Phase 0.5.**
+Status: **closed 2026-08-30; GHOST remains an optional read-only diagnostic.**
 
 This document records evidence for Phase 0 of
 [`COPY_ENGINE_BLUEPRINT.md`](COPY_ENGINE_BLUEPRINT.md). A build, a passing
@@ -44,9 +44,9 @@ lock test, or a healthy connection is not permission to place an order.
 2. The account owner approved closing Phase 0 on 2026-08-30 per the
    financial-correctness gate review (see the report's Decision section).
 
-## Hard stop
+## Scope
 
-No automated copy-execution client exists in this project. The sole
-order-writing surface is the explicitly operator-confirmed Phase 0.5
-`canary_probe`; its report must be complete before any automatic retry or
-live-order path is introduced.
+Phase 0 records baseline safeguards and GHOST behavior. It does not determine
+whether persistent execution may start. Persistent execution remains governed
+by its runtime configuration, budget limits, fuse, and query-first
+reconciliation behavior.

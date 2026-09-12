@@ -30,4 +30,4 @@ ReadWritePaths=/var/lib/polycopy-engine /var/log/polycopy-engine
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 # There is intentionally no [Install] section. This persistent service is
-# static and must be started only after a separate live activation decision.
+# static; an operator starts it explicitly when its runtime configuration is ready.

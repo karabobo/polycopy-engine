@@ -27,5 +27,4 @@ ReadWritePaths=/var/lib/polycopy-engine /var/log/polycopy-engine
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 # There is intentionally no [Install] section. This unit is static and is
-# never enabled as a timer or boot service. Starting it requires a separate,
-# documented, human-reviewed Phase 0.5/Phase 7 gate decision.
+# never enabled as a timer or boot service; an operator starts it explicitly.

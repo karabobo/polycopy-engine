@@ -66,13 +66,13 @@ pub use execute::{
 
 #[cfg(feature = "execute")]
 pub use reconcile::{
-    attempts_in_window, load_or_prepare_attempt, mark_attempt_rejected, mark_attempt_submitting,
-    mark_attempt_uncertain_after_submission_error, open_reconciliation_case,
-    permitted_recovery_action, recover_fak_taker_order_from_trades,
-    recover_lost_submission_response, CopyExecution, LostSubmissionRecoveryOutcome, OrderId,
-    PreparedOrderEnvelope, ReconcileError, RecoveryAction, SubmitError, TradeHistoryLookup,
-    TradeHistoryRecoveryError, TradeHistoryWindow, VenueOrderState, MAX_ATTEMPTS_PER_WINDOW,
-    RETRY_WINDOW_SECONDS,
+    attempts_in_window, inspect_uncertain_attempt_for_operator, load_or_prepare_attempt,
+    mark_attempt_rejected, mark_attempt_submitting, mark_attempt_uncertain_after_submission_error,
+    open_reconciliation_case, permitted_recovery_action, recover_fak_taker_order_from_trades,
+    recover_lost_submission_response, CopyExecution, LostSubmissionRecoveryOutcome,
+    OperatorUncertainLookup, OrderId, PreparedOrderEnvelope, ReconcileError, RecoveryAction,
+    SubmitError, TradeHistoryLookup, TradeHistoryRecoveryError, TradeHistoryWindow,
+    VenueOrderState, MAX_ATTEMPTS_PER_WINDOW, RETRY_WINDOW_SECONDS,
 };
 
 #[cfg(feature = "execute")]
@@ -88,10 +88,10 @@ pub use persistent::{
     fuse_status as persistent_fuse_status, init_config as init_persistent_config,
     pause_fuse as pause_persistent_fuse, reconfigure_config as reconfigure_persistent_config,
     release_definitive_rejection, release_pre_boundary_failure, reserve_budget_and_mark_submitting,
-    resolve_no_virtual_lot_sell_case, resolve_pre_submit_balance_case,
-    resume_fuse as resume_persistent_fuse, rolling_reserved_total, PersistentError,
-    PersistentRuntimeConfig, PersistentSubmitMarker, EXIT_BUDGET_STATE, EXIT_CONFIG,
-    EXIT_FUSE_OPEN, EXIT_LOCK_COLLISION, EXIT_UNRESOLVED_RECOVERY,
+    resolve_no_virtual_lot_sell_case, resolve_operator_confirmed_no_fill,
+    resolve_pre_submit_balance_case, resume_fuse as resume_persistent_fuse, rolling_reserved_total,
+    PersistentError, PersistentRuntimeConfig, PersistentSubmitMarker, EXIT_BUDGET_STATE,
+    EXIT_CONFIG, EXIT_FUSE_OPEN, EXIT_LOCK_COLLISION, EXIT_UNRESOLVED_RECOVERY,
 };
 
 #[cfg(feature = "redeem_detect")]

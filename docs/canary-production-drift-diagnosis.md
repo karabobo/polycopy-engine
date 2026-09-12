@@ -1,9 +1,10 @@
 # Canary/production BUY-path drift diagnosis
 
-Status: **B and C mitigations implemented; current Phase 0.5 evidence still
-requires a new attested BUY canary.** This document preserves the diagnosis
-that motivated the change. Full construction-path unification remains a
-separate design decision.
+Status: **B and C mitigations implemented.** Canary provenance remains useful
+optional diagnostic evidence for the current BUY construction path; it is not
+a persistent-execution startup requirement. This document preserves the
+diagnosis that motivated the change. Full construction-path unification remains
+a separate design decision.
 
 ## The problem
 

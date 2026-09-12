@@ -792,6 +792,137 @@ pub async fn release_definitive_rejection(
     .await
 }
 
+/// Atomically closes one persistent `uncertain` submission after the caller
+/// has just completed a strict authenticated history lookup which found no
+/// exact prepared envelope and obtained an explicit operator no-fill reason.
+///
+/// This is intentionally narrower than `release_definitive_rejection`: a
+/// request may have crossed the venue boundary, so it requires the linked
+/// `unknown_submission` case and records a distinct reservation state.  The
+/// caller is responsible for the venue query; keeping this module
+/// database-only makes it impossible for this function to submit an order.
+pub async fn resolve_operator_confirmed_no_fill(
+    pool: &SqlitePool,
+    account_id: i64,
+    attempt_id: i64,
+    operator_reason: &str,
+) -> Result<i64, PersistentError> {
+    let operator_reason = non_empty(operator_reason, "operator_reason")?;
+    let mut conn = pool.acquire().await.map_err(db_err)?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+    let result: Result<i64, PersistentError> = async {
+        let row: Option<(i64, String, String)> = sqlx::query_as(
+            "SELECT ci.id, ci.status, oa.status FROM order_attempts oa \
+             JOIN copy_intents ci ON ci.id = oa.intent_id \
+             WHERE oa.id = ? AND ci.account_id = ?",
+        )
+        .bind(attempt_id)
+        .bind(account_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        let Some((intent_id, intent_status, attempt_status)) = row else {
+            return Err(PersistentError::UnresolvedRecovery);
+        };
+        if intent_status != "needs_reconcile" || attempt_status != "uncertain" {
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+
+        let cases: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM reconciliation_cases WHERE account_id = ? AND intent_id = ? \
+             AND order_attempt_id = ? AND case_type = 'unknown_submission' \
+             AND resolved_at IS NULL ORDER BY id",
+        )
+        .bind(account_id)
+        .bind(intent_id)
+        .bind(attempt_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        let [case_id] = cases.as_slice() else {
+            return Err(PersistentError::UnresolvedRecovery);
+        };
+
+        let resolution = format!(
+            "operator confirmed no fill after fresh authenticated exact-envelope trade-history lookup: {operator_reason}"
+        );
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let attempt = sqlx::query(
+            "UPDATE order_attempts SET status = 'rejected', failure_detail = ?, \
+             updated_at = ? WHERE id = ? AND status = 'uncertain'",
+        )
+        .bind(&resolution)
+        .bind(&now)
+        .bind(attempt_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        if attempt.rows_affected() != 1 {
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+        let intent = sqlx::query(
+            "UPDATE copy_intents SET status = 'rejected', rejection_reason = ?, reserved_qty = '0', \
+             updated_at = ? WHERE id = ? AND status = 'needs_reconcile'",
+        )
+        .bind(&resolution)
+        .bind(&now)
+        .bind(intent_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        if intent.rows_affected() != 1 {
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+        let reservation = sqlx::query(
+            "UPDATE persistent_budget_reservations SET state = 'released_operator_no_fill', \
+             release_reason = ?, released_at = ? \
+             WHERE order_attempt_id = ? AND account_id = ? AND state = 'reserved'",
+        )
+        .bind(&resolution)
+        .bind(&now)
+        .bind(attempt_id)
+        .bind(account_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        if reservation.rows_affected() != 1 {
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+        let case = sqlx::query(
+            "UPDATE reconciliation_cases SET resolved_at = ?, resolution = ? \
+             WHERE id = ? AND resolved_at IS NULL",
+        )
+        .bind(&now)
+        .bind(&resolution)
+        .bind(case_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        if case.rows_affected() != 1 {
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+        Ok(*case_id)
+    }
+    .await;
+
+    match &result {
+        Ok(_) => {
+            sqlx::query("COMMIT")
+                .execute(&mut *conn)
+                .await
+                .map_err(db_err)?;
+        }
+        Err(_) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+        }
+    }
+    result
+}
+
 /// Resolves a pre-submit SELL case only when the durable virtual ledger proves
 /// that this leader has no lot for the token. This is the safe recovery for an
 /// older runner that misclassified an ordinary leader exit as balance drift.
@@ -1724,6 +1855,144 @@ mod tests {
             resume_fuse(&db, 1, "resume").await,
             Err(PersistentError::UnresolvedRecovery)
         );
+    }
+
+    #[tokio::test]
+    async fn operator_confirmed_no_fill_atomically_closes_the_deadlock_and_allows_resume() {
+        let db = TestDb::new().await;
+        seed_base(&db).await;
+        let config = cfg();
+        let now = Utc::now();
+        let (intent_id, attempt_id) = seed_attempt(
+            &db,
+            "operator-no-fill",
+            "1",
+            now + chrono::Duration::seconds(60),
+        )
+        .await;
+        reserve_budget_and_mark_submitting(&db, &config, intent_id, attempt_id, now)
+            .await
+            .expect("reserve before a possibly-sent request");
+        sqlx::query(
+            "UPDATE order_attempts SET status = 'uncertain', failure_detail = 'transport response lost' WHERE id = ?",
+        )
+        .bind(attempt_id)
+        .execute(&db.pool)
+        .await
+        .expect("uncertain");
+        sqlx::query("UPDATE copy_intents SET status = 'needs_reconcile' WHERE id = ?")
+            .bind(intent_id)
+            .execute(&db.pool)
+            .await
+            .expect("reconcile intent");
+        sqlx::query(
+            "INSERT INTO reconciliation_cases \
+             (account_id, token_id, intent_id, order_attempt_id, case_type, detail) \
+             VALUES (1, '123456', ?, ?, 'unknown_submission', 'no exact trade after strict lookup')",
+        )
+        .bind(intent_id)
+        .bind(attempt_id)
+        .execute(&db.pool)
+        .await
+        .expect("case");
+        pause_fuse(&db, 1, "operator pause", "test")
+            .await
+            .expect("pause");
+
+        let case_id = resolve_operator_confirmed_no_fill(
+            &db,
+            1,
+            attempt_id,
+            "reviewed authenticated history at 2026-09-12T00:00:00Z",
+        )
+        .await
+        .expect("explicit no-fill resolution");
+
+        let attempt: (String, String) =
+            sqlx::query_as("SELECT status, failure_detail FROM order_attempts WHERE id = ?")
+                .bind(attempt_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("attempt");
+        assert_eq!(attempt.0, "rejected");
+        assert!(attempt.1.contains("operator confirmed no fill"));
+        let intent: (String, String) =
+            sqlx::query_as("SELECT status, rejection_reason FROM copy_intents WHERE id = ?")
+                .bind(intent_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("intent");
+        assert_eq!(intent.0, "rejected");
+        assert!(intent.1.contains("reviewed authenticated history"));
+        let reservation: (String, String) = sqlx::query_as(
+            "SELECT state, release_reason FROM persistent_budget_reservations WHERE order_attempt_id = ?",
+        )
+        .bind(attempt_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("reservation");
+        assert_eq!(reservation.0, "released_operator_no_fill");
+        assert!(reservation.1.contains("operator confirmed no fill"));
+        let resolution: String = sqlx::query_scalar(
+            "SELECT resolution FROM reconciliation_cases WHERE id = ? AND resolved_at IS NOT NULL",
+        )
+        .bind(case_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("resolved case");
+        assert!(resolution.contains("reviewed authenticated history"));
+
+        resume_fuse(&db, 1, "recovery evidence reviewed")
+            .await
+            .expect("the resolved attempt must no longer deadlock resume");
+    }
+
+    #[tokio::test]
+    async fn operator_no_fill_refuses_to_free_a_reservation_without_the_linked_case() {
+        let db = TestDb::new().await;
+        seed_base(&db).await;
+        let config = cfg();
+        let now = Utc::now();
+        let (intent_id, attempt_id) = seed_attempt(
+            &db,
+            "operator-no-case",
+            "1",
+            now + chrono::Duration::seconds(60),
+        )
+        .await;
+        reserve_budget_and_mark_submitting(&db, &config, intent_id, attempt_id, now)
+            .await
+            .expect("reserve");
+        sqlx::query("UPDATE order_attempts SET status = 'uncertain' WHERE id = ?")
+            .bind(attempt_id)
+            .execute(&db.pool)
+            .await
+            .expect("uncertain");
+        sqlx::query("UPDATE copy_intents SET status = 'needs_reconcile' WHERE id = ?")
+            .bind(intent_id)
+            .execute(&db.pool)
+            .await
+            .expect("reconcile intent");
+
+        assert_eq!(
+            resolve_operator_confirmed_no_fill(&db, 1, attempt_id, "no linked case").await,
+            Err(PersistentError::UnresolvedRecovery)
+        );
+        let attempt_status: String =
+            sqlx::query_scalar("SELECT status FROM order_attempts WHERE id = ?")
+                .bind(attempt_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("attempt unchanged");
+        let reservation_state: String = sqlx::query_scalar(
+            "SELECT state FROM persistent_budget_reservations WHERE order_attempt_id = ?",
+        )
+        .bind(attempt_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("reservation unchanged");
+        assert_eq!(attempt_status, "uncertain");
+        assert_eq!(reservation_state, "reserved");
     }
 
     #[tokio::test]

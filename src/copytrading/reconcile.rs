@@ -81,6 +81,16 @@ pub enum LostSubmissionRecoveryOutcome {
     NeedsReconcile,
 }
 
+/// Read-only result used by the operator-only uncertain-submission control.
+/// Unlike [`recover_lost_submission_response`], this deliberately makes no
+/// local state change: the command must first show the operator what the
+/// fresh strict query found, then require an explicit no-fill confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorUncertainLookup {
+    Recovered { order_id: OrderId },
+    NotFound,
+}
+
 /// Reads the existing envelope persisted for `(intent_id, attempt_number)`,
 /// or -- if none exists -- persists `candidate` as the one envelope for
 /// this attempt and returns it. Uses `BEGIN IMMEDIATE` (not sqlx's default
@@ -287,6 +297,47 @@ async fn load_pending_trade_history_recovery(
     .map_err(|_| ReconcileError::InvalidSubmissionWindow)?;
 
     Ok(PendingTradeHistoryRecovery { envelope, window })
+}
+
+/// Performs the fresh, authenticated, exact-envelope lookup required before
+/// an operator can resolve an `uncertain` attempt as no-fill.  It never opens
+/// or closes a local reconciliation case and never submits an order.
+///
+/// The account predicate prevents an operator command configured for one
+/// account from inspecting or resolving another account's attempt.
+pub async fn inspect_uncertain_attempt_for_operator<R>(
+    pool: &SqlitePool,
+    reader: &R,
+    account_id: i64,
+    attempt_id: i64,
+    queried_at: DateTime<Utc>,
+) -> Result<OperatorUncertainLookup, ReconcileError>
+where
+    R: StrictTradeHistoryReader + ?Sized,
+{
+    let intent_id: Option<i64> = sqlx::query_scalar(
+        "SELECT oa.intent_id FROM order_attempts oa \
+         JOIN copy_intents ci ON ci.id = oa.intent_id \
+         WHERE oa.id = ? AND ci.account_id = ? AND oa.status = 'uncertain'",
+    )
+    .bind(attempt_id)
+    .bind(account_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+    let intent_id = intent_id.ok_or(ReconcileError::AttemptNotFound)?;
+    let pending =
+        load_pending_trade_history_recovery(pool, intent_id, attempt_id, queried_at).await?;
+
+    match lookup_prepared_fak_in_trade_history(reader, &pending.envelope, pending.window)
+        .await
+        .map_err(|error| ReconcileError::StrictTradeHistoryLookup(error.to_string()))?
+    {
+        TradeHistoryLookup::Recovered { order_id, .. } => {
+            Ok(OperatorUncertainLookup::Recovered { order_id })
+        }
+        TradeHistoryLookup::NotFound => Ok(OperatorUncertainLookup::NotFound),
+    }
 }
 
 async fn persist_recovered_order_id(
@@ -677,6 +728,7 @@ pub enum ReconcileError {
     InvalidSubmissionStartedAt,
     InvalidSubmissionWindow,
     ConflictingRecoveredOrderId,
+    StrictTradeHistoryLookup(String),
 }
 
 impl fmt::Display for ReconcileError {
@@ -707,6 +759,12 @@ impl fmt::Display for ReconcileError {
                 formatter,
                 "order attempt already records a different venue order ID"
             ),
+            Self::StrictTradeHistoryLookup(error) => {
+                write!(
+                    formatter,
+                    "strict trade-history lookup did not prove no-fill: {error}"
+                )
+            }
         }
     }
 }
@@ -1297,6 +1355,45 @@ mod tests {
             case_count, 0,
             "a uniquely recovered ID is not a receipt or a failure"
         );
+    }
+
+    #[tokio::test]
+    async fn operator_inspection_reports_not_found_without_mutating_uncertain_state() {
+        let db = TestDb::new().await;
+        let (intent_id, attempt_id, _) = prepared_submitting_attempt(&db).await;
+        sqlx::query("UPDATE order_attempts SET status = 'uncertain' WHERE id = ?")
+            .bind(attempt_id)
+            .execute(&db.pool)
+            .await
+            .expect("make the possibly-sent attempt query-only");
+        let reader = FakeTradeHistoryReader {
+            reply: FakeTradeHistoryReply::Trades(vec![]),
+        };
+
+        let result = inspect_uncertain_attempt_for_operator(
+            &db,
+            &reader,
+            1,
+            attempt_id,
+            trade_history_window().before(),
+        )
+        .await
+        .expect("empty authenticated history is a result, not a rejection");
+        assert_eq!(result, OperatorUncertainLookup::NotFound);
+        let status: String = sqlx::query_scalar("SELECT status FROM order_attempts WHERE id = ?")
+            .bind(attempt_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("attempt remains durable");
+        let cases: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ?",
+        )
+        .bind(intent_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("inspection writes no case");
+        assert_eq!(status, "uncertain");
+        assert_eq!(cases, 0);
     }
 
     #[tokio::test]

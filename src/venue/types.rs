@@ -26,4 +26,3 @@ pub struct VenueOrderState {
     pub status: String,
     pub size_matched: Decimal,
 }
-

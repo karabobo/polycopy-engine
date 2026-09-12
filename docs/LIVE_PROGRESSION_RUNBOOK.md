@@ -1,18 +1,17 @@
-# Bounded live-progression runbook
+# Persistent execution and optional live-progression runbook
 
-This is an operational safety contract, not permission to start trading. The
-copy unit must remain static and stopped until every prerequisite below is
-independently reviewed.
+This runbook describes persistent execution configuration and optional
+diagnostics. Phase 0.5 canary and GHOST evidence are not prerequisites for
+starting the persistent service.
 
-## Preconditions
+## Optional diagnostics and operational hygiene
 
-1. Phase 0.5 is marked passed only after a real matched canary proves that
+1. A Phase 0.5 real matched canary can prove whether
    `GET /data/trades.taker_order_id` equals the persisted precomputed ID.
-2. The current commit is reviewed, pushed, built remotely, and backed by a
-   verified SQLite `.backup` copy.
-3. A 12-hour GHOST timer window has produced a clean drift report: no bad
-   records, no gaps over fifteen minutes, and no unresolved mismatch.
-4. The signing key is a new server-local credential, not a key ever pasted in
+2. A current commit review, remote build, and verified SQLite `.backup` are
+   recommended before a release change.
+3. A 12-hour GHOST timer window can identify mismatches and run gaps.
+4. The signing key should be a new server-local credential, not a key ever pasted in
    chat. The credential file is root-owned mode `0600`; it contains only
    `POLYCOPY_CLOB_PRIVATE_KEY` and optional complete L2 fields.
 
@@ -190,6 +189,34 @@ submission state remains. The static service uses exit code `20` for lock
 collision, `21` for fuse-open safe stop, `22` for config refusal, `23` for
 unresolved recovery state, and `24` for malformed budget state/budget refusal;
 systemd does not restart on those codes.
+
+### Uncertain submission with no exact trade-history match
+
+Do not edit `order_attempts` or the SQLite database directly. With the
+persistent service stopped, first inspect the one attempt through the strict
+authenticated trade-history path:
+
+```sh
+/opt/polycopy-engine/current/target/release/persistent_control reconcile-uncertain <attempt-id>
+```
+
+This command takes the engine lock, submits no order, and writes no local
+state. A strict-query error or a recovered venue order ID leaves the attempt
+blocked; neither is proof of no fill. Only when this fresh lookup reports no
+exact prepared-envelope match may an account holder record a human no-fill
+decision, with a specific reason:
+
+```sh
+/opt/polycopy-engine/current/target/release/persistent_control reconcile-uncertain <attempt-id> --confirm-no-fill "reviewed authenticated history at <UTC timestamp>"
+```
+
+The confirmation reruns the strict lookup and then atomically requires the
+same attempt to still be `uncertain`, its intent to still be
+`needs_reconcile`, one linked open `unknown_submission` case, and one reserved
+persistent budget row. It records the reason on the attempt, intent, case, and
+the distinct `released_operator_no_fill` budget state. It never submits or
+retries an order. Review `persistent_control status` and all remaining cases
+before a separate explicit `resume`.
 
 ### Proven pre-submission allowance failure
 

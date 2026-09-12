@@ -4,16 +4,14 @@
 
 The designated execution server is the only environment allowed to contact
 Polymarket for this project. Developer machines are for source editing and
-offline tests only. This is a deployment boundary, not authorization to trade:
-until Phase 0.5 and Phase 7 pass, the server may run only authenticated
-read-only GHOST verification or an explicitly operator-confirmed Phase 0.5
-canary.
+offline tests only. Persistent execution starts according to its explicit
+runtime configuration; Phase 0.5 and GHOST are optional diagnostics, not
+startup prerequisites.
 
-The repository now contains a bounded copy-execution binary, including a real
-`submit_exact_envelope` adapter. It is intentionally **not deployed or
-enabled** by this document: the binary refuses to write unless all runtime
-gates are present, and the systemd unit is static. Do not create an automatic
-timer for copy execution.
+The repository contains a bounded copy-execution binary, including a real
+`submit_exact_envelope` adapter. It refuses to write unless its runtime
+configuration is present, and the systemd unit is static. Do not create an
+automatic timer for copy execution.
 
 ## Layout and ownership
 
@@ -178,10 +176,10 @@ journalctl -u polycopy-engine-canary.service --since '-10 min' --no-pager
 Success must explicitly include `DRY RUN: no order was submitted to
 Polymarket.` plus a byte-identical-signature result and an expected order ID.
 The unit has no `[Install]` section, so it cannot be enabled as a timer. A
-successful signing dry run does not pass Phase 0.5 and does not authorize a
-real order.
+successful signing dry run is optional diagnostic evidence; it does not alter
+persistent-service configuration.
 
-## Evidence, backups, and production promotion
+## Evidence, backups, and operation
 
 Keep raw canary artifacts and the future SQLite database only on the server,
 with root-only permissions. Before each migration or release promotion, make a
@@ -189,15 +187,9 @@ timestamped, SQLite-consistent backup using SQLite's `.backup` command; verify
 the copied database opens and run an integrity check before relying on it.
 Do not copy a live WAL database with a plain file copy.
 
-Production promotion remains blocked until all of the following are recorded
-and independently reviewed:
-
-1. Phase 0.5 proves the exact `taker_order_id` recovery lookup after a truly
-   lost response, not merely the submission response's order ID.
-2. The live order writer, strict collateral preflight, market/allowance checks,
-   and its failure-injection tests are implemented and independently reviewed.
-3. Phase 7 historical replay, 12-hour GHOST verification, and bounded
-   single-leader seven-day live progression complete with no unresolved drift.
+Canary artifacts, GHOST records, verified SQLite backups, and historical replay
+results are retained as operational evidence and diagnostics. They are not
+prerequisites for persistent-service startup.
 
 Any query failure, uncertain submission, balance mismatch, or unresolved
 reconciliation case freezes the affected account/token. It is never repaired

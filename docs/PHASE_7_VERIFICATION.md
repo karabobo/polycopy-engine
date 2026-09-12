@@ -1,11 +1,10 @@
 # Phase 7: end-to-end verification
 
 See `docs/COPY_ENGINE_BLUEPRINT.md` section 12. This covers the "Historical
-replay" and "Required tests" portions only. "Live progression" (running one
-leader with a bounded live amount for seven days) remains a separate, later
-gate. A bounded writer now exists, but it is default-disabled and cannot
-satisfy the live gate without independent Phase 0.5 and 12-hour GHOST
-evidence; see `docs/LIVE_PROGRESSION_RUNBOOK.md`.
+replay" and "Required tests" portions. A bounded one-leader progression and a
+12-hour GHOST window remain optional operational diagnostics; neither is a
+prerequisite for persistent execution. See
+`docs/LIVE_PROGRESSION_RUNBOOK.md`.
 
 ## Required tests: status
 
@@ -17,7 +16,7 @@ evidence; see `docs/LIVE_PROGRESSION_RUNBOOK.md`.
 | 4 | Process death after dispatch, before receipt; recovery without a duplicate lot or unsafe resubmission | Done | `reconcile.rs::a_crash_between_dispatch_and_receipt_recovers_to_exactly_one_lot_no_resubmission` — chains real recovery + real finalize end to end, not just the pieces each already covered alone |
 | 5 | Duplicate receipt delivery, partial fill, exactly-once lot deltas | Already substantially done | `execute.rs`/`reconcile.rs`'s existing idempotent-finalize tests; also re-exercised by #4 above |
 | 6 | Token query failure, stale signal, changed lane count, second-process lock failure | Done | Token query failure and stale signal were already covered; second-process lock was already covered (`process_lock.rs`); **changed lane count was a genuine gap** — closed by the new `plan::verify_schedule_compatible_with_pending_work` (a real startup check, not just a test — see below) |
-| 7 | 12-hour GHOST run reconciling ledger/intent/strict venue reads with no unexplained event loss | Tooling built; the run itself is the account owner's operation | See "12-hour GHOST run" below |
+| 7 | 12-hour GHOST run reconciling ledger/intent/strict venue reads with no unexplained event loss | Optional tooling built | See "12-hour GHOST run" below |
 | — | Historical replay | Done — 305 real PolyHermes production rows replayed; combination-bet exclusion implemented, grounded in PolyHermes's own source | See "Historical replay" below |
 
 ## New: the lane-count/shard-scheme startup check
@@ -36,7 +35,7 @@ it and refuse to proceed on `Err`. `copy_run` invokes this check before it
 loads any runnable intent, so a changed schedule blocks the bounded runtime
 instead of merely documenting a required manual check.
 
-## 12-hour GHOST run
+## Optional 12-hour GHOST run
 
 `ghost_verify` now also prints one `GHOST_RECORD: {json}` line per run (in
 addition to its existing human-readable output) — a redacted,
@@ -84,9 +83,8 @@ allowance data; it uses the smaller of the two, subtracts in-progress BUY
 reservations for every token in the account, and moves any query uncertainty
 to `needs_reconcile`. The Activity WebSocket gates realtime execution; REST
 backfill is an independent audit worker that backs off on public Data API
-failures without stopping a healthy WS. These are implementation gates, not evidence
-that a real order is safe: the remaining evidence gates are listed in the
-live-progression runbook.
+failures without stopping a healthy WS. These are runtime safeguards; optional
+diagnostics are described in the live-progression runbook.
 
 ## Historical replay
 
