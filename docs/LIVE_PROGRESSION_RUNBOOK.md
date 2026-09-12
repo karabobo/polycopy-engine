@@ -200,10 +200,12 @@ authenticated trade-history path:
 /opt/polycopy-engine/current/target/release/persistent_control reconcile-uncertain <attempt-id>
 ```
 
-This command takes the engine lock, submits no order, and writes no local
-state. A strict-query error or a recovered venue order ID leaves the attempt
-blocked; neither is proof of no fill. Only when this fresh lookup reports no
-exact prepared-envelope match may an account holder record a human no-fill
+This command takes the engine lock and submits no order. A strict-query error
+or a recovered venue order ID leaves the attempt blocked; neither is proof of
+no fill. When the fresh lookup reports no exact prepared-envelope match, it
+opens an auditable `unknown_submission` case and moves the intent to
+`needs_reconcile`; it does not terminate the attempt, release its reservation,
+or resume the fuse. Only then may an account holder record a human no-fill
 decision, with a specific reason:
 
 ```sh

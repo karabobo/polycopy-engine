@@ -12,7 +12,7 @@ async fn main() {
     use polycopy_engine::copytrading::{
         cancel_overdue_pre_submit_intent, init_persistent_config,
         inspect_uncertain_attempt_for_operator, open_and_migrate, pause_persistent_fuse,
-        persistent_fuse_status, reconfigure_persistent_config, release_definitive_rejection,
+        open_reconciliation_case, persistent_fuse_status, reconfigure_persistent_config, release_definitive_rejection,
         resolve_no_virtual_lot_sell_case, resolve_operator_confirmed_no_fill,
         resolve_pre_submit_balance_case, resume_persistent_fuse, OperatorUncertainLookup,
         PersistentRuntimeConfig,
@@ -203,10 +203,30 @@ async fn main() {
                     ))
                 })?;
                 match (lookup, confirmation) {
-                    (OperatorUncertainLookup::NotFound, None) => println!(
-                        "uncertain attempt inspected: account_id={account_id} attempt_id={attempt_id} exact prepared envelope was not found in fresh authenticated trade history; no local state changed. To record a human no-fill decision after reviewing this result, rerun: persistent_control reconcile-uncertain {attempt_id} --confirm-no-fill <reason>"
-                    ),
-                    (OperatorUncertainLookup::NotFound, Some(reason)) => {
+                    (OperatorUncertainLookup::NotFound, confirmation) => {
+                        let intent_id: i64 = sqlx::query_scalar(
+                            "SELECT oa.intent_id FROM order_attempts oa \
+                             JOIN copy_intents ci ON ci.id = oa.intent_id \
+                             WHERE oa.id = ? AND ci.account_id = ? AND oa.status = 'uncertain'",
+                        )
+                        .bind(attempt_id)
+                        .bind(account_id)
+                        .fetch_optional(&pool)
+                        .await
+                        .map_err(|error| polycopy_engine::copytrading::PersistentError::Database(error.to_string()))?
+                        .ok_or(polycopy_engine::copytrading::PersistentError::UnresolvedRecovery)?;
+                        open_reconciliation_case(
+                            &pool,
+                            intent_id,
+                            Some(attempt_id),
+                            "unknown_submission",
+                            "operator strict trade-history lookup contained no exact prepared-order identifier",
+                        )
+                        .await
+                        .map_err(|error| polycopy_engine::copytrading::PersistentError::Config(format!(
+                            "could not record no-match reconciliation state: {error}"
+                        )))?;
+                        if let Some(reason) = confirmation {
                         let case_id = resolve_operator_confirmed_no_fill(
                             &pool,
                             account_id,
@@ -217,6 +237,11 @@ async fn main() {
                         println!(
                             "uncertain attempt resolved as operator-confirmed no-fill: account_id={account_id} attempt_id={attempt_id} case_id={case_id}; the reservation was released with an auditable operator-no-fill state. Run persistent_control resume <reason> separately after reviewing all remaining recovery state."
                         );
+                        } else {
+                            println!(
+                                "uncertain attempt inspected: account_id={account_id} attempt_id={attempt_id} exact prepared envelope was not found in fresh authenticated trade history; an unknown-submission reconciliation case was opened and the intent remains blocked. To record a human no-fill decision after reviewing this result, rerun: persistent_control reconcile-uncertain {attempt_id} --confirm-no-fill <reason>"
+                            );
+                        }
                     }
                     (OperatorUncertainLookup::Recovered { order_id }, _) => {
                         return Err(polycopy_engine::copytrading::PersistentError::Config(format!(
