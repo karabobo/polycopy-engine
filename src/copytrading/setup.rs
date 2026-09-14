@@ -111,6 +111,12 @@ pub struct LeaderPolicyInput {
     /// decides which field actually governs a given order.
     #[serde(default)]
     pub max_order_shares: Option<String>,
+    /// When true, a BUY into a market where this account already holds the
+    /// other outcome (for this same Leader) is sized to match that held
+    /// quantity instead of `max_order_shares`/`max_order_notional`. Default
+    /// false leaves every existing Leader unaffected.
+    #[serde(default)]
+    pub balance_within_market: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -490,8 +496,8 @@ async fn insert_policy(
         "INSERT INTO leader_policy \
          (leader_id, max_signal_age_seconds, decision_window_seconds, price_tolerance_bps, \
           tick_size, min_price, max_price, max_order_notional, min_leader_trade_size, \
-          rolling_budget_usdc, budget_window_seconds, max_order_shares) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          rolling_budget_usdc, budget_window_seconds, max_order_shares, balance_within_market) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(leader_id)
     .bind(policy.max_signal_age_seconds)
@@ -505,6 +511,7 @@ async fn insert_policy(
     .bind(&policy.rolling_budget_usdc)
     .bind(policy.budget_window_seconds)
     .bind(&policy.max_order_shares)
+    .bind(policy.balance_within_market)
     .execute(&mut **tx)
     .await
     .map_err(ConfigError::Database)?;
@@ -529,10 +536,11 @@ async fn update_policy_if_changed(
         Option<String>,
         Option<i64>,
         Option<String>,
+        bool,
     )> = sqlx::query_as(
         "SELECT max_signal_age_seconds, decision_window_seconds, price_tolerance_bps, \
          tick_size, min_price, max_price, max_order_notional, min_leader_trade_size, \
-         rolling_budget_usdc, budget_window_seconds, max_order_shares \
+         rolling_budget_usdc, budget_window_seconds, max_order_shares, balance_within_market \
          FROM leader_policy WHERE leader_id = ?",
     )
     .bind(leader_id)
@@ -552,6 +560,7 @@ async fn update_policy_if_changed(
         policy.rolling_budget_usdc.clone(),
         policy.budget_window_seconds,
         policy.max_order_shares.clone(),
+        policy.balance_within_market,
     );
     if current.as_ref() == Some(&desired) {
         return Ok(false);
@@ -563,6 +572,7 @@ async fn update_policy_if_changed(
              price_tolerance_bps = ?, tick_size = ?, min_price = ?, max_price = ?, \
              max_order_notional = ?, min_leader_trade_size = ?, \
              rolling_budget_usdc = ?, budget_window_seconds = ?, max_order_shares = ?, \
+             balance_within_market = ?, \
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE leader_id = ?",
         )
         .bind(policy.max_signal_age_seconds)
@@ -576,6 +586,7 @@ async fn update_policy_if_changed(
         .bind(&policy.rolling_budget_usdc)
         .bind(policy.budget_window_seconds)
         .bind(&policy.max_order_shares)
+        .bind(policy.balance_within_market)
         .bind(leader_id)
         .execute(&mut **tx)
         .await
@@ -598,6 +609,7 @@ struct NormalizedPolicy {
     rolling_budget_usdc: Option<String>,
     budget_window_seconds: Option<i64>,
     max_order_shares: Option<String>,
+    balance_within_market: bool,
 }
 
 fn normalize_policy(
@@ -679,6 +691,7 @@ fn normalize_policy(
         rolling_budget_usdc,
         budget_window_seconds: policy.budget_window_seconds,
         max_order_shares,
+        balance_within_market: policy.balance_within_market,
     })
 }
 
@@ -846,6 +859,7 @@ mod tests {
             rolling_budget_usdc: None,
             budget_window_seconds: None,
             max_order_shares: None,
+            balance_within_market: false,
         }
     }
 
@@ -1517,4 +1531,46 @@ mod tests {
         assert!(matches!(result, Err(ConfigError::InvalidPolicyField(_))));
     }
 
+    #[tokio::test]
+    async fn balance_within_market_defaults_to_false_and_can_be_enabled() {
+        let db = TestDb::new().await;
+        let config = config_with_one_leader("1");
+
+        let summary = apply_trading_config(
+            &db,
+            &config,
+            SIGNING_ADDRESS,
+            &ConfigApplyOptions::default(),
+        )
+        .await
+        .unwrap();
+        let stored: bool = sqlx::query_scalar(
+            "SELECT balance_within_market FROM leader_policy WHERE leader_id = ?",
+        )
+        .bind(summary.leaders[0].leader_id)
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        assert!(!stored);
+
+        let mut config = config;
+        config.leaders[0].policy.balance_within_market = true;
+        let summary = apply_trading_config(
+            &db,
+            &config,
+            SIGNING_ADDRESS,
+            &ConfigApplyOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(summary.leaders[0].policy_changed);
+        let stored: bool = sqlx::query_scalar(
+            "SELECT balance_within_market FROM leader_policy WHERE leader_id = ?",
+        )
+        .bind(summary.leaders[0].leader_id)
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        assert!(stored);
+    }
 }

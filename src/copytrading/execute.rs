@@ -434,7 +434,34 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
             // amount. Round that budget down to cents *before* signing;
             // rounding shares and price independently leaves a maker amount
             // such as 1.72 * 0.58 = 0.9976, which the CLOB rejects.
-            let buy_budget = match policy.max_order_shares.as_deref() {
+            // A leader can intentionally cross both outcomes of one
+            // condition. In that opt-in mode, close only this account's
+            // *outstanding* same-market delta. In particular, do not size
+            // every split hedge leg to the sibling's whole position: after a
+            // successful first balancing fill that would over-hedge every
+            // later leg. Only confirmed virtual lots participate; pending
+            // intents, maker-side counterparty data, and uncorrelated chain
+            // observations cannot establish a position for sizing.
+            let balancing_target = if policy.balance_within_market {
+                let (sibling_qty, this_qty) = load_same_market_lot_quantities(pool, claimed).await?;
+                (sibling_qty > Decimal::ZERO).then_some((sibling_qty - this_qty).max(Decimal::ZERO))
+            } else {
+                None
+            };
+            let buy_budget = match balancing_target {
+                Some(target_qty) if target_qty > Decimal::ZERO => {
+                    let budget = round_usdc_down(target_qty * limit_price);
+                    // Like fixed-share sizing, an explicit balancing target
+                    // is all-or-nothing: shrinking it would preserve the
+                    // imbalance the policy was enabled to eliminate.
+                    if budget > available_collateral {
+                        return Ok(SizingOutcome::Rejected(
+                            "same-market balancing buy budget exceeds available collateral",
+                        ));
+                    }
+                    budget
+                }
+                _ => match policy.max_order_shares.as_deref() {
                 Some(raw) => {
                     let target_qty: Decimal = raw.parse().map_err(|_| {
                         ExecuteError::InvalidDecimal("leader_policy.max_order_shares")
@@ -459,6 +486,7 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
                     let order_notional = max_notional.min(available_collateral);
                     round_usdc_down((event_size * limit_price).min(order_notional))
                 }
+                },
             };
             let qty = market_buy_shares_for_budget(buy_budget, limit_price, tick_size);
             if qty <= Decimal::ZERO {
@@ -693,6 +721,49 @@ async fn load_position_lot(
             age_seconds: None,
         }),
     }
+}
+
+/// Returns this token's confirmed virtual lot and the total confirmed lot in
+/// the other outcome token(s) that this same leader has traded in the same
+/// condition as `claimed`. `condition_id` is read from the immutable source
+/// event behind the intent, rather than guessed from token IDs or order-book
+/// metadata. The sums deliberately stay in Rust Decimal space.
+async fn load_same_market_lot_quantities(
+    pool: &SqlitePool,
+    claimed: &ClaimedIntent,
+) -> Result<(Decimal, Decimal), ExecuteError> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT pl.token_id, pl.qty \
+         FROM position_lots pl \
+         WHERE pl.account_id = ? AND pl.leader_id = ? \
+           AND pl.token_id IN ( \
+             SELECT DISTINCT sibling.token_id FROM leader_events sibling \
+             JOIN copy_intents current_intent ON current_intent.event_id = ? \
+             JOIN leader_events current_event ON current_event.id = current_intent.event_id \
+             WHERE sibling.leader_id = ? AND sibling.condition_id = current_event.condition_id \
+           )",
+    )
+    .bind(claimed.account_id)
+    .bind(claimed.leader_id)
+    .bind(claimed.intent_id)
+    .bind(claimed.leader_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| ExecuteError::Database(error.to_string()))?;
+
+    let mut sibling_qty = Decimal::ZERO;
+    let mut this_qty = Decimal::ZERO;
+    for (token_id, raw_qty) in rows {
+        let qty = raw_qty
+            .parse::<Decimal>()
+            .map_err(|_| ExecuteError::InvalidDecimal("position_lots.qty"))?;
+        if token_id == claimed.token_id {
+            this_qty += qty;
+        } else {
+            sibling_qty += qty;
+        }
+    }
+    Ok((sibling_qty, this_qty))
 }
 
 /// Sums other active BUY reservations as account-level collateral notional,
@@ -1394,6 +1465,7 @@ mod tests {
             max_price: "0.99".to_owned(),
             max_order_notional: "100000".to_owned(),
             max_order_shares: None,
+            balance_within_market: false,
             min_leader_trade_size: "0".to_owned(),
         };
         let snapshot_json = serde_json::to_string(&snapshot).unwrap();
@@ -1784,6 +1856,7 @@ mod tests {
                 max_price: "0.99".to_owned(),
                 max_order_notional: "1".to_owned(),
                 max_order_shares: Some("10".to_owned()),
+                balance_within_market: false,
                 min_leader_trade_size: "0".to_owned(),
             };
             sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
@@ -1823,6 +1896,7 @@ mod tests {
             max_price: "0.99".to_owned(),
             max_order_notional: "100000".to_owned(),
             max_order_shares: Some("10".to_owned()),
+            balance_within_market: false,
             min_leader_trade_size: "0".to_owned(),
         };
         sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
@@ -1847,6 +1921,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "rejected");
+    }
+
+    #[tokio::test]
+    async fn same_market_balancing_targets_only_the_outstanding_cross_outcome_delta() {
+        let db = TestDb::new().await;
+        seed_account_and_schedule(&db).await;
+        seed_leader(&db, 1).await;
+        let balance_reader = FixedBalanceReader::new(Decimal::ZERO, Decimal::new(100, 0));
+        let submitter = FullFillSubmitter;
+
+        // First outcome: ordinary sizing establishes a confirmed 50-share
+        // virtual lot. All events share the fixture's same condition_id.
+        let up = seed_pending_intent(&db, 1, "up-token", "BUY", "50", "0.50").await;
+        execute_intent(&db, &balance_reader, &submitter, up)
+            .await
+            .unwrap();
+        assert_eq!(lot_qty(&db, 1, "up-token").await, Decimal::new(50, 0));
+
+        let balanced_policy = PolicySnapshot {
+            max_signal_age_seconds: 3600,
+            decision_window_seconds: 300,
+            price_tolerance_bps: 0,
+            tick_size: "0.01".to_owned(),
+            min_price: "0.01".to_owned(),
+            max_price: "0.99".to_owned(),
+            max_order_notional: "1".to_owned(),
+            max_order_shares: Some("5".to_owned()),
+            balance_within_market: true,
+            min_leader_trade_size: "0".to_owned(),
+        };
+
+        // The leader's second leg is only 40 shares, but this account needs
+        // all 50 to reach parity. That delta deliberately overrides the
+        // normal 5-share target while balancing is still needed.
+        let down_first = seed_pending_intent(&db, 1, "down-token", "BUY", "40", "0.50").await;
+        sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
+            .bind(serde_json::to_string(&balanced_policy).unwrap())
+            .bind(down_first)
+            .execute(&*db)
+            .await
+            .unwrap();
+        let claimed = claim_or_resume_intent(&db, down_first).await.unwrap().unwrap();
+        let SizingOutcome::Decision(decision) = size_and_reserve(&db, &balance_reader, &claimed)
+            .await
+            .unwrap()
+        else {
+            panic!("the outstanding same-market delta must be sized");
+        };
+        assert_eq!(decision.qty, Decimal::new(50, 0));
+        assert_eq!(decision.buy_budget, Some(Decimal::new(25, 0)));
+        execute_intent(&db, &balance_reader, &submitter, down_first)
+            .await
+            .unwrap();
+        assert_eq!(lot_qty(&db, 1, "down-token").await, Decimal::new(50, 0));
+
+        // A later split hedge leg sees parity already reached. It must fall
+        // through to the ordinary fixed-share target, not buy 50 again.
+        let down_second = seed_pending_intent(&db, 1, "down-token", "BUY", "10", "0.50").await;
+        sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
+            .bind(serde_json::to_string(&balanced_policy).unwrap())
+            .bind(down_second)
+            .execute(&*db)
+            .await
+            .unwrap();
+        let claimed = claim_or_resume_intent(&db, down_second).await.unwrap().unwrap();
+        let SizingOutcome::Decision(decision) = size_and_reserve(&db, &balance_reader, &claimed)
+            .await
+            .unwrap()
+        else {
+            panic!("an already-balanced leg must use its normal sizing policy");
+        };
+        assert_eq!(decision.qty, Decimal::new(5, 0));
+        assert_eq!(decision.buy_budget, Some(Decimal::new(250, 2)));
     }
 
     #[tokio::test]
@@ -2066,6 +2213,7 @@ mod tests {
             max_price: "0.99".to_owned(),
             max_order_notional: "1".to_owned(),
             max_order_shares: None,
+            balance_within_market: false,
             min_leader_trade_size: "0".to_owned(),
         };
         sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")

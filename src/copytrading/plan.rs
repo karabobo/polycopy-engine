@@ -260,7 +260,7 @@ async fn evaluate_event(
 
     let policy = sqlx::query_as::<_, PolicySnapshot>(
         "SELECT max_signal_age_seconds, decision_window_seconds, price_tolerance_bps, \
-                tick_size, min_price, max_price, max_order_notional, max_order_shares, min_leader_trade_size \
+                tick_size, min_price, max_price, max_order_notional, max_order_shares, balance_within_market, min_leader_trade_size \
          FROM leader_policy WHERE leader_id = ?",
     )
     .bind(event.leader_id)
@@ -342,6 +342,12 @@ pub struct PolicySnapshot {
     /// written before this field was introduced executable.
     #[serde(default)]
     pub max_order_shares: Option<String>,
+    /// Opt-in same-market hedge sizing. When a BUY has a confirmed virtual
+    /// lot in this leader's other outcome of the same condition, execution
+    /// targets only the remaining quantity needed for parity. Defaulting
+    /// keeps snapshots written before this field executable.
+    #[serde(default)]
+    pub balance_within_market: bool,
     pub min_leader_trade_size: String,
 }
 
