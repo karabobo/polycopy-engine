@@ -260,7 +260,7 @@ async fn evaluate_event(
 
     let policy = sqlx::query_as::<_, PolicySnapshot>(
         "SELECT max_signal_age_seconds, decision_window_seconds, price_tolerance_bps, \
-                tick_size, min_price, max_price, max_order_notional, min_leader_trade_size \
+                tick_size, min_price, max_price, max_order_notional, max_order_shares, min_leader_trade_size \
          FROM leader_policy WHERE leader_id = ?",
     )
     .bind(event.leader_id)
@@ -338,6 +338,10 @@ pub struct PolicySnapshot {
     pub min_price: String,
     pub max_price: String,
     pub max_order_notional: String,
+    /// Optional per-leader fixed BUY share target. Defaulting keeps snapshots
+    /// written before this field was introduced executable.
+    #[serde(default)]
+    pub max_order_shares: Option<String>,
     pub min_leader_trade_size: String,
 }
 
@@ -642,6 +646,10 @@ mod tests {
         let db = TestDb::new().await;
         seed_account_and_leader(&db).await;
         seed_policy(&db, 3600, "1").await;
+        sqlx::query("UPDATE leader_policy SET max_order_shares = '10' WHERE leader_id = 1")
+            .execute(&*db)
+            .await
+            .expect("fixed-share policy must update");
         insert_event(&db, "5", &chrono::Utc::now().to_rfc3339()).await;
         plan_next_batch(&db, 1)
             .await
@@ -657,6 +665,7 @@ mod tests {
         assert_eq!(snapshot.tick_size, "0.01");
         assert_eq!(snapshot.price_tolerance_bps, 100);
         assert_eq!(snapshot.max_order_notional, "1000");
+        assert_eq!(snapshot.max_order_shares.as_deref(), Some("10"));
     }
 
     #[tokio::test]

@@ -472,6 +472,7 @@ async fn seed_pending_buy_with_event_key(db: &TestDb, event_key: &str) -> i64 {
         min_price: "0.01".to_owned(),
         max_price: "0.99".to_owned(),
         max_order_notional: "100000".to_owned(),
+        max_order_shares: None,
         min_leader_trade_size: "0".to_owned(),
     };
     sqlx::query_scalar(
@@ -511,6 +512,7 @@ async fn seed_pending_sell_with_event_key(db: &TestDb, event_key: &str) -> i64 {
         min_price: "0.01".to_owned(),
         max_price: "0.99".to_owned(),
         max_order_notional: "100000".to_owned(),
+        max_order_shares: None,
         min_leader_trade_size: "0".to_owned(),
     };
     sqlx::query_scalar(

@@ -57,9 +57,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
-use crate::copytrading::persistent::{
-    MAX_BUDGET_WINDOW_SECONDS, MIN_BUDGET_WINDOW_SECONDS,
-};
+use crate::copytrading::persistent::{MAX_BUDGET_WINDOW_SECONDS, MIN_BUDGET_WINDOW_SECONDS};
 
 pub const CONFIG_APPLIED_PREFIX: &str = "CONFIG_APPLIED: ";
 
@@ -108,6 +106,11 @@ pub struct LeaderPolicyInput {
     /// Window for that budget. Absent falls back to the account window.
     #[serde(default)]
     pub budget_window_seconds: Option<i64>,
+    /// Optional fixed-shares BUY sizing. Absent means this Leader keeps
+    /// sizing from `max_order_notional` exactly as before; execute.rs
+    /// decides which field actually governs a given order.
+    #[serde(default)]
+    pub max_order_shares: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -487,8 +490,8 @@ async fn insert_policy(
         "INSERT INTO leader_policy \
          (leader_id, max_signal_age_seconds, decision_window_seconds, price_tolerance_bps, \
           tick_size, min_price, max_price, max_order_notional, min_leader_trade_size, \
-          rolling_budget_usdc, budget_window_seconds) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          rolling_budget_usdc, budget_window_seconds, max_order_shares) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(leader_id)
     .bind(policy.max_signal_age_seconds)
@@ -501,6 +504,7 @@ async fn insert_policy(
     .bind(&policy.min_leader_trade_size)
     .bind(&policy.rolling_budget_usdc)
     .bind(policy.budget_window_seconds)
+    .bind(&policy.max_order_shares)
     .execute(&mut **tx)
     .await
     .map_err(ConfigError::Database)?;
@@ -524,10 +528,11 @@ async fn update_policy_if_changed(
         String,
         Option<String>,
         Option<i64>,
+        Option<String>,
     )> = sqlx::query_as(
         "SELECT max_signal_age_seconds, decision_window_seconds, price_tolerance_bps, \
          tick_size, min_price, max_price, max_order_notional, min_leader_trade_size, \
-         rolling_budget_usdc, budget_window_seconds \
+         rolling_budget_usdc, budget_window_seconds, max_order_shares \
          FROM leader_policy WHERE leader_id = ?",
     )
     .bind(leader_id)
@@ -546,6 +551,7 @@ async fn update_policy_if_changed(
         policy.min_leader_trade_size.clone(),
         policy.rolling_budget_usdc.clone(),
         policy.budget_window_seconds,
+        policy.max_order_shares.clone(),
     );
     if current.as_ref() == Some(&desired) {
         return Ok(false);
@@ -556,7 +562,7 @@ async fn update_policy_if_changed(
             "UPDATE leader_policy SET max_signal_age_seconds = ?, decision_window_seconds = ?, \
              price_tolerance_bps = ?, tick_size = ?, min_price = ?, max_price = ?, \
              max_order_notional = ?, min_leader_trade_size = ?, \
-             rolling_budget_usdc = ?, budget_window_seconds = ?, \
+             rolling_budget_usdc = ?, budget_window_seconds = ?, max_order_shares = ?, \
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE leader_id = ?",
         )
         .bind(policy.max_signal_age_seconds)
@@ -569,6 +575,7 @@ async fn update_policy_if_changed(
         .bind(&policy.min_leader_trade_size)
         .bind(&policy.rolling_budget_usdc)
         .bind(policy.budget_window_seconds)
+        .bind(&policy.max_order_shares)
         .bind(leader_id)
         .execute(&mut **tx)
         .await
@@ -590,6 +597,7 @@ struct NormalizedPolicy {
     min_leader_trade_size: String,
     rolling_budget_usdc: Option<String>,
     budget_window_seconds: Option<i64>,
+    max_order_shares: Option<String>,
 }
 
 fn normalize_policy(
@@ -634,9 +642,7 @@ fn normalize_policy(
     // out at apply time rather than by watching a Leader silently never trade.
     let rolling_budget_usdc = match policy.rolling_budget_usdc.as_deref() {
         None => None,
-        Some(raw) => {
-            Some(parse_positive_decimal(raw, "rolling_budget_usdc")?.to_string())
-        }
+        Some(raw) => Some(parse_positive_decimal(raw, "rolling_budget_usdc")?.to_string()),
     };
     if let Some(seconds) = policy.budget_window_seconds {
         let seconds = u64::try_from(seconds)
@@ -651,6 +657,16 @@ fn normalize_policy(
         return Err(ConfigError::InvalidPolicyField("budget_window_seconds"));
     }
 
+    // A fixed share target must be a real, positive share count. It is not
+    // compared against `max_notional_ceiling` here -- that ceiling is a
+    // USDC bound, and a shares target's USDC cost varies with price; the
+    // sizing branch that spends it is responsible for still respecting
+    // available collateral at submission time.
+    let max_order_shares = match policy.max_order_shares.as_deref() {
+        None => None,
+        Some(raw) => Some(parse_positive_decimal(raw, "max_order_shares")?.to_string()),
+    };
+
     Ok(NormalizedPolicy {
         max_signal_age_seconds: policy.max_signal_age_seconds,
         decision_window_seconds: policy.decision_window_seconds,
@@ -662,6 +678,7 @@ fn normalize_policy(
         min_leader_trade_size: min_leader_trade_size.to_string(),
         rolling_budget_usdc,
         budget_window_seconds: policy.budget_window_seconds,
+        max_order_shares,
     })
 }
 
@@ -828,6 +845,7 @@ mod tests {
             min_leader_trade_size: "0".to_owned(),
             rolling_budget_usdc: None,
             budget_window_seconds: None,
+            max_order_shares: None,
         }
     }
 
@@ -1434,4 +1452,69 @@ mod tests {
 
         assert!(matches!(result, Err(ConfigError::InvalidPolicyField(_))));
     }
+
+    #[tokio::test]
+    async fn a_fixed_shares_target_is_persisted() {
+        let db = TestDb::new().await;
+        let mut config = config_with_one_leader("1");
+        config.leaders[0].policy.max_order_shares = Some("10".to_owned());
+
+        let summary = apply_trading_config(
+            &db,
+            &config,
+            SIGNING_ADDRESS,
+            &ConfigApplyOptions::default(),
+        )
+        .await
+        .expect("a positive shares target must be accepted");
+
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT max_order_shares FROM leader_policy WHERE leader_id = ?")
+                .bind(summary.leaders[0].leader_id)
+                .fetch_one(&*db)
+                .await
+                .unwrap();
+        assert_eq!(stored.as_deref(), Some("10"));
+    }
+
+    #[tokio::test]
+    async fn omitting_max_order_shares_leaves_it_null() {
+        let db = TestDb::new().await;
+        let config = config_with_one_leader("1");
+
+        let summary = apply_trading_config(
+            &db,
+            &config,
+            SIGNING_ADDRESS,
+            &ConfigApplyOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT max_order_shares FROM leader_policy WHERE leader_id = ?")
+                .bind(summary.leaders[0].leader_id)
+                .fetch_one(&*db)
+                .await
+                .unwrap();
+        assert_eq!(stored, None);
+    }
+
+    #[tokio::test]
+    async fn a_non_positive_max_order_shares_is_rejected() {
+        let db = TestDb::new().await;
+        let mut config = config_with_one_leader("1");
+        config.leaders[0].policy.max_order_shares = Some("0".to_owned());
+
+        let result = apply_trading_config(
+            &db,
+            &config,
+            SIGNING_ADDRESS,
+            &ConfigApplyOptions::default(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ConfigError::InvalidPolicyField(_))));
+    }
+
 }

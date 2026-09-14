@@ -430,16 +430,36 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
             .await?;
             let available_collateral =
                 (strict_collateral.min(strict_allowance) - other_buy_notional).max(Decimal::ZERO);
-            let max_notional: Decimal = policy
-                .max_order_notional
-                .parse()
-                .map_err(|_| ExecuteError::InvalidDecimal("leader_policy.max_order_notional"))?;
             // A marketable BUY is denominated by the CLOB maker-side USDC
             // amount. Round that budget down to cents *before* signing;
             // rounding shares and price independently leaves a maker amount
             // such as 1.72 * 0.58 = 0.9976, which the CLOB rejects.
-            let order_notional = max_notional.min(available_collateral);
-            let buy_budget = round_usdc_down((event_size * limit_price).min(order_notional));
+            let buy_budget = match policy.max_order_shares.as_deref() {
+                Some(raw) => {
+                    let target_qty: Decimal = raw.parse().map_err(|_| {
+                        ExecuteError::InvalidDecimal("leader_policy.max_order_shares")
+                    })?;
+                    let budget = round_usdc_down(target_qty * limit_price);
+                    // Fixed-share sizing must either retain its configured
+                    // target or make no trade. Clamping it to available
+                    // collateral would silently reintroduce the residual
+                    // position drift this policy exists to avoid.
+                    if budget > available_collateral {
+                        return Ok(SizingOutcome::Rejected(
+                            "fixed-share buy budget exceeds available collateral",
+                        ));
+                    }
+                    budget
+                }
+                None => {
+                    let max_notional: Decimal =
+                        policy.max_order_notional.parse().map_err(|_| {
+                            ExecuteError::InvalidDecimal("leader_policy.max_order_notional")
+                        })?;
+                    let order_notional = max_notional.min(available_collateral);
+                    round_usdc_down((event_size * limit_price).min(order_notional))
+                }
+            };
             let qty = market_buy_shares_for_budget(buy_budget, limit_price, tick_size);
             if qty <= Decimal::ZERO {
                 return Ok(SizingOutcome::NeedsReconcile(
@@ -1373,6 +1393,7 @@ mod tests {
             min_price: "0.01".to_owned(),
             max_price: "0.99".to_owned(),
             max_order_notional: "100000".to_owned(),
+            max_order_shares: None,
             min_leader_trade_size: "0".to_owned(),
         };
         let snapshot_json = serde_json::to_string(&snapshot).unwrap();
@@ -1746,6 +1767,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fixed_share_buys_keep_the_configured_target_across_prices() {
+        for (price, expected_budget) in [("0.58", "5.8"), ("0.73", "7.3")] {
+            let db = TestDb::new().await;
+            seed_account_and_schedule(&db).await;
+            seed_leader(&db, 1).await;
+            // The leader size deliberately differs from the configured target:
+            // fixed-share policy is an absolute per-trade target, not a ratio.
+            let intent = seed_pending_intent(&db, 1, "123456", "BUY", "3", price).await;
+            let snapshot = PolicySnapshot {
+                max_signal_age_seconds: 3600,
+                decision_window_seconds: 300,
+                price_tolerance_bps: 0,
+                tick_size: "0.01".to_owned(),
+                min_price: "0.01".to_owned(),
+                max_price: "0.99".to_owned(),
+                max_order_notional: "1".to_owned(),
+                max_order_shares: Some("10".to_owned()),
+                min_leader_trade_size: "0".to_owned(),
+            };
+            sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
+                .bind(serde_json::to_string(&snapshot).unwrap())
+                .bind(intent)
+                .execute(&*db)
+                .await
+                .unwrap();
+
+            let balance_reader = FixedBalanceReader::new(Decimal::ZERO, Decimal::new(100, 0));
+            let claimed = claim_or_resume_intent(&db, intent).await.unwrap().unwrap();
+            let SizingOutcome::Decision(decision) =
+                size_and_reserve(&db, &balance_reader, &claimed)
+                    .await
+                    .unwrap()
+            else {
+                panic!("fixed share target must size successfully");
+            };
+
+            assert_eq!(decision.buy_budget, Some(expected_budget.parse().unwrap()));
+            assert_eq!(decision.qty, Decimal::new(10, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn fixed_share_buy_is_rejected_when_its_budget_exceeds_available_collateral() {
+        let db = TestDb::new().await;
+        seed_account_and_schedule(&db).await;
+        seed_leader(&db, 1).await;
+        let intent = seed_pending_intent(&db, 1, "123456", "BUY", "3", "0.58").await;
+        let snapshot = PolicySnapshot {
+            max_signal_age_seconds: 3600,
+            decision_window_seconds: 300,
+            price_tolerance_bps: 0,
+            tick_size: "0.01".to_owned(),
+            min_price: "0.01".to_owned(),
+            max_price: "0.99".to_owned(),
+            max_order_notional: "100000".to_owned(),
+            max_order_shares: Some("10".to_owned()),
+            min_leader_trade_size: "0".to_owned(),
+        };
+        sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
+            .bind(serde_json::to_string(&snapshot).unwrap())
+            .bind(intent)
+            .execute(&*db)
+            .await
+            .unwrap();
+
+        let balance_reader = FixedBalanceReader::new(Decimal::ZERO, Decimal::new(579, 2));
+        let outcome = execute_intent(&db, &balance_reader, &FullFillSubmitter, intent)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ExecutionOutcome::Rejected("fixed-share buy budget exceeds available collateral")
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+            .bind(intent)
+            .fetch_one(&*db)
+            .await
+            .unwrap();
+        assert_eq!(status, "rejected");
+    }
+
+    #[tokio::test]
     async fn a_second_token_buy_cannot_overspend_collateral_reserved_by_the_first_buy() {
         let db = TestDb::new().await;
         seed_account_and_schedule(&db).await;
@@ -1961,6 +2065,7 @@ mod tests {
             min_price: "0.01".to_owned(),
             max_price: "0.99".to_owned(),
             max_order_notional: "1".to_owned(),
+            max_order_shares: None,
             min_leader_trade_size: "0".to_owned(),
         };
         sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
