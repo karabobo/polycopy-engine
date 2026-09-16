@@ -2180,6 +2180,51 @@ async fn a_definitive_rejection_prepares_one_fresh_retry_without_phantom_lot() {
     assert_eq!(lot.parse::<Decimal>().unwrap(), Decimal::new(5, 0));
 }
 
+#[tokio::test]
+async fn an_explicit_fak_no_match_is_terminal_without_a_retry_or_reconciliation_case() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+    let venue = FakeVenue::succeeding(Decimal::new(5, 0));
+    *venue.submit_result.lock().unwrap() = Err(SubmitError::Rejected(
+        "400 no orders found to match with FAK order".to_owned(),
+    ));
+
+    assert_eq!(
+        execute_one_intent(
+            &db,
+            &FixedBalance(Decimal::new(100, 0)),
+            &venue,
+            &venue,
+            &EmptyHistory,
+            intent_id,
+            Utc::now()
+        )
+        .await
+        .unwrap(),
+        OrchestrateOutcome::Rejected
+    );
+    let intent: (String, String) = sqlx::query_as(
+        "SELECT status, rejection_reason FROM copy_intents WHERE id = ?",
+    )
+    .bind(intent_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(intent.0, "rejected");
+    assert!(intent.1.contains("no matching liquidity"));
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 1);
+    let cases: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ? AND resolved_at IS NULL",
+    )
+    .bind(intent_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(cases, 0);
+}
+
 /// The per-Leader budget exists so one Leader running dry does not stop the
 /// others. That only holds if the runner's own path turns the error into a
 /// skipped signal; the variant was introduced with a comment saying the

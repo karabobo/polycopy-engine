@@ -460,6 +460,19 @@ where
             mark_attempt_rejected(pool, intent_id, attempt.id, &detail).await?;
             release_pre_boundary_failure(pool, attempt.id, "venue definitively rejected order")
                 .await?;
+            // A FAK response that explicitly says that it found no matching
+            // orders is a definitive zero-fill outcome. Re-preparing the same
+            // stale copy signal cannot discover new liquidity at its original
+            // limit, and a burst of such retries must not trip the account
+            // fuse. Transport errors remain query-first above.
+            if detail.contains("no orders found to match with FAK order") {
+                reject_pre_submit_intent(
+                    pool,
+                    intent_id,
+                    "venue found no matching liquidity for FAK order",
+                )
+                .await?;
+            }
             Ok(OrchestrateOutcome::Rejected)
         }
         Err(SubmitError::Local(detail)) => {

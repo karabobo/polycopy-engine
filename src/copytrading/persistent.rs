@@ -792,6 +792,115 @@ pub async fn release_definitive_rejection(
     .await
 }
 
+/// Closes the legacy recovery state produced when an intent exhausted its
+/// retry budget solely through explicit zero-fill FAK rejections. This is
+/// deliberately an operator action: it never constructs, submits, or retries
+/// an order, and it refuses every case containing an uncertain/non-rejected
+/// attempt or a still-reserved budget row.
+pub async fn resolve_exhausted_fak_no_match(
+    pool: &SqlitePool,
+    account_id: i64,
+    intent_id: i64,
+) -> Result<i64, PersistentError> {
+    let mut conn = pool.acquire().await.map_err(db_err)?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+    let result: Result<i64, PersistentError> = async {
+        let rows: Vec<i64> = sqlx::query_scalar(
+            "SELECT rc.id FROM reconciliation_cases rc \
+             JOIN copy_intents ci ON ci.id = rc.intent_id \
+             WHERE rc.account_id = ? AND rc.intent_id = ? \
+               AND ci.status = 'needs_reconcile' AND rc.resolved_at IS NULL \
+               AND rc.case_type = 'blocked_recovery' \
+               AND rc.detail = 'retry budget exhausted'",
+        )
+        .bind(account_id)
+        .bind(intent_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        let [case_id] = rows.as_slice() else {
+            return Err(PersistentError::UnresolvedRecovery);
+        };
+
+        let (total, verified): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), \
+                    SUM(CASE WHEN status = 'rejected' \
+                              AND submission_started_at IS NOT NULL \
+                              AND failure_detail LIKE '%no orders found to match with FAK order%' \
+                             THEN 1 ELSE 0 END) \
+             FROM order_attempts WHERE intent_id = ?",
+        )
+        .bind(intent_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        if total < crate::copytrading::reconcile::MAX_ATTEMPTS_PER_WINDOW || total != verified {
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+
+        let reserved: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM persistent_budget_reservations p \
+             JOIN order_attempts oa ON oa.id = p.order_attempt_id \
+             WHERE oa.intent_id = ? AND p.account_id = ? AND p.state = 'reserved'",
+        )
+        .bind(intent_id)
+        .bind(account_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        if reserved != 0 {
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let reason = "all retry-budget attempts received explicit FAK no-match rejections; signal will not be replayed";
+        let intent = sqlx::query(
+            "UPDATE copy_intents SET status = 'rejected', rejection_reason = ?, reserved_qty = '0', \
+             updated_at = ? WHERE id = ? AND account_id = ? AND status = 'needs_reconcile'",
+        )
+        .bind(reason)
+        .bind(&now)
+        .bind(intent_id)
+        .bind(account_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        if intent.rows_affected() != 1 {
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+        let case = sqlx::query(
+            "UPDATE reconciliation_cases SET resolved_at = ?, resolution = ? \
+             WHERE id = ? AND resolved_at IS NULL",
+        )
+        .bind(&now)
+        .bind(reason)
+        .bind(case_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        if case.rows_affected() != 1 {
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+        Ok(*case_id)
+    }
+    .await;
+
+    match result {
+        Ok(case_id) => {
+            sqlx::query("COMMIT").execute(&mut *conn).await.map_err(db_err)?;
+            Ok(case_id)
+        }
+        Err(error) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            Err(error)
+        }
+    }
+}
+
 /// Atomically closes one persistent `uncertain` submission after the caller
 /// has just completed a strict authenticated history lookup which found no
 /// exact prepared envelope and obtained an explicit operator no-fill reason.
@@ -1765,6 +1874,103 @@ mod tests {
         .await
         .expect("reservation");
         assert_eq!(state, "released_pre_boundary");
+    }
+
+    #[tokio::test]
+    async fn exhausted_explicit_fak_no_match_retries_can_be_closed_without_replaying() {
+        let db = TestDb::new().await;
+        seed_base(&db).await;
+        let config = cfg();
+        let now = Utc::now();
+        let mut intent_id = None;
+        for index in 0..crate::copytrading::reconcile::MAX_ATTEMPTS_PER_WINDOW {
+            let (current_intent, attempt_id) = if let Some(intent_id) = intent_id {
+                let envelope = PreparedOrderEnvelope {
+                    token_id: "123456".to_owned(),
+                    side: "BUY".to_owned(),
+                    price: "1".to_owned(),
+                    size: "1".to_owned(),
+                    buy_budget_usdc: Some("1".to_owned()),
+                    salt: (100 + index) as u64,
+                    order_type: "FAK".to_owned(),
+                    expected_taker_order_id: format!("0xretry{index}"),
+                    signed_order_json: "{}".to_owned(),
+                };
+                load_or_prepare_attempt(&db, intent_id, index + 1, &envelope)
+                    .await
+                    .expect("retry attempt");
+                let attempt_id: i64 = sqlx::query_scalar(
+                    "SELECT id FROM order_attempts WHERE intent_id = ? AND attempt_number = ?",
+                )
+                .bind(intent_id)
+                .bind(index + 1)
+                .fetch_one(&db.pool)
+                .await
+                .expect("retry id");
+                (intent_id, attempt_id)
+            } else {
+                seed_attempt(&db, "fak-exhausted", "1", now + chrono::Duration::seconds(60)).await
+            };
+            intent_id = Some(current_intent);
+            reserve_budget_and_mark_submitting(&db, &config, current_intent, attempt_id, now)
+                .await
+                .expect("reserve");
+            sqlx::query(
+                "UPDATE order_attempts SET status = 'rejected', \
+                 failure_detail = '400 no orders found to match with FAK order' WHERE id = ?",
+            )
+            .bind(attempt_id)
+            .execute(&db.pool)
+            .await
+            .expect("explicit rejection");
+            release_pre_boundary_failure(&db, attempt_id, "venue definitively rejected order")
+                .await
+                .expect("release");
+        }
+        let intent_id = intent_id.expect("intent");
+        sqlx::query("UPDATE copy_intents SET status = 'needs_reconcile' WHERE id = ?")
+            .bind(intent_id)
+            .execute(&db.pool)
+            .await
+            .expect("blocked intent");
+        sqlx::query(
+            "INSERT INTO reconciliation_cases \
+             (account_id, token_id, intent_id, order_attempt_id, case_type, detail) \
+             SELECT 1, '123456', ?, MAX(id), 'blocked_recovery', 'retry budget exhausted' \
+             FROM order_attempts WHERE intent_id = ?",
+        )
+        .bind(intent_id)
+        .bind(intent_id)
+        .execute(&db.pool)
+        .await
+        .expect("blocked case");
+        pause_fuse(&db, 1, "retry budget exhausted", "test")
+            .await
+            .expect("pause");
+
+        let case_id = resolve_exhausted_fak_no_match(&db, 1, intent_id)
+            .await
+            .expect("safe terminal resolution");
+        let intent: (String, String) = sqlx::query_as(
+            "SELECT status, rejection_reason FROM copy_intents WHERE id = ?",
+        )
+        .bind(intent_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("intent");
+        assert_eq!(intent.0, "rejected");
+        assert!(intent.1.contains("will not be replayed"));
+        let resolution: String = sqlx::query_scalar(
+            "SELECT resolution FROM reconciliation_cases WHERE id = ? AND resolved_at IS NOT NULL",
+        )
+        .bind(case_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("resolved case");
+        assert!(resolution.contains("explicit FAK no-match"));
+        resume_fuse(&db, 1, "all FAK no-match rejections reviewed")
+            .await
+            .expect("resolution must permit explicit resume");
     }
 
     #[tokio::test]

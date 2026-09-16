@@ -13,7 +13,7 @@ async fn main() {
         cancel_overdue_pre_submit_intent, init_persistent_config,
         inspect_uncertain_attempt_for_operator, open_and_migrate, pause_persistent_fuse,
         open_reconciliation_case, persistent_fuse_status, reconfigure_persistent_config, release_definitive_rejection,
-        resolve_no_virtual_lot_sell_case, resolve_operator_confirmed_no_fill,
+        resolve_exhausted_fak_no_match, resolve_no_virtual_lot_sell_case, resolve_operator_confirmed_no_fill,
         resolve_pre_submit_balance_case, resume_persistent_fuse, OperatorUncertainLookup,
         PersistentRuntimeConfig,
     };
@@ -30,7 +30,7 @@ async fn main() {
         })?;
         let command = std::env::args().nth(1).ok_or_else(|| {
             polycopy_engine::copytrading::PersistentError::Config(
-                "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|resolve-no-virtual-lot-sell <intent-id>|reconcile-uncertain <attempt-id> [--confirm-no-fill <reason>]|reconcile-preflight"
+                "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|resolve-exhausted-fak-no-match <intent-id>|resolve-no-virtual-lot-sell <intent-id>|reconcile-uncertain <attempt-id> [--confirm-no-fill <reason>]|reconcile-preflight"
                     .to_owned(),
             )
         })?;
@@ -149,6 +149,27 @@ async fn main() {
                 release_definitive_rejection(&pool, account_id, attempt_id).await?;
                 println!(
                     "definitive rejection reservation released: account_id={account_id} attempt_id={attempt_id}"
+                );
+            }
+            "resolve-exhausted-fak-no-match" => {
+                let _lock = EngineLock::acquire_for_database(&db_path).map_err(|error| {
+                    polycopy_engine::copytrading::PersistentError::Config(format!(
+                        "cannot resolve exhausted FAK retries while an engine owns the database: {error}"
+                    ))
+                })?;
+                let account_id = account_id_from_env()?;
+                let intent_id = std::env::args()
+                    .nth(2)
+                    .ok_or_else(|| polycopy_engine::copytrading::PersistentError::Config(
+                        "resolve-exhausted-fak-no-match requires an intent id".to_owned(),
+                    ))?
+                    .parse()
+                    .map_err(|_| polycopy_engine::copytrading::PersistentError::Config(
+                        "invalid intent id".to_owned(),
+                    ))?;
+                let case_id = resolve_exhausted_fak_no_match(&pool, account_id, intent_id).await?;
+                println!(
+                    "exhausted FAK no-match retries resolved: account_id={account_id} intent_id={intent_id} case_id={case_id}; no order was submitted or replayed. Review status and use persistent_control resume <reason> separately."
                 );
             }
             "resolve-no-virtual-lot-sell" => {
@@ -291,7 +312,7 @@ async fn main() {
             }
             _ => {
                 return Err(polycopy_engine::copytrading::PersistentError::Config(
-                    "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|resolve-no-virtual-lot-sell <intent-id>|reconcile-uncertain <attempt-id> [--confirm-no-fill <reason>]|reconcile-preflight"
+                    "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|resolve-exhausted-fak-no-match <intent-id>|resolve-no-virtual-lot-sell <intent-id>|reconcile-uncertain <attempt-id> [--confirm-no-fill <reason>]|reconcile-preflight"
                         .to_owned(),
                 ));
             }
