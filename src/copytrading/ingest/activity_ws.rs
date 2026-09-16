@@ -716,13 +716,13 @@ mod tests {
             outcome,
             ProcessOutcome::Ingested {
                 leader_id: 1,
-                canonical_event_key:
-                    "activity:0xh1:0xleader:0xcond:123:0:BUY:0.5:5:2025-01-01T00:00:00.000Z"
-                        .to_owned()
+                // No timestamp: the key identifies the fill, not the
+                // observation of it. See apply.rs's canonical_event_key.
+                canonical_event_key: "activity:0xh1:0xleader:0xcond:123:0:BUY:0.5:5".to_owned()
             }
         );
 
-        let event_count: i64 = sqlx::query("SELECT COUNT(*) FROM leader_events WHERE canonical_event_key = 'activity:0xh1:0xleader:0xcond:123:0:BUY:0.5:5:2025-01-01T00:00:00.000Z'")
+        let event_count: i64 = sqlx::query("SELECT COUNT(*) FROM leader_events WHERE canonical_event_key = 'activity:0xh1:0xleader:0xcond:123:0:BUY:0.5:5'")
             .fetch_one(&*db)
             .await
             .expect("event count must be queryable")

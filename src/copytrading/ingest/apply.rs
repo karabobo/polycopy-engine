@@ -166,8 +166,16 @@ async fn apply_trade_once(
     // preserve venue spelling ("0.50") while REST may render the same
     // decimal as "0.5"; textual identity would turn one fill into two
     // executable events. Decimal::to_string gives the shared canonical form.
+    //
+    // The sources also disagree on precision for one fill: the WS carries the
+    // venue's full ratio (0.4455297954234464) where REST renders ten places
+    // (0.4455297954), which was splitting single fills across two rows.
+    // Quantizing to REST's precision is what makes them converge. Distinct
+    // fills in one transaction differ by far more than 1e-10 -- they are
+    // separate rungs of an order book -- so this collapses nothing real.
+    const IDENTITY_PRICE_DP: u32 = 10;
     let canonical_price = match Decimal::from_str(&trade.price) {
-        Ok(value) => value.normalize().to_string(),
+        Ok(value) => value.round_dp(IDENTITY_PRICE_DP).normalize().to_string(),
         Err(_) => return ProcessOutcome::Rejected("invalid price in normalized trade"),
     };
     let canonical_size = match Decimal::from_str(&trade.size) {
@@ -175,9 +183,27 @@ async fn apply_trade_once(
         _ => return ProcessOutcome::Rejected("invalid size in normalized trade"),
     };
     // transaction_hash alone is not a safe identity: one settlement can
-    // carry multiple fills. Include every stable field supplied by BOTH WS
-    // and REST, including condition/outcome/time/trader, so distinct fills
-    // are never collapsed merely because token/side/price/size agree.
+    // carry multiple fills. So the identity is every field that describes the
+    // fill itself -- hash, trader, market, token, outcome, side, price, size
+    // -- and nothing that merely describes an observation of it.
+    //
+    // occurred_at was in here, and that is what turned one fill into two live
+    // orders. The engine subscribes to `trades` and `orders_matched`, and 38%
+    // of fills arrive on both (measured 2026-09-16: 5,357 of 14,175 in ninety
+    // seconds). The two topics stamp the same fill up to a second apart, so
+    // one execution produced two keys, two leader_events rows and two
+    // intents; REST disagrees by a second as well. A timestamp says when an
+    // observer saw the fill, not which fill it was.
+    //
+    // Removing it collapses almost nothing. Measured on one topic over two
+    // minutes, the key separated 35 of 12,978 messages with the timestamp and
+    // 38 without it: three pairs identical in transaction, trader, token,
+    // side, price and size, which no observer could tell apart regardless.
+    // And the two errors do not cost the same -- splitting one fill in two
+    // submits a second live order, while collapsing two fills into one copies
+    // slightly less than the leader. Only one of those spends money, so this
+    // identity deliberately errs toward collapsing.
+    //
     // Hash and addresses are lowercased so EIP-55 and mixed-case REST
     // spellings converge to one identity. token_id is rendered as the
     // canonical decimal of its U256 magnitude so leading zeros or quoted
@@ -185,7 +211,7 @@ async fn apply_trade_once(
     let canonical_token_id =
         canonical_decimal_token_id(&trade.token_id).unwrap_or_else(|| trade.token_id.clone());
     let canonical_event_key = format!(
-        "activity:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        "activity:{}:{}:{}:{}:{}:{}:{}:{}",
         trade.transaction_hash.to_ascii_lowercase(),
         trade.trader_address.to_ascii_lowercase(),
         trade.condition_id.to_ascii_lowercase(),
@@ -194,7 +220,6 @@ async fn apply_trade_once(
         side,
         canonical_price,
         canonical_size,
-        trade.occurred_at_utc,
     );
 
     let mut tx = match pool.begin().await {
@@ -563,6 +588,146 @@ mod tests {
             observations, 2,
             "both raw source observations remain auditable"
         );
+    }
+
+    #[tokio::test]
+    async fn one_fill_seen_on_both_activity_topics_creates_one_event() {
+        // The production double-order of 2026-09-16. The engine subscribes to
+        // `trades` and `orders_matched`, and 38% of fills arrive on both. The
+        // two topics stamp the same fill up to a second apart, which used to
+        // produce two canonical keys, two leader_events rows, and two live
+        // copy intents for a single leader execution.
+        let db = TestDb::new().await;
+        sqlx::query("INSERT INTO leader_config (id, label, activation_at) VALUES (1, 'leader-one', '2020-01-01T00:00:00.000Z')")
+            .execute(&*db).await.unwrap();
+        let resolver = AddressResolver::new();
+        resolver.reload([("0xleader".to_owned(), 1)]);
+
+        let trades_topic = trade("23.456789", "0xfeed0002");
+        let mut orders_matched_topic = trades_topic.clone();
+        orders_matched_topic.occurred_at_utc = "2026-08-31T00:00:01.000Z".to_owned();
+        assert_ne!(
+            trades_topic.occurred_at_utc, orders_matched_topic.occurred_at_utc,
+            "the fixture must reproduce the one-second disagreement"
+        );
+
+        let first = apply_trade(
+            &db,
+            &resolver,
+            &trades_topic,
+            "activity_ws",
+            "0xfeed0002",
+            "trades",
+        )
+        .await;
+        let second = apply_trade(
+            &db,
+            &resolver,
+            &orders_matched_topic,
+            "activity_ws",
+            "0xfeed0002",
+            "orders_matched",
+        )
+        .await;
+        let (
+            ProcessOutcome::Ingested {
+                canonical_event_key: first_key,
+                ..
+            },
+            ProcessOutcome::Ingested {
+                canonical_event_key: second_key,
+                ..
+            },
+        ) = (first, second)
+        else {
+            panic!("both topic observations must ingest");
+        };
+        assert_eq!(first_key, second_key, "one fill must have one identity");
+
+        let events: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM leader_events WHERE tx_hash = '0xfeed0002'")
+                .fetch_one(&*db)
+                .await
+                .unwrap();
+        assert_eq!(events, 1, "one execution must not become two orderable events");
+    }
+
+    #[tokio::test]
+    async fn the_two_sources_disagreeing_on_price_precision_are_one_fill() {
+        // Taken from the live database: the WS carried the venue's full ratio
+        // while the REST audit rendered the same fill to ten decimal places,
+        // and the pair became two rows.
+        let db = TestDb::new().await;
+        sqlx::query("INSERT INTO leader_config (id, label, activation_at) VALUES (1, 'leader-one', '2020-01-01T00:00:00.000Z')")
+            .execute(&*db).await.unwrap();
+        let resolver = AddressResolver::new();
+        resolver.reload([("0xleader".to_owned(), 1)]);
+
+        let mut ws = trade("12.345678", "0xfeed0001");
+        ws.price = "0.4455297954234464".to_owned();
+        let mut rest = ws.clone();
+        rest.price = "0.4455297954".to_owned();
+
+        let first = apply_trade(&db, &resolver, &ws, "activity_ws", "0xfeed0001", "ws").await;
+        let second = apply_trade(
+            &db,
+            &resolver,
+            &rest,
+            "activity_backfill",
+            "0xfeed0001",
+            "rest",
+        )
+        .await;
+        let (
+            ProcessOutcome::Ingested {
+                canonical_event_key: first_key,
+                ..
+            },
+            ProcessOutcome::Ingested {
+                canonical_event_key: second_key,
+                ..
+            },
+        ) = (first, second)
+        else {
+            panic!("both source observations must ingest");
+        };
+        assert_eq!(first_key, second_key);
+
+        let events: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM leader_events WHERE tx_hash = '0xfeed0001'")
+                .fetch_one(&*db)
+                .await
+                .unwrap();
+        assert_eq!(events, 1);
+    }
+
+    #[tokio::test]
+    async fn two_fills_in_one_transaction_at_different_prices_stay_distinct() {
+        // The other side of the trade-off. Collapsing is the safer error, but
+        // it must not reach genuinely separate rungs of an order book: a taker
+        // sweeping two price levels really did execute twice. Dropping price
+        // from the identity would merge these, which is why only the timestamp
+        // was removed.
+        let db = TestDb::new().await;
+        sqlx::query("INSERT INTO leader_config (id, label, activation_at) VALUES (1, 'leader-one', '2020-01-01T00:00:00.000Z')")
+            .execute(&*db).await.unwrap();
+        let resolver = AddressResolver::new();
+        resolver.reload([("0xleader".to_owned(), 1)]);
+
+        let mut cheap = trade("5", "0xsweep");
+        cheap.price = "0.51".to_owned();
+        let mut dear = cheap.clone();
+        dear.price = "0.52".to_owned();
+
+        apply_trade(&db, &resolver, &cheap, "activity_ws", "0xsweep", "a").await;
+        apply_trade(&db, &resolver, &dear, "activity_ws", "0xsweep", "b").await;
+
+        let events: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM leader_events WHERE tx_hash = '0xsweep'")
+                .fetch_one(&*db)
+                .await
+                .unwrap();
+        assert_eq!(events, 2, "distinct price levels are distinct fills");
     }
 
     #[tokio::test]
