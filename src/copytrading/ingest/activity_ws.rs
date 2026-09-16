@@ -36,6 +36,9 @@ const SUBSCRIBE_MESSAGE: &str = r#"{"action":"subscribe","subscriptions":[{"topi
 // form proves transport health.
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+// How long the *subscription* may deliver nothing before the connection is
+// treated as dead, independent of transport health. See `StreamWatchdog`.
+const STREAM_SILENCE_TIMEOUT: Duration = Duration::from_secs(60);
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(3);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 
@@ -99,6 +102,56 @@ impl ApplicationHeartbeat {
 
     fn observe_pong(&mut self) {
         self.awaiting_pong_since = None;
+    }
+}
+
+/// Watches the *subscription*, where `ApplicationHeartbeat` watches the
+/// *transport*. Both are needed because they fail independently.
+///
+/// They came apart in production on 2026-09-16: PING/PONG kept answering
+/// normally on a connection whose activity subscription had silently stopped
+/// delivering roughly fourteen minutes in. No reconnect condition existed for
+/// that state, so the engine held the dead subscription for the rest of the
+/// run. Every leader trade after it arrived only through REST backfill, and
+/// backfill deliberately creates no intents -- so nothing was copied, and no
+/// error was logged anywhere. Measured at the time: the socket took 288 bytes
+/// in sixty seconds while a second client on the same host, same endpoint and
+/// same subscribe frame took thousands of messages a minute.
+///
+/// The distinction an earlier revision got wrong by deleting this check: the
+/// subscription is the venue's *global* activity firehose, not one leader's
+/// tape. Measured on the engine host it carries on the order of 3,200
+/// messages a minute across all of Polymarket. A watched leader being quiet
+/// for hours is ordinary and must never trigger a reconnect; the firehose
+/// itself being quiet for a minute is not ordinary, and means this connection
+/// has stopped being useful. So the timer below is fed by every activity
+/// message from any wallet, and never by watched-leader events -- which are
+/// far too rare to serve as a liveness signal.
+///
+/// A false reconnect costs one connection setup (`INITIAL_RECONNECT_DELAY`);
+/// a missed one costs every fill until someone notices by hand. The threshold
+/// is set accordingly.
+#[derive(Debug)]
+struct StreamWatchdog {
+    last_message_at: tokio::time::Instant,
+}
+
+impl StreamWatchdog {
+    /// A fresh connection starts the clock, so a subscription that never
+    /// delivers anything at all is caught by the same timer that catches one
+    /// which stops delivering later.
+    fn started_at(now: tokio::time::Instant) -> Self {
+        Self {
+            last_message_at: now,
+        }
+    }
+
+    fn observe_message(&mut self, now: tokio::time::Instant) {
+        self.last_message_at = now;
+    }
+
+    fn is_silent(&self, now: tokio::time::Instant) -> bool {
+        now.duration_since(self.last_message_at) >= STREAM_SILENCE_TIMEOUT
     }
 }
 
@@ -257,10 +310,17 @@ async fn run_once(
     let mut ping_interval = tokio::time::interval(PING_INTERVAL);
     ping_interval.tick().await; // the first tick fires immediately; skip it.
     let mut heartbeat = ApplicationHeartbeat::default();
+    let mut stream = StreamWatchdog::started_at(tokio::time::Instant::now());
 
     loop {
         tokio::select! {
             _ = ping_interval.tick() => {
+                // Checked before the heartbeat: a silent subscription is the
+                // failure PING/PONG cannot see, so it must not be masked by a
+                // transport that is answering perfectly.
+                if stream.is_silent(tokio::time::Instant::now()) {
+                    return Err(ActivityWsError::StreamSilent);
+                }
                 match heartbeat.tick(tokio::time::Instant::now()) {
                     HeartbeatTick::SendPing => {
                         writer
@@ -282,6 +342,9 @@ async fn run_once(
                         if is_application_pong(&text) {
                             heartbeat.observe_pong();
                         } else {
+                            // Any activity message, watched or not, proves the
+                            // subscription is still delivering.
+                            stream.observe_message(tokio::time::Instant::now());
                             let outcome = process_message(pool, resolver, &text).await;
                             if let ProcessOutcome::DatabaseError(_) = &outcome {
                                 eprintln!("activity ws: {outcome}");
@@ -312,6 +375,7 @@ pub enum ActivityWsError {
     Stream(Box<tokio_tungstenite::tungstenite::Error>),
     ConnectionClosed,
     HeartbeatTimedOut,
+    StreamSilent,
 }
 
 impl fmt::Display for ActivityWsError {
@@ -325,6 +389,11 @@ impl fmt::Display for ActivityWsError {
                 formatter,
                 "no application PONG received within {HEARTBEAT_TIMEOUT:?}"
             ),
+            Self::StreamSilent => write!(
+                formatter,
+                "subscription delivered no activity message within \
+                 {STREAM_SILENCE_TIMEOUT:?} while the transport stayed alive"
+            ),
         }
     }
 }
@@ -333,7 +402,7 @@ impl StdError for ActivityWsError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Connect(source) | Self::Send(source) | Self::Stream(source) => Some(source),
-            Self::ConnectionClosed | Self::HeartbeatTimedOut => None,
+            Self::ConnectionClosed | Self::HeartbeatTimedOut | Self::StreamSilent => None,
         }
     }
 }
@@ -398,6 +467,10 @@ mod tests {
         // This models 45 seconds without a single activity-topic message.
         // Each matching PONG is sufficient transport evidence to keep the
         // realtime gate open; leader silence is not a disconnect.
+        //
+        // Transport evidence only. Whether the *subscription* is still
+        // delivering is `StreamWatchdog`'s question, not this one -- see
+        // `a_silent_subscription_reconnects_while_pongs_keep_arriving`.
         for elapsed in [0_u64, 10, 20, 30, 40] {
             assert_eq!(
                 heartbeat.tick(start + Duration::from_secs(elapsed)),
@@ -432,6 +505,84 @@ mod tests {
         assert!(is_application_pong(" PONG "));
         assert!(is_application_pong("pong"));
         assert!(!is_application_pong("{\"topic\":\"activity\"}"));
+    }
+
+    #[test]
+    fn a_silent_subscription_reconnects_while_pongs_keep_arriving() {
+        // The exact production state of 2026-09-16: the transport answered
+        // every heartbeat while the subscription delivered nothing. Before
+        // the watchdog existed this combination had no reconnect condition
+        // at all, so the engine sat on a dead subscription indefinitely and
+        // copied nothing while looking healthy from every angle.
+        let start = tokio::time::Instant::now();
+        let mut heartbeat = ApplicationHeartbeat::default();
+        let stream = StreamWatchdog::started_at(start);
+
+        let mut elapsed = Duration::ZERO;
+        while elapsed < STREAM_SILENCE_TIMEOUT {
+            assert_eq!(heartbeat.tick(start + elapsed), HeartbeatTick::SendPing);
+            heartbeat.observe_pong();
+            assert!(
+                !stream.is_silent(start + elapsed),
+                "must not reconnect before the threshold, at {elapsed:?}"
+            );
+            elapsed += PING_INTERVAL;
+        }
+
+        // Transport still perfect at the threshold; the subscription is not.
+        assert_eq!(
+            heartbeat.tick(start + STREAM_SILENCE_TIMEOUT),
+            HeartbeatTick::SendPing
+        );
+        assert!(stream.is_silent(start + STREAM_SILENCE_TIMEOUT));
+    }
+
+    #[test]
+    fn an_activity_message_from_any_wallet_keeps_the_subscription_alive() {
+        // The watchdog is fed by the global firehose, not by watched-leader
+        // events. A leader can be quiet for hours; that must never reconnect.
+        let start = tokio::time::Instant::now();
+        let mut stream = StreamWatchdog::started_at(start);
+
+        // Four hours of unwatched-wallet traffic at one message every thirty
+        // seconds -- orders of magnitude below the real firehose rate, and
+        // still never silent.
+        const STEP: u64 = 30;
+        let ticks = 4 * 60 * 60 / STEP;
+        for tick in 1..=ticks {
+            let now = start + Duration::from_secs(tick * STEP);
+            assert!(!stream.is_silent(now), "silent at tick {tick}");
+            stream.observe_message(now);
+        }
+
+        // The moment that traffic stops, the threshold applies again.
+        let last = start + Duration::from_secs(ticks * STEP);
+        assert!(!stream.is_silent(last + STREAM_SILENCE_TIMEOUT - Duration::from_millis(1)));
+        assert!(stream.is_silent(last + STREAM_SILENCE_TIMEOUT));
+    }
+
+    #[test]
+    fn a_subscription_that_never_delivers_anything_is_caught_too() {
+        // A connection that subscribes and is answered with silence from the
+        // first second is the same failure, and the clock starts at connect
+        // so the same timer covers it.
+        let start = tokio::time::Instant::now();
+        let stream = StreamWatchdog::started_at(start);
+
+        assert!(!stream.is_silent(start));
+        assert!(stream.is_silent(start + STREAM_SILENCE_TIMEOUT));
+    }
+
+    #[test]
+    fn stream_silence_reports_itself_distinctly_from_a_heartbeat_timeout() {
+        // These two reach the same reconnect path, so the log line is the
+        // only way an operator can tell which failure actually happened.
+        let silent = ActivityWsError::StreamSilent.to_string();
+        let heartbeat = ActivityWsError::HeartbeatTimedOut.to_string();
+
+        assert_ne!(silent, heartbeat);
+        assert!(silent.contains("no activity message"), "{silent}");
+        assert!(silent.contains("transport stayed alive"), "{silent}");
     }
 
     // Mirrors src/copytrading/db.rs's TestDb: a migrated pool at a unique
