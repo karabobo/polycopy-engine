@@ -268,7 +268,7 @@ async fn run_once(
                             .await
                             .map_err(|error| ActivityWsError::Send(Box::new(error)))?;
                         writer
-                            .send(Message::Ping(Vec::new().into()))
+                            .send(Message::Ping(Vec::new()))
                             .await
                             .map_err(|error| ActivityWsError::Send(Box::new(error)))?;
                     }
