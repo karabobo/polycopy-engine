@@ -1,0 +1,43 @@
+[Unit]
+Description=polycopy-engine Feishu notifier
+Documentation=file:/opt/polycopy-engine/notify/notify.py
+Wants=network-online.target
+After=network-online.target
+# Deliberately not Requires= or BindsTo= the execution service: the notifier
+# must keep running while the engine is stopped, because "the engine stopped"
+# is one of the things it exists to tell someone.
+ConditionPathExists=/opt/polycopy-engine/notify/notify.py
+ConditionPathExists=/etc/polycopy-engine/credentials/feishu.env
+
+[Service]
+Type=exec
+User=polycopy-engine
+Group=polycopy-engine
+UMask=0077
+WorkingDirectory=/opt/polycopy-engine/current
+EnvironmentFile=/etc/polycopy-engine/persistent-public.env
+# The webhook URL is a bearer secret: holding it is enough to post into the
+# group. It goes through the credential store rather than the environment so
+# it never appears in /proc/<pid>/environ.
+LoadCredential=feishu:/etc/polycopy-engine/credentials/feishu.env
+StateDirectory=polycopy-engine-notify
+StateDirectoryMode=0700
+Environment=NOTIFY_STATE_DIR=/var/lib/polycopy-engine-notify
+ExecStart=/usr/bin/python3 /opt/polycopy-engine/notify/notify.py
+Restart=always
+RestartSec=10s
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+# The engine database is opened read-only; this service is never granted
+# write access to it. Its own cursor lives in StateDirectory.
+ReadOnlyPaths=/var/lib/polycopy-engine
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# There is intentionally no [Install] section, matching the other units here:
+# an operator starts this explicitly once the webhook credential is in place.
