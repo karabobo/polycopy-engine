@@ -117,6 +117,19 @@ pub struct LeaderPolicyInput {
     /// false leaves every existing Leader unaffected.
     #[serde(default)]
     pub balance_within_market: bool,
+    /// Optional absolute price tolerance, in the market's own price units:
+    /// 0.02 is two ticks on a 0.01 book, at every price.
+    ///
+    /// `price_tolerance_bps` scales with the price, which is the wrong shape
+    /// for a book quoted in fixed ticks. On a 0.01 tick a 2% tolerance is
+    /// 0.006 at a price of 0.29 -- too small to move the limit by even one
+    /// tick, so the order behaves exactly like a zero-tolerance one -- and
+    /// 0.013 at 0.66. It does the least where the copied leaders trade most.
+    ///
+    /// The effective tolerance is the larger of the two, so a config that
+    /// sets only bps keeps the behaviour it had before this field existed.
+    #[serde(default)]
+    pub price_tolerance_abs: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -496,8 +509,9 @@ async fn insert_policy(
         "INSERT INTO leader_policy \
          (leader_id, max_signal_age_seconds, decision_window_seconds, price_tolerance_bps, \
           tick_size, min_price, max_price, max_order_notional, min_leader_trade_size, \
-          rolling_budget_usdc, budget_window_seconds, max_order_shares, balance_within_market) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          rolling_budget_usdc, budget_window_seconds, max_order_shares, balance_within_market, \
+          price_tolerance_abs) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(leader_id)
     .bind(policy.max_signal_age_seconds)
@@ -512,35 +526,44 @@ async fn insert_policy(
     .bind(policy.budget_window_seconds)
     .bind(&policy.max_order_shares)
     .bind(policy.balance_within_market)
+    .bind(&policy.price_tolerance_abs)
     .execute(&mut **tx)
     .await
     .map_err(ConfigError::Database)?;
     Ok(())
 }
 
-#[allow(clippy::type_complexity)]
+/// The policy exactly as stored, for comparing against what a config asks
+/// for. A named struct rather than the tuple this used to be: the column
+/// list outgrew the twelve elements Rust implements `PartialEq` for, and a
+/// field name at each site is worth more than the brevity was.
+#[derive(Debug, PartialEq, sqlx::FromRow)]
+struct StoredPolicy {
+    max_signal_age_seconds: i64,
+    decision_window_seconds: i64,
+    price_tolerance_bps: i64,
+    tick_size: String,
+    min_price: String,
+    max_price: String,
+    max_order_notional: String,
+    min_leader_trade_size: String,
+    rolling_budget_usdc: Option<String>,
+    budget_window_seconds: Option<i64>,
+    max_order_shares: Option<String>,
+    balance_within_market: bool,
+    price_tolerance_abs: String,
+}
+
 async fn update_policy_if_changed(
     tx: &mut Transaction<'_, Sqlite>,
     leader_id: i64,
     policy: &NormalizedPolicy,
 ) -> Result<bool, ConfigError> {
-    let current: Option<(
-        i64,
-        i64,
-        i64,
-        String,
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<i64>,
-        Option<String>,
-        bool,
-    )> = sqlx::query_as(
+    let current: Option<StoredPolicy> = sqlx::query_as(
         "SELECT max_signal_age_seconds, decision_window_seconds, price_tolerance_bps, \
          tick_size, min_price, max_price, max_order_notional, min_leader_trade_size, \
-         rolling_budget_usdc, budget_window_seconds, max_order_shares, balance_within_market \
+         rolling_budget_usdc, budget_window_seconds, max_order_shares, balance_within_market, \
+         price_tolerance_abs \
          FROM leader_policy WHERE leader_id = ?",
     )
     .bind(leader_id)
@@ -548,20 +571,21 @@ async fn update_policy_if_changed(
     .await
     .map_err(ConfigError::Database)?;
 
-    let desired = (
-        policy.max_signal_age_seconds,
-        policy.decision_window_seconds,
-        policy.price_tolerance_bps,
-        policy.tick_size.clone(),
-        policy.min_price.clone(),
-        policy.max_price.clone(),
-        policy.max_order_notional.clone(),
-        policy.min_leader_trade_size.clone(),
-        policy.rolling_budget_usdc.clone(),
-        policy.budget_window_seconds,
-        policy.max_order_shares.clone(),
-        policy.balance_within_market,
-    );
+    let desired = StoredPolicy {
+        max_signal_age_seconds: policy.max_signal_age_seconds,
+        decision_window_seconds: policy.decision_window_seconds,
+        price_tolerance_bps: policy.price_tolerance_bps,
+        tick_size: policy.tick_size.clone(),
+        min_price: policy.min_price.clone(),
+        max_price: policy.max_price.clone(),
+        max_order_notional: policy.max_order_notional.clone(),
+        min_leader_trade_size: policy.min_leader_trade_size.clone(),
+        rolling_budget_usdc: policy.rolling_budget_usdc.clone(),
+        budget_window_seconds: policy.budget_window_seconds,
+        max_order_shares: policy.max_order_shares.clone(),
+        balance_within_market: policy.balance_within_market,
+        price_tolerance_abs: policy.price_tolerance_abs.clone(),
+    };
     if current.as_ref() == Some(&desired) {
         return Ok(false);
     }
@@ -572,7 +596,7 @@ async fn update_policy_if_changed(
              price_tolerance_bps = ?, tick_size = ?, min_price = ?, max_price = ?, \
              max_order_notional = ?, min_leader_trade_size = ?, \
              rolling_budget_usdc = ?, budget_window_seconds = ?, max_order_shares = ?, \
-             balance_within_market = ?, \
+             balance_within_market = ?, price_tolerance_abs = ?, \
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE leader_id = ?",
         )
         .bind(policy.max_signal_age_seconds)
@@ -587,6 +611,7 @@ async fn update_policy_if_changed(
         .bind(policy.budget_window_seconds)
         .bind(&policy.max_order_shares)
         .bind(policy.balance_within_market)
+        .bind(&policy.price_tolerance_abs)
         .bind(leader_id)
         .execute(&mut **tx)
         .await
@@ -610,7 +635,15 @@ struct NormalizedPolicy {
     budget_window_seconds: Option<i64>,
     max_order_shares: Option<String>,
     balance_within_market: bool,
+    price_tolerance_abs: String,
 }
+
+/// A flat tolerance is a licence to cross the spread, not a target price --
+/// an FAK still pays the resting ask -- but it is still how far the engine
+/// may chase, so it is bounded. Ten ticks on a 0.01 book is far beyond any
+/// spread these markets quote, and stops a misplaced decimal from turning a
+/// 0.30 buy into a 0.80 one.
+const MAX_PRICE_TOLERANCE_ABS: Decimal = Decimal::from_parts(10, 0, 0, false, 2);
 
 fn normalize_policy(
     policy: &LeaderPolicyInput,
@@ -679,6 +712,19 @@ fn normalize_policy(
         Some(raw) => Some(parse_positive_decimal(raw, "max_order_shares")?.to_string()),
     };
 
+    let price_tolerance_abs = match policy.price_tolerance_abs.as_deref() {
+        None => Decimal::ZERO,
+        Some(raw) => {
+            let parsed: Decimal = raw
+                .parse()
+                .map_err(|_| ConfigError::InvalidPolicyField("price_tolerance_abs"))?;
+            if parsed < Decimal::ZERO || parsed > MAX_PRICE_TOLERANCE_ABS {
+                return Err(ConfigError::InvalidPolicyField("price_tolerance_abs"));
+            }
+            parsed
+        }
+    };
+
     Ok(NormalizedPolicy {
         max_signal_age_seconds: policy.max_signal_age_seconds,
         decision_window_seconds: policy.decision_window_seconds,
@@ -692,6 +738,7 @@ fn normalize_policy(
         budget_window_seconds: policy.budget_window_seconds,
         max_order_shares,
         balance_within_market: policy.balance_within_market,
+        price_tolerance_abs: price_tolerance_abs.to_string(),
     })
 }
 
@@ -851,6 +898,7 @@ mod tests {
             max_signal_age_seconds: 3,
             decision_window_seconds: 3,
             price_tolerance_bps: 100,
+            price_tolerance_abs: None,
             tick_size: "0.01".to_owned(),
             min_price: "0.01".to_owned(),
             max_price: "0.99".to_owned(),
@@ -907,6 +955,74 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stored_notional, "1");
+    }
+
+    #[test]
+    fn a_flat_price_tolerance_is_accepted_and_bounded() {
+        let options = ConfigApplyOptions::default();
+        let mut input = policy("1");
+
+        input.price_tolerance_abs = Some("0.02".to_owned());
+        let normalized =
+            normalize_policy(&input, "leader-a", &options).expect("two ticks must be accepted");
+        assert_eq!(normalized.price_tolerance_abs, "0.02");
+
+        // Absent is what every configuration written before this field
+        // existed carries, and must mean "no flat tolerance".
+        input.price_tolerance_abs = None;
+        let normalized =
+            normalize_policy(&input, "leader-a", &options).expect("absent must be accepted");
+        assert_eq!(normalized.price_tolerance_abs, "0");
+
+        // A misplaced decimal must not be able to turn a 0.30 buy into a
+        // 0.80 one.
+        for rejected in ["0.5", "-0.01", "two ticks", ""] {
+            input.price_tolerance_abs = Some(rejected.to_owned());
+            assert!(
+                matches!(
+                    normalize_policy(&input, "leader-a", &options),
+                    Err(ConfigError::InvalidPolicyField("price_tolerance_abs"))
+                ),
+                "{rejected:?} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_flat_tolerance_survives_apply_and_a_reapply_sees_no_change() {
+        // Covers the column end to end: written by the insert, read back by
+        // the comparison select. A name wrong in either place shows up here
+        // as a config that claims to change on every apply.
+        let db = TestDb::new().await;
+        let mut config = config_with_one_leader("1");
+        config.leaders[0].policy.price_tolerance_abs = Some("0.02".to_owned());
+
+        let first = apply_trading_config(
+            &db,
+            &config,
+            SIGNING_ADDRESS,
+            &ConfigApplyOptions::default(),
+        )
+        .await
+        .expect("config with a flat tolerance must apply");
+
+        let stored: String =
+            sqlx::query_scalar("SELECT price_tolerance_abs FROM leader_policy WHERE leader_id = ?")
+                .bind(first.leaders[0].leader_id)
+                .fetch_one(&*db)
+                .await
+                .unwrap();
+        assert_eq!(stored, "0.02");
+
+        let again = apply_trading_config(
+            &db,
+            &config,
+            SIGNING_ADDRESS,
+            &ConfigApplyOptions::default(),
+        )
+        .await
+        .expect("reapplying must succeed");
+        assert_eq!(again.leaders[0].change, ChangeKind::Unchanged);
     }
 
     #[tokio::test]

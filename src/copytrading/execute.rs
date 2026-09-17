@@ -272,6 +272,15 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
         .tick_size
         .parse()
         .map_err(|_| ExecuteError::InvalidDecimal("leader_policy.tick_size"))?;
+    // Absent in a snapshot written before the field existed, and zero in a
+    // config that sets only bps. Both mean "no flat tolerance", which leaves
+    // the proportional one governing exactly as it did before.
+    let price_tolerance_abs: Decimal = match policy.price_tolerance_abs.as_deref() {
+        None => Decimal::ZERO,
+        Some(raw) => raw
+            .parse()
+            .map_err(|_| ExecuteError::InvalidDecimal("leader_policy.price_tolerance_abs"))?,
+    };
     // P2-5: parse the absolute price band so clamp_to_policy_band can run
     // on the post-round_price limit. Without this parse the policy band
     // is silently ignored, which is the audit-flagged behaviour.
@@ -357,7 +366,12 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
             }
             let event_price = load_event_price(pool, claimed.intent_id).await?;
             let price = round_price(
-                apply_tolerance(event_price, policy.price_tolerance_bps, claimed.side),
+                apply_tolerance(
+                    event_price,
+                    policy.price_tolerance_bps,
+                    price_tolerance_abs,
+                    claimed.side,
+                ),
                 tick_size,
                 claimed.side,
             );
@@ -388,7 +402,12 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
             let event_size = load_event_size(pool, claimed.intent_id).await?;
             let event_price = load_event_price(pool, claimed.intent_id).await?;
             let limit_price = round_price(
-                apply_tolerance(event_price, policy.price_tolerance_bps, claimed.side),
+                apply_tolerance(
+                    event_price,
+                    policy.price_tolerance_bps,
+                    price_tolerance_abs,
+                    claimed.side,
+                ),
                 tick_size,
                 claimed.side,
             );
@@ -550,8 +569,24 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
     }))
 }
 
-fn apply_tolerance(event_price: Decimal, tolerance_bps: i64, side: Side) -> Decimal {
-    let tolerance = event_price * Decimal::new(tolerance_bps, 4); // bps / 10_000
+/// How far this order may move from the leader's own fill price to cross the
+/// spread. The result is a ceiling, not a target: an FAK order pays the
+/// resting ask, so a wider tolerance buys reach, not a worse price.
+///
+/// Two tolerances, and the wider one wins. A basis-point tolerance scales
+/// with the price, which is the wrong shape for a book quoted in fixed ticks
+/// -- on a 0.01 tick, 200 bps is 0.006 at a price of 0.29 and cannot move the
+/// limit by even one tick, while the same 200 bps is 0.013 at 0.66. An
+/// operator who configures both means both, so taking the smaller would be
+/// silently ignoring one of them.
+fn apply_tolerance(
+    event_price: Decimal,
+    tolerance_bps: i64,
+    tolerance_abs: Decimal,
+    side: Side,
+) -> Decimal {
+    let proportional = event_price * Decimal::new(tolerance_bps, 4); // bps / 10_000
+    let tolerance = proportional.max(tolerance_abs);
                                                                   // BUY ceiling strictly below 1.00: the Polymarket CLOB accepts only
                                                                   // prices in the open interval (0, 1). A tolerance-adjusted BUY must
                                                                   // never reach 1.00 (or above) before tick alignment; otherwise the
@@ -1212,17 +1247,100 @@ mod tests {
     }
 
     #[test]
+    fn a_flat_tolerance_moves_the_limit_the_same_at_every_price() {
+        // Why the flat tolerance exists. The book is quoted in fixed 0.01
+        // ticks, so what matters is how many ticks the limit may cross, and
+        // a proportional tolerance answers that differently at every price:
+        // 200 bps is 0.0058 at 0.29 -- less than one tick, so the order is
+        // indistinguishable from a zero-tolerance one -- and 0.0132 at 0.66.
+        let two_ticks = Decimal::new(2, 2); // 0.02
+        let cheap = Decimal::new(29, 2);
+        let dear = Decimal::new(66, 2);
+
+        assert_eq!(
+            apply_tolerance(cheap, 0, two_ticks, Side::Buy) - cheap,
+            two_ticks
+        );
+        assert_eq!(
+            apply_tolerance(dear, 0, two_ticks, Side::Buy) - dear,
+            two_ticks
+        );
+
+        // The same configuration expressed in bps does not hold that
+        // property, which is the whole reason for the field.
+        let cheap_bps = apply_tolerance(cheap, 200, Decimal::ZERO, Side::Buy) - cheap;
+        let dear_bps = apply_tolerance(dear, 200, Decimal::ZERO, Side::Buy) - dear;
+        assert_ne!(cheap_bps, dear_bps);
+        assert!(
+            cheap_bps < Decimal::new(1, 2),
+            "200 bps at 0.29 is below one tick, which is the failure being fixed: {cheap_bps}"
+        );
+    }
+
+    #[test]
+    fn the_wider_of_the_two_tolerances_governs() {
+        let price = Decimal::new(50, 2); // 0.50, where 200 bps is exactly 0.01
+        let one_tick = Decimal::new(1, 2);
+        let three_ticks = Decimal::new(3, 2);
+
+        // Flat wider than proportional: flat governs.
+        assert_eq!(
+            apply_tolerance(price, 200, three_ticks, Side::Buy),
+            price + three_ticks
+        );
+        // Proportional wider than flat: proportional governs, so a leader
+        // configured only in bps is untouched by this field existing.
+        assert_eq!(
+            apply_tolerance(price, 1_000, one_tick, Side::Buy),
+            price + Decimal::new(5, 2)
+        );
+    }
+
+    #[test]
+    fn a_policy_without_a_flat_tolerance_prices_exactly_as_before() {
+        // Snapshots written before the column existed carry None, and a
+        // config that sets only bps normalizes to zero. Both must leave the
+        // proportional result untouched.
+        let price = Decimal::new(37, 2);
+        for side in [Side::Buy, Side::Sell] {
+            assert_eq!(
+                apply_tolerance(price, 300, Decimal::ZERO, side),
+                apply_tolerance(price, 300, Decimal::ZERO, side),
+            );
+            let with_zero = apply_tolerance(price, 300, Decimal::ZERO, side);
+            let expected = match side {
+                Side::Buy => price + price * Decimal::new(300, 4),
+                Side::Sell => price - price * Decimal::new(300, 4),
+            };
+            assert_eq!(with_zero, expected);
+        }
+    }
+
+    #[test]
+    fn a_flat_tolerance_on_a_sell_gives_ground_rather_than_chasing() {
+        // The BUY direction is the one that motivated this, but a SELL uses
+        // the same tolerance to accept less, and must not be able to invert
+        // past zero.
+        let price = Decimal::new(3, 2); // 0.03, smaller than the tolerance
+        let five_ticks = Decimal::new(5, 2);
+        assert_eq!(
+            apply_tolerance(price, 0, five_ticks, Side::Sell),
+            Decimal::ZERO
+        );
+    }
+
+    #[test]
     fn apply_tolerance_buy_caps_below_one() {
         // A BUY with event price just below 1.00 and any tolerance must
         // never produce a tolerance-adjusted price at or above 1.00.
-        let adjusted = apply_tolerance(Decimal::new(999, 3), 100, Side::Buy);
+        let adjusted = apply_tolerance(Decimal::new(999, 3), 100, Decimal::ZERO, Side::Buy);
         assert!(
             adjusted < Decimal::ONE,
             "apply_tolerance must never produce a BUY price >= 1.00; got {adjusted}"
         );
         // Even an arbitrarily large BUY tolerance cannot push the
         // adjusted price to 1.00 -- the cap holds.
-        let any = apply_tolerance(Decimal::new(999, 3), 10_000, Side::Buy);
+        let any = apply_tolerance(Decimal::new(999, 3), 10_000, Decimal::ZERO, Side::Buy);
         assert!(
             any < Decimal::ONE,
             "an arbitrarily large BUY tolerance must still cap below 1.00; got {any}"
@@ -1460,6 +1578,7 @@ mod tests {
             max_signal_age_seconds: 3600,
             decision_window_seconds: 300,
             price_tolerance_bps: 0,
+            price_tolerance_abs: None,
             tick_size: "0.01".to_owned(),
             min_price: "0.01".to_owned(),
             max_price: "0.99".to_owned(),
@@ -1851,6 +1970,7 @@ mod tests {
                 max_signal_age_seconds: 3600,
                 decision_window_seconds: 300,
                 price_tolerance_bps: 0,
+                price_tolerance_abs: None,
                 tick_size: "0.01".to_owned(),
                 min_price: "0.01".to_owned(),
                 max_price: "0.99".to_owned(),
@@ -1891,6 +2011,7 @@ mod tests {
             max_signal_age_seconds: 3600,
             decision_window_seconds: 300,
             price_tolerance_bps: 0,
+            price_tolerance_abs: None,
             tick_size: "0.01".to_owned(),
             min_price: "0.01".to_owned(),
             max_price: "0.99".to_owned(),
@@ -1943,6 +2064,7 @@ mod tests {
             max_signal_age_seconds: 3600,
             decision_window_seconds: 300,
             price_tolerance_bps: 0,
+            price_tolerance_abs: None,
             tick_size: "0.01".to_owned(),
             min_price: "0.01".to_owned(),
             max_price: "0.99".to_owned(),
@@ -2141,7 +2263,7 @@ mod tests {
             Decimal::new(1, 0),  // 1.0 (would round to 1.00)
         ] {
             for tol in [0i64, 50, 100, 1_000, 10_000] {
-                let adjusted = apply_tolerance(event, tol, Side::Buy);
+                let adjusted = apply_tolerance(event, tol, Decimal::ZERO, Side::Buy);
                 let r1 = round_price(adjusted, Decimal::new(1, 2), Side::Buy);
                 let r2 =
                     clamp_to_policy_band(r1, Decimal::new(1, 2), Decimal::new(99, 2)).unwrap_or(r1);
@@ -2208,6 +2330,7 @@ mod tests {
             max_signal_age_seconds: 3600,
             decision_window_seconds: 300,
             price_tolerance_bps: 0,
+            price_tolerance_abs: None,
             tick_size: "0.01".to_owned(),
             min_price: "0.01".to_owned(),
             max_price: "0.99".to_owned(),

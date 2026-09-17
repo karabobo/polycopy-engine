@@ -260,7 +260,8 @@ async fn evaluate_event(
 
     let policy = sqlx::query_as::<_, PolicySnapshot>(
         "SELECT max_signal_age_seconds, decision_window_seconds, price_tolerance_bps, \
-                tick_size, min_price, max_price, max_order_notional, max_order_shares, balance_within_market, min_leader_trade_size \
+                tick_size, min_price, max_price, max_order_notional, max_order_shares, balance_within_market, min_leader_trade_size, \
+                price_tolerance_abs \
          FROM leader_policy WHERE leader_id = ?",
     )
     .bind(event.leader_id)
@@ -338,6 +339,12 @@ pub struct PolicySnapshot {
     pub min_price: String,
     pub max_price: String,
     pub max_order_notional: String,
+    /// Absolute price tolerance in the market's own units, taken alongside
+    /// `price_tolerance_bps`; execution uses whichever is larger. Optional so
+    /// that intents snapshotted before this field existed still deserialize,
+    /// where absent means zero and behaviour is unchanged.
+    #[serde(default)]
+    pub price_tolerance_abs: Option<String>,
     /// Optional per-leader fixed BUY share target. Defaulting keeps snapshots
     /// written before this field was introduced executable.
     #[serde(default)]
