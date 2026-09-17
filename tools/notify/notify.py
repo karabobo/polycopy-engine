@@ -35,34 +35,38 @@ from typing import Any
 
 DB_PATH = os.environ.get("POLYCOPY_DB_PATH", "/var/lib/polycopy-engine/polycopy.sqlite")
 STATE_DIR = os.environ.get("NOTIFY_STATE_DIR", "/var/lib/polycopy-engine-notify")
-def _webhook() -> str:
-    """Prefer systemd's credential store over the environment.
+def _credentials() -> dict[str, str]:
+    """Read app credentials, preferring systemd's credential store.
 
-    A value in the environment is readable from /proc for the whole life of
-    the process; LoadCredential keeps it in a file only this unit can open.
-    The webhook URL is a bearer secret -- anyone holding it can post into the
-    group -- so it gets the same handling as the signing key, not less.
+    A value in the environment is readable from /proc for the life of the
+    process; LoadCredential keeps it in a file only this unit can open. The
+    app secret is a signing credential for the whole app, so it gets the same
+    handling as the engine's own key, not less.
     """
 
-    direct = os.environ.get("FEISHU_WEBHOOK_URL", "").strip()
-    if direct:
-        return direct
+    values: dict[str, str] = {}
+    wanted = ("FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_CHAT_ID")
+
     directory = os.environ.get("CREDENTIALS_DIRECTORY", "")
-    if not directory:
-        return ""
-    try:
-        with open(os.path.join(directory, "feishu"), encoding="utf-8") as handle:
-            text = handle.read()
-    except OSError:
-        return ""
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("FEISHU_WEBHOOK_URL="):
-            return line.split("=", 1)[1].strip().strip("\"'")
-    return ""
+    if directory:
+        try:
+            with open(os.path.join(directory, "feishu"), encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    if key in wanted:
+                        values[key] = value.strip().strip("\"'")
+        except OSError:
+            pass
 
-
-WEBHOOK = ""
+    for key in wanted:
+        from_env = os.environ.get(key, "").strip()
+        if from_env and key not in values:
+            values[key] = from_env
+    return values
 POLL_SECONDS = float(os.environ.get("NOTIFY_POLL_SECONDS", "2"))
 ENGINE_UNIT = os.environ.get("NOTIFY_ENGINE_UNIT", "polycopy-engine-persistent")
 
@@ -233,19 +237,92 @@ def intent_rows(db: sqlite3.Connection, after_id: int, watching: list[int]) -> l
 # --- Feishu --------------------------------------------------------------
 
 
-class Sender:
-    """Posts cards, and refuses to let the webhook become a liability.
+TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+MESSAGE_URL = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
+CHATS_URL = "https://open.feishu.cn/open-apis/im/v1/chats?page_size=100"
 
-    Every failure mode here is contained: a timeout is bounded, an error is
-    logged and dropped rather than retried forever, and the rate bucket stops
-    a notification loop from burning the bot's quota.
+
+def _post_json(url: str, body: dict, token: str = "") -> dict:
+    """One JSON round trip, with every failure turned into a dict rather than
+    an exception. Nothing in this file is allowed to die because Feishu had a
+    bad minute."""
+
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as error:
+        return {"code": -1, "msg": f"{type(error).__name__}: {error}"}
+
+
+def _get_json(url: str, token: str) -> dict:
+    request = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {token}"}, method="GET"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as error:
+        return {"code": -1, "msg": f"{type(error).__name__}: {error}"}
+
+
+class Sender:
+    """Posts cards as a self-built Feishu app, and refuses to let the API
+    become a liability.
+
+    Every failure mode is contained: timeouts are bounded, an error is logged
+    and dropped rather than retried forever, and the rate bucket stops a
+    notification loop from burning the app's quota.
+
+    Two details of this API are easy to get wrong and are pinned here. The
+    card goes in `content` as a JSON-encoded *string*, not an object, and
+    without the `{"msg_type", "card"}` envelope a webhook would need. And the
+    tenant token expires -- two hours at most -- so it is cached with a margin
+    rather than fetched per message or fetched once and trusted forever.
     """
 
-    def __init__(self, url: str) -> None:
-        self.url = url
+    #: Refresh this long before the stated expiry. Feishu issues a fresh token
+    #: when under thirty minutes remain; asking earlier than that costs one
+    #: round trip and removes any chance of sending with a token that expires
+    #: between the check and the request.
+    TOKEN_MARGIN_SECONDS = 600
+
+    def __init__(self, app_id: str, app_secret: str, chat_id: str) -> None:
+        self.app_id = app_id
+        self.app_secret = app_secret
+        self.chat_id = chat_id
+        self._token = ""
+        self._token_expires_at = 0.0
         self._minute = 0
         self._sent_this_minute = 0
         self._suppressed = 0
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.app_id and self.app_secret and self.chat_id)
+
+    def token(self) -> str:
+        """Cached tenant token. Never logged: it is a bearer credential for
+        everything the app can do, not just this notifier."""
+
+        if self._token and time.time() < self._token_expires_at:
+            return self._token
+        answer = _post_json(
+            TOKEN_URL, {"app_id": self.app_id, "app_secret": self.app_secret}
+        )
+        if answer.get("code") != 0 or not answer.get("tenant_access_token"):
+            log(f"token request failed: code={answer.get('code')} {answer.get('msg')}")
+            self._token = ""
+            return ""
+        self._token = answer["tenant_access_token"]
+        expire = float(answer.get("expire") or 7200)
+        self._token_expires_at = time.time() + max(expire - self.TOKEN_MARGIN_SECONDS, 60)
+        return self._token
 
     def _allowed(self) -> bool:
         minute = int(time.time() // 60)
@@ -261,38 +338,53 @@ class Sender:
         self._sent_this_minute += 1
         return True
 
-    def send(self, card: dict[str, Any], description: str) -> bool:
-        if not self.url:
-            log(f"no webhook configured; would have sent: {description}")
+    def send(self, card: dict[str, Any], description: str, dedup: str = "") -> bool:
+        if not self.configured:
+            log(f"not configured; would have sent: {description}")
             return False
         if not self._allowed():
             return False
-
-        body = json.dumps({"msg_type": "interactive", "card": card}).encode("utf-8")
-        request = urllib.request.Request(
-            self.url,
-            data=body,
-            headers={"Content-Type": "application/json; charset=utf-8"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=10) as response:
-                raw = response.read().decode("utf-8", "replace")
-        except (urllib.error.URLError, OSError, TimeoutError) as error:
-            log(f"send failed ({description}): {type(error).__name__}")
+        token = self.token()
+        if not token:
             return False
 
-        # Feishu answers 200 with a body that carries the real outcome, so the
-        # HTTP status alone does not tell you the message arrived.
-        try:
-            answer = json.loads(raw)
-        except ValueError:
-            log(f"send returned unparseable body ({description})")
-            return False
-        if answer.get("code") not in (0, None):
-            log(f"feishu rejected ({description}): code={answer.get('code')} {answer.get('msg')}")
+        body: dict[str, Any] = {
+            "receive_id": self.chat_id,
+            "msg_type": "interactive",
+            # A JSON string, per the API: an object here is rejected.
+            "content": json.dumps(card, ensure_ascii=False),
+        }
+        if dedup:
+            # Feishu drops a repeat of the same uuid, so a cursor that replays
+            # after a crash cannot post the same fill twice.
+            body["uuid"] = dedup[:50]
+
+        answer = _post_json(MESSAGE_URL, body, token)
+        if answer.get("code") != 0:
+            log(f"send failed ({description}): code={answer.get('code')} {answer.get('msg')}")
+            # An expired or revoked token is worth one immediate retry; any
+            # other failure is dropped rather than hammered.
+            if answer.get("code") in (99991663, 99991664, 99991661):
+                self._token = ""
+                token = self.token()
+                if token:
+                    answer = _post_json(MESSAGE_URL, body, token)
+                    return answer.get("code") == 0
             return False
         return True
+
+    def list_chats(self) -> list[tuple[str, str]]:
+        """Groups this app can see, for finding the chat_id by its name."""
+
+        token = self.token()
+        if not token:
+            return []
+        answer = _get_json(CHATS_URL, token)
+        if answer.get("code") != 0:
+            log(f"chat list failed: code={answer.get('code')} {answer.get('msg')}")
+            return []
+        items = (answer.get("data") or {}).get("items") or []
+        return [(item.get("chat_id", ""), item.get("name", "")) for item in items]
 
 
 # --- cards ---------------------------------------------------------------
@@ -490,10 +582,36 @@ def engine_active() -> bool:
 
 
 def main() -> int:
-    webhook = _webhook()
-    if not webhook:
-        log("no webhook configured -- dry run, nothing will be sent")
-    sender = Sender(webhook)
+    credentials = _credentials()
+    sender = Sender(
+        credentials.get("FEISHU_APP_ID", ""),
+        credentials.get("FEISHU_APP_SECRET", ""),
+        credentials.get("FEISHU_CHAT_ID", ""),
+    )
+
+    # A helper rather than a separate script: finding a chat_id otherwise
+    # means digging through the developer console, and this already holds the
+    # credentials needed to just ask.
+    if "--list-chats" in sys.argv:
+        if not (sender.app_id and sender.app_secret):
+            log("FEISHU_APP_ID / FEISHU_APP_SECRET are not set")
+            return 2
+        chats = sender.list_chats()
+        if not chats:
+            log("no groups visible -- is the app added to the group, and does it")
+            log("hold one of im:chat / im:chat:readonly?")
+            return 1
+        for chat_id, name in chats:
+            print(f"{chat_id}  {name}")
+        return 0
+
+    if not sender.configured:
+        missing = [
+            key
+            for key in ("FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_CHAT_ID")
+            if not credentials.get(key)
+        ]
+        log(f"dry run, nothing will be sent -- missing {', '.join(missing)}")
     state = load_state()
 
     try:
@@ -520,6 +638,7 @@ def main() -> int:
                 sender.send(
                     leader_card(event, label, short),
                     f"leader event {event['id']}",
+                    dedup=f"polycopy-ev-{event['id']}",
                 )
                 state["event_cursor"] = event["id"]
 
@@ -537,6 +656,7 @@ def main() -> int:
                     sender.send(
                         outcome_card(intent, label, short),
                         f"intent {intent['id']} {intent['status']}",
+                        dedup=f"polycopy-in-{intent['id']}-{intent['status']}",
                     )
                 else:
                     still_watching.append(intent["id"])

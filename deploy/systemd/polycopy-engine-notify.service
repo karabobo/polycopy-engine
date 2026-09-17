@@ -16,9 +16,9 @@ Group=polycopy-engine
 UMask=0077
 WorkingDirectory=/opt/polycopy-engine/current
 EnvironmentFile=/etc/polycopy-engine/persistent-public.env
-# The webhook URL is a bearer secret: holding it is enough to post into the
-# group. It goes through the credential store rather than the environment so
-# it never appears in /proc/<pid>/environ.
+# FEISHU_APP_SECRET signs for everything the app can do, not just this
+# notifier. It goes through the credential store rather than the environment
+# so it never appears in /proc/<pid>/environ.
 LoadCredential=feishu:/etc/polycopy-engine/credentials/feishu.env
 StateDirectory=polycopy-engine-notify
 StateDirectoryMode=0700
