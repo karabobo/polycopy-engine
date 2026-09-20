@@ -70,6 +70,10 @@ pub enum TradeHistoryLookup {
     Recovered {
         order_id: OrderId,
         filled_qty: Decimal,
+        /// Sum of the matched outcome shares times their execution prices.
+        /// This is the maker-side USDC principal that the rolling budget must
+        /// retain after an operator recovers a real BUY fill.
+        maker_notional_usdc: Decimal,
     },
     NotFound,
 }
@@ -195,6 +199,7 @@ pub fn recover_fak_taker_order_from_trades(
 
     let mut seen_by_trade_id: HashMap<&str, &AccountTrade> = HashMap::new();
     let mut filled_qty = Decimal::ZERO;
+    let mut maker_notional_usdc = Decimal::ZERO;
 
     for trade in trades {
         if let Some(previous) = seen_by_trade_id.insert(&trade.trade_id, trade) {
@@ -229,6 +234,7 @@ pub fn recover_fak_taker_order_from_trades(
         }
 
         filled_qty += trade.size;
+        maker_notional_usdc += trade.size * trade.price;
     }
 
     if filled_qty == Decimal::ZERO {
@@ -237,6 +243,7 @@ pub fn recover_fak_taker_order_from_trades(
         Ok(TradeHistoryLookup::Recovered {
             order_id: OrderId(envelope.expected_taker_order_id.clone()),
             filled_qty,
+            maker_notional_usdc,
         })
     }
 }

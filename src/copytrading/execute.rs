@@ -112,6 +112,9 @@ pub struct ClaimedIntent {
     pub account_id: i64,
     pub leader_id: i64,
     pub token_id: String,
+    /// Immutable source-event identity used only for a post-FAK maker order.
+    pub condition_id: String,
+    pub leader_price: Decimal,
     pub side: Side,
     pub decision_deadline_at: Option<String>,
     /// Set only when this claim is resuming an intent that already has a
@@ -186,6 +189,17 @@ pub async fn claim_or_resume_intent(
         planned_notional_usdc,
     ) = row;
     let side = Side::from_str(&side).ok_or(ExecuteError::InvalidSide)?;
+    let (condition_id, leader_price): (String, String) = sqlx::query_as(
+        "SELECT le.condition_id, le.price FROM leader_events le \
+         JOIN copy_intents ci ON ci.event_id = le.id WHERE ci.id = ?",
+    )
+    .bind(intent_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| ExecuteError::Database(error.to_string()))?;
+    let leader_price = leader_price
+        .parse()
+        .map_err(|_| ExecuteError::InvalidDecimal("leader_events.price"))?;
     let existing_decision = match (planned_qty, planned_price, planned_notional_usdc) {
         (Some(qty), Some(price), Some(notional)) => Some((
             qty.parse()
@@ -210,6 +224,8 @@ pub async fn claim_or_resume_intent(
         account_id,
         leader_id,
         token_id,
+        condition_id,
+        leader_price,
         side,
         decision_deadline_at,
         existing_decision,
@@ -256,6 +272,8 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
         },
     }
 
+    let policy = load_policy_snapshot(pool, claimed.intent_id).await?;
+
     if let Some((qty, price, notional)) = claimed.existing_decision {
         return Ok(SizingOutcome::Decision(SizedDecision {
             intent_id: claimed.intent_id,
@@ -264,10 +282,10 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
             qty,
             limit_price: price,
             buy_budget: (claimed.side == Side::Buy).then_some(notional),
+            buy_shares_exact: claimed.side == Side::Buy && policy.max_order_shares.is_some(),
         }));
     }
 
-    let policy = load_policy_snapshot(pool, claimed.intent_id).await?;
     let tick_size: Decimal = policy
         .tick_size
         .parse()
@@ -566,6 +584,121 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
         qty,
         limit_price,
         buy_budget,
+        buy_shares_exact: claimed.side == Side::Buy && policy.max_order_shares.is_some(),
+    }))
+}
+
+/// Reprices one already-sized fixed-share BUY after the venue explicitly
+/// reported that the original FAK had no match. This intentionally does not
+/// apply the leader-price tolerance or policy price band: the caller has
+/// opted into one fresh-book sweep attempt. Collateral, allowance,
+/// deadline, fixed share target, and CLOB's open (0, 1) price domain remain
+/// mandatory.
+pub async fn reprice_fixed_share_buy_after_no_fak<B: StrictAccountBalanceReader>(
+    pool: &SqlitePool,
+    balance_reader: &B,
+    claimed: &ClaimedIntent,
+    sweep_limit_price: Decimal,
+) -> Result<SizingOutcome, ExecuteError> {
+    match &claimed.decision_deadline_at {
+        Some(deadline) => match chrono::DateTime::parse_from_rfc3339(deadline) {
+            Ok(parsed) if chrono::Utc::now() <= parsed => {}
+            Ok(_) | Err(_) => return Ok(SizingOutcome::Expired),
+        },
+        None => return Ok(SizingOutcome::Expired),
+    }
+    if claimed.side != Side::Buy {
+        return Ok(SizingOutcome::Rejected("no-FAK best-ask retry is BUY-only"));
+    }
+    let policy = load_policy_snapshot(pool, claimed.intent_id).await?;
+    let Some(raw_target) = policy.max_order_shares.as_deref() else {
+        return Ok(SizingOutcome::Rejected(
+            "no-FAK best-ask retry requires a fixed-share policy",
+        ));
+    };
+    let target_qty: Decimal = raw_target
+        .parse()
+        .map_err(|_| ExecuteError::InvalidDecimal("leader_policy.max_order_shares"))?;
+    let Some((qty, _, _)) = claimed.existing_decision else {
+        return Ok(SizingOutcome::NeedsReconcile(
+            "no-FAK retry is missing its persisted fixed-share decision",
+        ));
+    };
+    if qty != target_qty {
+        return Ok(SizingOutcome::NeedsReconcile(
+            "persisted quantity differs from fixed-share policy snapshot",
+        ));
+    }
+    if sweep_limit_price <= Decimal::ZERO || sweep_limit_price >= Decimal::ONE {
+        return Ok(SizingOutcome::Rejected(
+            "fresh-book sweep limit is outside the CLOB open price interval",
+        ));
+    }
+    let budget = (qty * sweep_limit_price).normalize();
+    if budget <= Decimal::ZERO || budget.scale() > 2 {
+        return Ok(SizingOutcome::Rejected(
+            "fixed shares at fresh-book sweep limit cannot produce a cent maker amount",
+        ));
+    }
+    if budget < Decimal::ONE {
+        return Ok(SizingOutcome::Rejected(
+            "fresh-book sweep buy notional is below the CLOB minimum of 1 USDC",
+        ));
+    }
+    let collateral = match balance_reader.collateral_balance_strict().await {
+        Ok(value) => value,
+        Err(_) => {
+            return Ok(SizingOutcome::NeedsReconcile(
+                "strict collateral balance query failed",
+            ))
+        }
+    };
+    let allowance = match balance_reader.collateral_allowance_strict().await {
+        Ok(value) => value,
+        Err(_) => {
+            return Ok(SizingOutcome::NeedsReconcile(
+                "strict collateral allowance query failed",
+            ))
+        }
+    };
+    let other_reserved = sum_other_active_buy_reservation_notional(
+        pool,
+        claimed.account_id,
+        claimed.intent_id,
+    )
+    .await?;
+    if budget > (collateral.min(allowance) - other_reserved).max(Decimal::ZERO) {
+        return Ok(SizingOutcome::Rejected(
+            "fresh-book sweep fixed-share buy exceeds available collateral",
+        ));
+    }
+
+    let updated = sqlx::query(
+        "UPDATE copy_intents SET planned_qty = ?, planned_price = ?, reserved_qty = ?, \
+         planned_notional_usdc = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE id = ? AND status = 'in_progress'",
+    )
+    .bind(qty.to_string())
+    .bind(sweep_limit_price.to_string())
+    .bind(qty.to_string())
+    .bind(budget.to_string())
+    .bind(claimed.intent_id)
+    .execute(pool)
+    .await
+    .map_err(|error| ExecuteError::Database(error.to_string()))?;
+    if updated.rows_affected() != 1 {
+        return Ok(SizingOutcome::NeedsReconcile(
+            "intent state changed during no-FAK fresh-book sweep repricing",
+        ));
+    }
+    Ok(SizingOutcome::Decision(SizedDecision {
+        intent_id: claimed.intent_id,
+        token_id: claimed.token_id.clone(),
+        side: Side::Buy,
+        qty,
+        limit_price: sweep_limit_price,
+        buy_budget: Some(budget),
+        buy_shares_exact: true,
     }))
 }
 
@@ -1093,13 +1226,30 @@ pub async fn finalize_receipt(
         .await
         .map_err(|error| ExecuteError::Database(error.to_string()))?;
 
+    finalize_receipt_with_conn(&mut tx, intent_id, attempt_id, receipt).await?;
+
+    tx.commit()
+        .await
+        .map_err(|error| ExecuteError::Database(error.to_string()))
+}
+
+/// Transaction-aware variant used by operator recovery so restoring a budget
+/// reservation, applying the confirmed lot delta, finalizing the attempt, and
+/// closing its case can commit together.
+pub(crate) async fn finalize_receipt_with_conn(
+    conn: &mut sqlx::SqliteConnection,
+    intent_id: i64,
+    attempt_id: i64,
+    receipt: &OrderReceipt,
+) -> Result<(), ExecuteError> {
+
     let row: (i64, i64, String, String, String) = sqlx::query_as(
         "SELECT ci.account_id, ci.leader_id, ci.token_id, ci.side, oa.accounted_filled_qty \
          FROM copy_intents ci JOIN order_attempts oa ON oa.id = ? WHERE ci.id = ?",
     )
     .bind(attempt_id)
     .bind(intent_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *conn)
     .await
     .map_err(|error| ExecuteError::Database(error.to_string()))?;
     let (account_id, leader_id, token_id, side, accounted_so_far) = row;
@@ -1125,7 +1275,7 @@ pub async fn finalize_receipt(
         .bind(account_id)
         .bind(leader_id)
         .bind(&token_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|error| ExecuteError::Database(error.to_string()))?;
         let current_qty: Decimal = match current_qty {
@@ -1146,7 +1296,7 @@ pub async fn finalize_receipt(
         .bind(leader_id)
         .bind(&token_id)
         .bind(new_qty.to_string())
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await
         .map_err(|error| ExecuteError::Database(error.to_string()))?;
     }
@@ -1163,7 +1313,7 @@ pub async fn finalize_receipt(
         receipt.remaining_qty()
     ))
     .bind(attempt_id)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await
     .map_err(|error| ExecuteError::Database(error.to_string()))?;
 
@@ -1177,13 +1327,11 @@ pub async fn finalize_receipt(
     )
     .bind(intent_status)
     .bind(intent_id)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await
     .map_err(|error| ExecuteError::Database(error.to_string()))?;
 
-    tx.commit()
-        .await
-        .map_err(|error| ExecuteError::Database(error.to_string()))
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1998,6 +2146,7 @@ mod tests {
 
             assert_eq!(decision.buy_budget, Some(expected_budget.parse().unwrap()));
             assert_eq!(decision.qty, Decimal::new(10, 0));
+            assert!(decision.buy_shares_exact);
         }
     }
 

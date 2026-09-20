@@ -18,7 +18,43 @@ fn production_buy(budget: Decimal) -> SizedDecision {
         qty: Decimal::new(17241, 4),
         limit_price: Decimal::new(58, 2),
         buy_budget: Some(budget),
+        buy_shares_exact: false,
     }
+}
+
+#[test]
+fn fixed_share_production_buy_uses_a_taker_share_amount() {
+    let decision = SizedDecision {
+        intent_id: 1,
+        token_id: "123456".to_owned(),
+        side: Side::Buy,
+        qty: Decimal::new(5, 0),
+        limit_price: Decimal::new(58, 2),
+        buy_budget: Some(Decimal::new(290, 2)),
+        buy_shares_exact: true,
+    };
+
+    assert_eq!(
+        prepare::construction_amount(&decision).expect("fixed share amount"),
+        ClobOrderAmount::BuyTakerShares(Decimal::new(5, 0))
+    );
+}
+
+#[test]
+fn fixed_share_buy_refuses_a_non_cent_maker_amount_before_signing() {
+    let decision = SizedDecision {
+        intent_id: 1,
+        token_id: "123456".to_owned(),
+        side: Side::Buy,
+        qty: Decimal::new(172, 2),
+        limit_price: Decimal::new(58, 2),
+        buy_budget: Some(Decimal::new(99, 2)),
+        buy_shares_exact: true,
+    };
+
+    let error = prepare::construction_amount(&decision)
+        .expect_err("a 0.9976 USDC maker amount cannot be represented as a cent order");
+    assert!(error.to_string().contains("non-cent maker amount"));
 }
 
 #[test]
@@ -71,6 +107,7 @@ fn sell_canary_and_production_keep_share_amounts() {
         qty: Decimal::new(17241, 4),
         limit_price: Decimal::new(58, 2),
         buy_budget: None,
+        buy_shares_exact: false,
     };
 
     let expected = ClobOrderAmount::SellMakerShares(Decimal::new(17241, 4));

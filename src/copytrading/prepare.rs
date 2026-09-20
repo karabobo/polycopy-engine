@@ -52,6 +52,27 @@ use crate::{
 /// Production's order-side amount contract, exposed for the canary drift
 /// regression test. It contains no SDK client, signer, or network state.
 pub fn construction_amount(decision: &SizedDecision) -> Result<ClobOrderAmount, PrepareError> {
+    if decision.side == crate::copytrading::execute::Side::Buy && decision.buy_shares_exact {
+        let maker_amount = (decision.qty * decision.limit_price).normalize();
+        if maker_amount <= rust_decimal::Decimal::ZERO || maker_amount.scale() > 2 {
+            return Err(PrepareError::NonCentFixedShareMakerAmount {
+                qty: decision.qty,
+                price: decision.limit_price,
+                maker_amount,
+            });
+        }
+        match decision.buy_budget {
+            Some(budget) if budget == maker_amount => {}
+            Some(budget) => {
+                return Err(PrepareError::FixedShareBudgetMismatch {
+                    expected: maker_amount,
+                    actual: budget,
+                });
+            }
+            None => return Err(PrepareError::MissingBuyBudget),
+        }
+        return Ok(ClobOrderAmount::BuyTakerShares(decision.qty));
+    }
     match (decision.side, decision.buy_budget) {
         (crate::copytrading::execute::Side::Buy, Some(budget))
             if budget > rust_decimal::Decimal::ZERO && budget.scale() <= 2 =>
@@ -156,11 +177,10 @@ impl<'a, S: Signer, R: NegRiskResolver> EnvelopePreparer<'a, S, R> {
             crate::copytrading::execute::Side::Sell => SdkSide::Sell,
         };
 
-        // Step 1: Build the SignableOrder. A BUY must be constructed with a
-        // cent-denominated maker-side USDC budget. Passing independently
-        // rounded shares to `limit_order()` makes its maker amount
-        // `shares * price`, commonly producing 3-4 decimal places that the
-        // CLOB rejects. SELLs remain share-denominated limit FAKs.
+        // Step 1: Build the SignableOrder. Ordinary BUYs use a
+        // cent-denominated maker-side USDC budget. Fixed-share BUYs instead
+        // pin the taker amount so a better venue price cannot create extra
+        // shares. SELLs remain share-denominated limit FAKs.
         let signable = match construction_amount(decision)? {
             ClobOrderAmount::BuyMakerUsdc(budget) => self
                 .client
@@ -169,6 +189,17 @@ impl<'a, S: Signer, R: NegRiskResolver> EnvelopePreparer<'a, S, R> {
                 .side(side)
                 .price(decision.limit_price)
                 .amount(Amount::usdc(budget).map_err(PrepareError::OrderBuilding)?)
+                .order_type(OrderType::FAK)
+                .build()
+                .await
+                .map_err(PrepareError::OrderBuilding)?,
+            ClobOrderAmount::BuyTakerShares(shares) => self
+                .client
+                .market_order()
+                .token_id(token_id)
+                .side(side)
+                .price(decision.limit_price)
+                .amount(Amount::shares(shares).map_err(PrepareError::OrderBuilding)?)
                 .order_type(OrderType::FAK)
                 .build()
                 .await
@@ -238,6 +269,71 @@ impl<'a, S: Signer, R: NegRiskResolver> EnvelopePreparer<'a, S, R> {
             signed_order,
         })
     }
+
+    /// Prepares a post-only GTD limit BUY. This is intentionally a separate
+    /// entry point from the FAK builder: the caller must have already fetched
+    /// and durably chosen the market end time before this can be signed.
+    pub async fn prepare_post_only_gtd_buy(
+        &self,
+        decision: &SizedDecision,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<PreparedEnvelope, PrepareError> {
+        if decision.side != crate::copytrading::execute::Side::Buy || !decision.buy_shares_exact {
+            return Err(PrepareError::PostOnlyGtdRequiresFixedShareBuy);
+        }
+        let token_id = U256::from_str(&decision.token_id)
+            .map_err(|e| PrepareError::InvalidTokenId(e.to_string()))?;
+        let signable = self
+            .client
+            .limit_order()
+            .token_id(token_id)
+            .side(SdkSide::Buy)
+            .price(decision.limit_price)
+            .size(decision.qty)
+            .expiration(expires_at)
+            .order_type(OrderType::GTD)
+            .post_only(true)
+            .build()
+            .await
+            .map_err(PrepareError::OrderBuilding)?;
+        let signed_order = self
+            .client
+            .sign(self.signer, signable)
+            .await
+            .map_err(PrepareError::OrderSigning)?;
+        let token_id_match = match &signed_order.payload {
+            polymarket_client_sdk_v2::clob::types::OrderPayload::V2(p) => p.order.tokenId,
+            polymarket_client_sdk_v2::clob::types::OrderPayload::V1(p) => p.order.tokenId,
+            _ => return Err(PrepareError::UnsupportedPayloadVersion),
+        };
+        let neg_risk_resp = self
+            .neg_risk_resolver
+            .resolve(token_id_match)
+            .await
+            .map_err(PrepareError::NegRiskQuery)?;
+        let config = polymarket_client_sdk_v2::contract_config(
+            polymarket_client_sdk_v2::POLYGON,
+            neg_risk_resp.neg_risk,
+        )
+        .ok_or(PrepareError::MissingContractConfig)?;
+        let expected_taker_order_id = compute_expected_taker_order_id(
+            &signed_order.payload,
+            &ExchangeAddresses { v1: config.exchange, v2: config.exchange_v2 },
+            polymarket_client_sdk_v2::POLYGON,
+        )?;
+        let signed_order_json = serde_json::to_string(&signed_order)
+            .map_err(|_| PrepareError::OrderSerialization)?;
+        let mut envelope = assemble_envelope(
+            decision,
+            &signed_order,
+            &expected_taker_order_id,
+            &signed_order_json,
+        );
+        envelope.order_type = "GTD".to_owned();
+        envelope.expires_at = Some(expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        envelope.post_only = true;
+        Ok(PreparedEnvelope { envelope, signed_order })
+    }
 }
 
 /// Pure helper that turns an already-signed `SignedOrder` + the offline
@@ -268,8 +364,11 @@ pub(crate) fn assemble_envelope(
         price: decision.limit_price.to_string(),
         size: decision.qty.to_string(),
         buy_budget_usdc: decision.buy_budget.map(|budget| budget.to_string()),
+        buy_shares_exact: decision.buy_shares_exact,
         salt: extract_salt(signed_order).unwrap_or(0),
         order_type: "FAK".to_owned(),
+        expires_at: None,
+        post_only: false,
         expected_taker_order_id: expected_taker_order_id.to_owned(),
         signed_order_json: signed_order_json.to_owned(),
     }
@@ -381,6 +480,7 @@ mod tests {
             qty: Decimal::from(100),
             limit_price: Decimal::from_str("0.55").unwrap(),
             buy_budget: (side == crate::copytrading::execute::Side::Buy).then(|| Decimal::from(55)),
+            buy_shares_exact: false,
         }
     }
 
@@ -433,6 +533,7 @@ mod tests {
         assert_eq!(env.price, "0.55");
         assert_eq!(env.size, "100");
         assert_eq!(env.buy_budget_usdc.as_deref(), Some("55"));
+        assert!(!env.buy_shares_exact);
         assert_eq!(env.salt, 2024);
         assert_eq!(env.order_type, "FAK");
         assert_eq!(env.expected_taker_order_id, expected_taker_order_id);
@@ -452,6 +553,17 @@ mod tests {
         assert_eq!(env.price, "0.55");
         assert_eq!(env.size, "100");
         assert_eq!(env.buy_budget_usdc, None);
+    }
+
+    #[test]
+    fn assemble_envelope_persists_the_fixed_share_mode_for_recovery() {
+        let signed = v2_signed_order(17);
+        let mut decision = decision(crate::copytrading::execute::Side::Buy);
+        decision.buy_shares_exact = true;
+
+        let env = assemble_envelope(&decision, &signed, "0x00", "{}");
+
+        assert!(env.buy_shares_exact);
     }
 
     #[test]
@@ -633,7 +745,17 @@ mod tests {
 pub enum PrepareError {
     InvalidTokenId(String),
     MissingBuyBudget,
+    PostOnlyGtdRequiresFixedShareBuy,
     InvalidBuyBudget(rust_decimal::Decimal),
+    NonCentFixedShareMakerAmount {
+        qty: rust_decimal::Decimal,
+        price: rust_decimal::Decimal,
+        maker_amount: rust_decimal::Decimal,
+    },
+    FixedShareBudgetMismatch {
+        expected: rust_decimal::Decimal,
+        actual: rust_decimal::Decimal,
+    },
     OrderBuilding(polymarket_client_sdk_v2::error::Error),
     OrderSigning(polymarket_client_sdk_v2::error::Error),
     NegRiskQuery(polymarket_client_sdk_v2::error::Error),
@@ -652,9 +774,24 @@ impl std::fmt::Display for PrepareError {
             Self::MissingBuyBudget => {
                 write!(f, "BUY decision is missing its maker-side USDC budget")
             }
+            Self::PostOnlyGtdRequiresFixedShareBuy => {
+                write!(f, "post-only GTD requires a fixed-share BUY decision")
+            }
             Self::InvalidBuyBudget(budget) => write!(
                 f,
                 "BUY maker-side USDC budget must be positive with at most two decimals: {budget}"
+            ),
+            Self::NonCentFixedShareMakerAmount {
+                qty,
+                price,
+                maker_amount,
+            } => write!(
+                f,
+                "fixed-share BUY ({qty} shares at {price}) has non-cent maker amount: {maker_amount}"
+            ),
+            Self::FixedShareBudgetMismatch { expected, actual } => write!(
+                f,
+                "fixed-share BUY budget must equal its signed maker amount ({expected}), got {actual}"
             ),
             Self::OrderBuilding(source) => write!(f, "order building failed: {source}"),
             Self::OrderSigning(source) => write!(f, "order signing failed: {source}"),

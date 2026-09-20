@@ -71,6 +71,28 @@ impl OrderReceipt {
         )
     }
 
+    /// Creates a final fixed-share BUY FAK receipt.
+    ///
+    /// The signed taker amount is the intended share target, not a venue
+    /// ceiling. Polymarket BUY FAK still spends the maker USDC budget, so a
+    /// better price can return more outcome shares than that target. The extra
+    /// shares are a real fill and must be accounted; `matched_shares` therefore
+    /// has no upper bound here, matching [`Self::from_fak_buy_budget`].
+    pub fn from_fak_buy_shares(
+        requested_shares: Decimal,
+        accepted_shares: Decimal,
+        matched_shares: Decimal,
+    ) -> Result<Self, ReceiptError> {
+        validate_no_fill_on_zero_request("filled_qty", requested_shares, matched_shares)?;
+        validate_not_greater_than_requested("accepted_qty", accepted_shares, requested_shares)?;
+        Self::new(
+            requested_shares,
+            accepted_shares,
+            matched_shares,
+            Decimal::ZERO,
+        )
+    }
+
     /// Creates a final SELL FAK receipt, for which every quantity is outcome
     /// shares and therefore an actual fill must not exceed the requested sell
     /// quantity.

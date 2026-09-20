@@ -19,6 +19,7 @@
 use std::fmt;
 
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 
 // P0-1: StrictTradeHistoryReader is still used by the recovery matrix
@@ -36,8 +37,6 @@ use crate::venue::intl_clob::{
 };
 #[cfg(test)]
 use crate::venue::OrderReceipt;
-#[cfg(test)]
-use rust_decimal::Decimal;
 #[cfg(test)]
 use std::str::FromStr as _;
 
@@ -87,7 +86,11 @@ pub enum LostSubmissionRecoveryOutcome {
 /// fresh strict query found, then require an explicit no-fill confirmation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperatorUncertainLookup {
-    Recovered { order_id: OrderId },
+    Recovered {
+        order_id: OrderId,
+        filled_qty: Decimal,
+        maker_notional_usdc: Decimal,
+    },
     NotFound,
 }
 
@@ -333,9 +336,15 @@ where
         .await
         .map_err(|error| ReconcileError::StrictTradeHistoryLookup(error.to_string()))?
     {
-        TradeHistoryLookup::Recovered { order_id, .. } => {
-            Ok(OperatorUncertainLookup::Recovered { order_id })
-        }
+        TradeHistoryLookup::Recovered {
+            order_id,
+            filled_qty,
+            maker_notional_usdc,
+        } => Ok(OperatorUncertainLookup::Recovered {
+            order_id,
+            filled_qty,
+            maker_notional_usdc,
+        }),
         TradeHistoryLookup::NotFound => Ok(OperatorUncertainLookup::NotFound),
     }
 }
@@ -864,8 +873,11 @@ mod tests {
             price: "0.5".to_owned(),
             size: "5".to_owned(),
             buy_budget_usdc: Some("2.50".to_owned()),
+            buy_shares_exact: false,
             salt,
             order_type: "FAK".to_owned(),
+            expires_at: None,
+            post_only: false,
             expected_taker_order_id: "order-a".to_owned(),
             signed_order_json: r#"{"order":{"maker":"0xexample"},"orderType":"FAK"}"#.to_owned(),
         }
@@ -986,6 +998,7 @@ mod tests {
             TradeHistoryLookup::Recovered {
                 order_id: OrderId("order-a".to_owned()),
                 filled_qty: Decimal::new(5_288_460, 6),
+                maker_notional_usdc: Decimal::new(25_584_608, 7),
             }
         );
     }
@@ -1042,6 +1055,7 @@ mod tests {
             TradeHistoryLookup::Recovered {
                 order_id: OrderId("order-a".to_owned()),
                 filled_qty: Decimal::ONE,
+                maker_notional_usdc: Decimal::new(49, 2),
             }
         );
     }

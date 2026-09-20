@@ -207,6 +207,7 @@ pub async fn build_signable_order(
             .build()
             .await
             .map_err(CanaryRunError::Building),
+        ClobOrderAmount::BuyTakerShares(_) => Err(CanaryRunError::UnsupportedConstructionAmount),
         ClobOrderAmount::SellMakerShares(shares) => client
             .limit_order()
             .token_id(token_id)
@@ -595,6 +596,7 @@ pub enum CanaryRunError {
     Lookup(SdkError),
     NegRiskQuery(SdkError),
     MissingContractConfig,
+    UnsupportedConstructionAmount,
     OrderHash(OrderHashError),
 }
 
@@ -630,6 +632,10 @@ impl fmt::Display for CanaryRunError {
                 formatter,
                 "no exchange contract configuration for this chain/neg-risk combination"
             ),
+            Self::UnsupportedConstructionAmount => write!(
+                formatter,
+                "canary construction produced an amount mode it does not support"
+            ),
             Self::OrderHash(source) => write!(formatter, "unable to compute the expected order ID: {source}"),
         }
     }
@@ -641,7 +647,8 @@ impl Error for CanaryRunError {
             Self::InvalidPrivateKey
             | Self::InvalidApiKey
             | Self::InvalidCanaryTokenId
-            | Self::MissingContractConfig => None,
+            | Self::MissingContractConfig
+            | Self::UnsupportedConstructionAmount => None,
             Self::Spec(source) => Some(source),
             Self::ClientInitialization(source)
             | Self::CredentialDerivation(source)

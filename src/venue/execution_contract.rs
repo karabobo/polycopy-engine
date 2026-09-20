@@ -48,13 +48,15 @@ pub enum Side {
 }
 
 /// The request-side amount handed to the CLOB builder. This deliberately
-/// models the venue contract rather than a policy decision: a marketable BUY
-/// is maker-side USDC, while a SELL is maker-side outcome-token shares.
+/// models the venue contract rather than a policy decision: an ordinary
+/// marketable BUY is maker-side USDC, while a fixed-share BUY pins the taker
+/// outcome-share amount. SELLs are maker-side outcome-token shares.
 /// Canary and production keep independent SDK construction code, but must
 /// agree on this value before either signs an order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClobOrderAmount {
     BuyMakerUsdc(Decimal),
+    BuyTakerShares(Decimal),
     SellMakerShares(Decimal),
 }
 
@@ -86,10 +88,13 @@ pub struct SizedDecision {
     pub side: Side,
     pub qty: Decimal,
     pub limit_price: Decimal,
-    /// BUYs are submitted as a USDC-denominated marketable FAK. This is the
-    /// exact maximum maker amount, rounded down to cents before signing. It
-    /// is absent for SELLs, whose request unit remains outcome-token shares.
+    /// BUYs retain a USDC amount for reservation and audit. It is absent for
+    /// SELLs, whose request unit remains outcome-token shares.
     pub buy_budget: Option<Decimal>,
+    /// A configured fixed-share BUY must pin its signed taker amount to
+    /// `qty`, rather than treating `buy_budget` as a spend-to amount whose
+    /// share fill can grow when the venue improves the price.
+    pub buy_shares_exact: bool,
 }
 
 /// The exact, plainly-serializable fields of one signed order attempt.
@@ -109,9 +114,20 @@ pub struct PreparedOrderEnvelope {
     /// new BUY envelopes must populate it.
     #[serde(default)]
     pub buy_budget_usdc: Option<String>,
+    /// True only for newly prepared fixed-share BUYs. Historical envelopes
+    /// deserialize as false and retain their original budget semantics.
+    #[serde(default)]
+    pub buy_shares_exact: bool,
     pub salt: u64,
-    /// Always "FAK" in v1 (blueprint section 8's stated v1-wide policy).
+    /// Venue time-in-force. Historical envelopes deserialize as FAK.
+    #[serde(default = "default_fak_order_type")]
     pub order_type: String,
+    /// GTD orders have a signed venue expiry. FAK envelopes have no expiry.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// A resting copy order must never cross on submission.
+    #[serde(default)]
+    pub post_only: bool,
     /// The deterministic order identifier calculated from the exact signed
     /// wire envelope *before* it crosses the HTTP boundary. A response may be
     /// lost, but this value must not depend on that response. Phase 0.5 still
@@ -123,6 +139,10 @@ pub struct PreparedOrderEnvelope {
     /// contains all version-specific maker/signer/amount/expiry/signature
     /// fields and must never be committed or logged.
     pub signed_order_json: String,
+}
+
+fn default_fak_order_type() -> String {
+    "FAK".to_owned()
 }
 
 /// What Phase 5 needs to actually talk to the venue. Only

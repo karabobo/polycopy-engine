@@ -48,7 +48,7 @@ pub async fn plan_next_batch_with_limit(
             .unwrap_or(0);
 
     let events: Vec<LeaderEventRow> = sqlx::query_as(
-        "SELECT id, leader_id, token_id, side, size, occurred_at, observed_at, realtime_observed \
+        "SELECT id, leader_id, condition_id, token_id, side, size, occurred_at, observed_at, realtime_observed \
          FROM leader_events WHERE id > ? ORDER BY id LIMIT ?",
     )
     .bind(cursor)
@@ -75,7 +75,7 @@ pub async fn plan_next_batch_with_limit(
             .await
             .map_err(|error| PlanError::Database(error.to_string()))?;
 
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT OR IGNORE INTO copy_intents \
              (event_id, account_id, leader_id, token_id, side, config_snapshot_json, \
               config_snapshot_hash, shard_scheme_version, lane_count, shard_id, status, \
@@ -99,6 +99,57 @@ pub async fn plan_next_batch_with_limit(
         .await
         .map_err(|error| PlanError::Database(error.to_string()))?;
 
+        // Persist an immutable account/market-direction gate before this event
+        // can be made runnable. A later signal for the same outcome, including
+        // one from another Leader, becomes an auditable rejection; the
+        // opposite outcome token remains independently eligible.
+        let market_limit_rejected = if decision.rejection_reason.is_none()
+            && inserted.rows_affected() == 1
+        {
+            let intent_id: i64 = sqlx::query_scalar(
+                "SELECT id FROM copy_intents WHERE event_id = ? AND account_id = ?",
+            )
+            .bind(event.id)
+            .bind(account_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| PlanError::Database(error.to_string()))?;
+            let lock = sqlx::query(
+                "INSERT OR IGNORE INTO market_direction_order_locks \
+                 (account_id, condition_id, token_id, intent_id) VALUES (?, ?, ?, ?)",
+            )
+            .bind(account_id)
+            .bind(&event.condition_id)
+            .bind(&event.token_id)
+            .bind(intent_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| PlanError::Database(error.to_string()))?;
+            if lock.rows_affected() == 1 {
+                false
+            } else {
+                let rejected = sqlx::query(
+                    "UPDATE copy_intents SET status = 'rejected', \
+                     rejection_reason = 'market direction already has a copy order for this account', \
+                     decision_deadline_at = NULL, \
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                     WHERE id = ? AND status = 'pending'",
+                )
+                .bind(intent_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| PlanError::Database(error.to_string()))?;
+                if rejected.rows_affected() != 1 {
+                    return Err(PlanError::Database(
+                        "new market-direction-limited intent was not pending".to_owned(),
+                    ));
+                }
+                true
+            }
+        } else {
+            false
+        };
+
         sqlx::query(
             "INSERT INTO planner_cursor (account_id, last_event_id) VALUES (?, ?) \
              ON CONFLICT(account_id) DO UPDATE SET \
@@ -116,7 +167,7 @@ pub async fn plan_next_batch_with_limit(
             .map_err(|error| PlanError::Database(error.to_string()))?;
 
         summary.processed += 1;
-        if decision.rejection_reason.is_some() {
+        if decision.rejection_reason.is_some() || market_limit_rejected {
             summary.rejected += 1;
         } else {
             summary.pending += 1;
@@ -149,6 +200,7 @@ async fn advance_cursor(
 struct LeaderEventRow {
     id: i64,
     leader_id: i64,
+    condition_id: String,
     token_id: String,
     side: String,
     size: String,
@@ -647,6 +699,60 @@ mod tests {
             deadline.is_some(),
             "a pending intent must have a decision deadline"
         );
+    }
+
+    #[tokio::test]
+    async fn a_second_signal_in_the_same_market_is_a_durable_rejection() {
+        let db = TestDb::new().await;
+        seed_account_and_leader(&db).await;
+        seed_policy(&db, 3600, "1").await;
+        let now = chrono::Utc::now().to_rfc3339();
+        insert_event(&db, "5", &now).await;
+        insert_event(&db, "5", &now).await;
+
+        let summary = plan_next_batch(&db, 1).await.expect("planning must succeed");
+        assert_eq!(summary, PlanSummary { processed: 2, pending: 1, rejected: 1 });
+        let intents: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, rejection_reason FROM copy_intents ORDER BY id",
+        )
+        .fetch_all(&*db)
+        .await
+        .expect("intents must be queryable");
+        assert_eq!(intents[0].0, "pending");
+        assert_eq!(intents[1].0, "rejected");
+        assert_eq!(
+            intents[1].1.as_deref(),
+            Some("market direction already has a copy order for this account"),
+        );
+        let locks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM market_direction_order_locks")
+            .fetch_one(&*db)
+            .await
+            .expect("market-direction lock must be queryable");
+        assert_eq!(locks, 1);
+    }
+
+    #[tokio::test]
+    async fn the_opposite_outcome_in_one_market_remains_eligible() {
+        let db = TestDb::new().await;
+        seed_account_and_leader(&db).await;
+        seed_policy(&db, 3600, "1").await;
+        let now = chrono::Utc::now().to_rfc3339();
+        insert_event(&db, "5", &now).await;
+        let opposite_event_id = insert_event(&db, "5", &now).await;
+        sqlx::query("UPDATE leader_events SET token_id = '456', outcome_index = 1 WHERE id = ?")
+            .bind(opposite_event_id)
+            .execute(&*db)
+            .await
+            .expect("opposite outcome must update");
+
+        let summary = plan_next_batch(&db, 1).await.expect("planning must succeed");
+        assert_eq!(summary, PlanSummary { processed: 2, pending: 2, rejected: 0 });
+        let locks: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM market_direction_order_locks")
+                .fetch_one(&*db)
+                .await
+                .expect("market-direction locks must be queryable");
+        assert_eq!(locks, 2);
     }
 
     #[tokio::test]

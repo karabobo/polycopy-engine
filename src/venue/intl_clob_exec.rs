@@ -170,6 +170,11 @@ pub fn receipt_from_submitted_envelope(
 ) -> Result<OrderReceipt, String> {
     match envelope.side.as_str() {
         "BUY" => {
+            if envelope.buy_shares_exact {
+                let shares = parsed_envelope_size(envelope)?;
+                return OrderReceipt::from_fak_buy_shares(shares, shares, taking_amount)
+                    .map_err(|error| error.to_string());
+            }
             let budget = parsed_buy_budget(envelope)?;
             OrderReceipt::from_fak_buy_budget(budget, budget, taking_amount)
                 .map_err(|error| error.to_string())
@@ -253,8 +258,13 @@ impl CopyExecution for IntlClobCopyAdapter {
                     // this up as defense in depth.
                     let receipt = match envelope.side.as_str() {
                         "BUY" => {
-                            let budget = parsed_buy_budget(&envelope)?;
-                            OrderReceipt::from_fak_buy_budget(budget, budget, filled_qty)
+                            if envelope.buy_shares_exact {
+                                let shares = parsed_envelope_size(&envelope)?;
+                                OrderReceipt::from_fak_buy_shares(shares, shares, filled_qty)
+                            } else {
+                                let budget = parsed_buy_budget(&envelope)?;
+                                OrderReceipt::from_fak_buy_budget(budget, budget, filled_qty)
+                            }
                         }
                         "SELL" => {
                             let size = parsed_envelope_size(&envelope)?;
@@ -289,12 +299,16 @@ impl CopyExecution for IntlClobCopyAdapter {
                     response.error_msg.unwrap_or_default(),
                 ));
             }
+            // The HTTP POST already crossed the venue boundary. A receipt
+            // that cannot be built from that response is uncertain, not a
+            // local pre-submit failure: treating it as Local would release
+            // the rolling-budget reservation and leave a live fill untracked.
             receipt_from_submitted_envelope(
                 &envelope,
                 response.making_amount,
                 response.taking_amount,
             )
-            .map_err(SubmitError::Local)
+            .map_err(SubmitError::Transport)
         }
     }
 }
@@ -570,8 +584,11 @@ mod tests {
             price: "0.55".to_owned(),
             size: size.to_owned(),
             buy_budget_usdc: (side == "BUY").then(|| size.to_owned()),
+            buy_shares_exact: false,
             salt: 1,
             order_type: "FAK".to_owned(),
+            expires_at: None,
+            post_only: false,
             expected_taker_order_id: "0xabc".to_owned(),
             signed_order_json: "{}".to_owned(),
         }
@@ -588,6 +605,22 @@ mod tests {
         assert_eq!(receipt.requested_qty(), RustDecimal::new(5, 0));
         assert_eq!(receipt.filled_qty(), RustDecimal::new(528846, 5));
         assert_ne!(receipt.filled_qty(), receipt.requested_qty());
+    }
+
+    #[test]
+    fn fixed_share_buy_receipt_accounts_a_fill_above_the_signed_size() {
+        let mut fixed_share = envelope("BUY", "5");
+        fixed_share.buy_shares_exact = true;
+
+        let receipt = receipt_from_submitted_envelope(
+            &fixed_share,
+            RustDecimal::new(270, 2),
+            RustDecimal::new(54, 1),
+        )
+        .expect("a better-priced fixed-share BUY must keep its venue fill");
+
+        assert_eq!(receipt.requested_qty(), RustDecimal::new(5, 0));
+        assert_eq!(receipt.filled_qty(), RustDecimal::new(54, 1));
     }
 
     #[test]

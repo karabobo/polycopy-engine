@@ -1,6 +1,9 @@
-use std::sync::{
+use std::{
+    collections::VecDeque,
+    sync::{
     atomic::{AtomicU64, Ordering},
     Mutex,
+    },
 };
 
 use async_trait::async_trait;
@@ -69,6 +72,37 @@ impl Drop for TestDb {
 
 struct FixedBalance(Decimal);
 
+#[test]
+fn no_fak_retry_uses_only_the_best_ask_not_the_depth_needed_for_five_shares() {
+    let quote = no_fak_sweep_quote(
+        [
+            (Decimal::new(45, 2), Decimal::new(2, 0)),
+            (Decimal::new(47, 2), Decimal::new(2, 0)),
+            (Decimal::new(50, 2), Decimal::new(4, 0)),
+        ],
+        Decimal::new(5, 0),
+    )
+    .expect("valid fresh book");
+
+    assert_eq!(quote.limit_price, Decimal::new(45, 2));
+    assert_eq!(quote.visible_shares, Decimal::new(2, 0));
+}
+
+#[test]
+fn no_fak_retry_never_escalates_to_the_last_visible_ask_when_depth_is_short() {
+    let quote = no_fak_sweep_quote(
+        [
+            (Decimal::new(45, 2), Decimal::new(1, 0)),
+            (Decimal::new(48, 2), Decimal::new(2, 0)),
+        ],
+        Decimal::new(5, 0),
+    )
+    .expect("short book still permits a partial FAK");
+
+    assert_eq!(quote.limit_price, Decimal::new(45, 2));
+    assert_eq!(quote.visible_shares, Decimal::new(1, 0));
+}
+
 #[async_trait]
 impl StrictTokenBalanceReader for FixedBalance {
     async fn position_for_token_strict(
@@ -136,6 +170,7 @@ struct FakeVenue {
     prepare_count: AtomicU64,
     submit_count: AtomicU64,
     submit_result: Mutex<Result<OrderReceipt, SubmitError>>,
+    submit_results: Mutex<VecDeque<Result<OrderReceipt, SubmitError>>>,
     order_status: Mutex<String>,
     last_salt: Mutex<Option<u64>>,
     // New fields added so tests can drive the audit-flagged but never-tested
@@ -166,6 +201,7 @@ impl FakeVenue {
                 filled,
             )
             .expect("receipt"))),
+            submit_results: Mutex::new(VecDeque::new()),
             order_status: Mutex::new("MATCHED".to_owned()),
             last_salt: Mutex::new(None),
             // Default: `order_for_receipt` succeeds with the current
@@ -183,6 +219,7 @@ impl FakeVenue {
             prepare_count: AtomicU64::new(0),
             submit_count: AtomicU64::new(0),
             submit_result: Mutex::new(Err(SubmitError::Transport("connection reset".into()))),
+            submit_results: Mutex::new(VecDeque::new()),
             order_status: Mutex::new("MATCHED".to_owned()),
             last_salt: Mutex::new(None),
             order_lookup_result: Mutex::new(None),
@@ -201,6 +238,7 @@ impl FakeVenue {
             prepare_count: AtomicU64::new(0),
             submit_count: AtomicU64::new(0),
             submit_result: Mutex::new(Err(SubmitError::Local(detail.to_owned()))),
+            submit_results: Mutex::new(VecDeque::new()),
             order_status: Mutex::new("MATCHED".to_owned()),
             last_salt: Mutex::new(None),
             order_lookup_result: Mutex::new(None),
@@ -224,6 +262,7 @@ impl FakeVenue {
                 Decimal::new(5, 0),
             )
             .expect("receipt"))),
+            submit_results: Mutex::new(VecDeque::new()),
             order_status: Mutex::new("MATCHED".to_owned()),
             last_salt: Mutex::new(None),
             order_lookup_result: Mutex::new(Some(Err(detail.to_owned()))),
@@ -249,6 +288,7 @@ impl FakeVenue {
             // through `submit_exact_envelope` still produces a
             // matching receipt.
             submit_result: Mutex::new(Ok(receipt.clone())),
+            submit_results: Mutex::new(VecDeque::new()),
             order_status: Mutex::new("MATCHED".to_owned()),
             last_salt: Mutex::new(None),
             order_lookup_result: Mutex::new(None),
@@ -274,6 +314,7 @@ impl FakeVenue {
             submit_result: Mutex::new(Err(SubmitError::Local(
                 "submit_result unused on this path".to_owned(),
             ))),
+            submit_results: Mutex::new(VecDeque::new()),
             order_status: Mutex::new("MATCHED".to_owned()),
             last_salt: Mutex::new(None),
             order_lookup_result: Mutex::new(None),
@@ -297,6 +338,22 @@ impl FakeVenue {
     fn set_order_status(&self, status: &str) {
         *self.order_status.lock().expect("order status lock") = status.to_owned();
     }
+
+    fn no_fak_then_fill(filled: Decimal) -> Self {
+        let venue = Self::succeeding(filled);
+        *venue.submit_results.lock().expect("submit sequence lock") = VecDeque::from([
+            Err(SubmitError::Rejected(
+                "400 no orders found to match with FAK order".to_owned(),
+            )),
+            Ok(OrderReceipt::from_fak_buy_shares(
+                Decimal::new(5, 0),
+                Decimal::new(5, 0),
+                filled,
+            )
+            .expect("fixed-share receipt")),
+        ]);
+        venue
+    }
 }
 
 impl EnvelopeFactory for FakeVenue {
@@ -312,12 +369,63 @@ impl EnvelopeFactory for FakeVenue {
             price: decision.limit_price.to_string(),
             size: decision.qty.to_string(),
             buy_budget_usdc: decision.buy_budget.map(|budget| budget.to_string()),
+            buy_shares_exact: decision.buy_shares_exact,
             salt: 1000 + count,
             order_type: "FAK".to_owned(),
+            expires_at: None,
+            post_only: false,
             expected_taker_order_id: format!("0xdead{count}"),
             signed_order_json: r#"{"order":{}}"#.to_owned(),
         };
         async move { Ok(envelope) }
+    }
+
+    fn sweep_quote_for_no_fak_retry<'a>(
+        &'a self,
+        _token_id: &'a str,
+        _target_shares: Decimal,
+    ) -> Pin<Box<dyn Future<Output = Result<NoFakSweepQuote, String>> + Send + 'a>> {
+        Box::pin(async {
+            Ok(NoFakSweepQuote {
+                limit_price: Decimal::new(60, 2),
+                visible_shares: Decimal::new(5, 0),
+            })
+        })
+    }
+
+    fn market_spec_for_gtd<'a>(
+        &'a self,
+        _condition_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<GtdMarketSpec, String>> + Send + 'a>> {
+        Box::pin(async {
+            Ok(GtdMarketSpec {
+                expires_at: Utc::now() + chrono::Duration::minutes(5),
+                tick_size: Decimal::new(1, 2),
+            })
+        })
+    }
+
+    fn prepare_post_only_gtd_buy<'a>(
+        &'a self,
+        decision: &'a SizedDecision,
+        expires_at: chrono::DateTime<Utc>,
+    ) -> Pin<Box<dyn Future<Output = Result<PreparedOrderEnvelope, String>> + Send + 'a>> {
+        let count = self.prepare_count.fetch_add(1, Ordering::SeqCst);
+        let envelope = PreparedOrderEnvelope {
+            token_id: decision.token_id.clone(),
+            side: decision.side.as_str().to_owned(),
+            price: decision.limit_price.to_string(),
+            size: decision.qty.to_string(),
+            buy_budget_usdc: decision.buy_budget.map(|budget| budget.to_string()),
+            buy_shares_exact: true,
+            salt: 1000 + count,
+            order_type: "GTD".to_owned(),
+            expires_at: Some(expires_at.to_rfc3339()),
+            post_only: true,
+            expected_taker_order_id: format!("0xgtd{count}"),
+            signed_order_json: r#"{"order":{}}"#.to_owned(),
+        };
+        Box::pin(async move { Ok(envelope) })
     }
 }
 
@@ -415,10 +523,16 @@ impl CopyExecution for FakeVenue {
         self.submit_count.fetch_add(1, Ordering::SeqCst);
         *self.last_salt.lock().expect("salt lock") = Some(envelope.salt);
         let result = self
-            .submit_result
+            .submit_results
             .lock()
-            .expect("submit result lock")
-            .clone();
+            .expect("submit sequence lock")
+            .pop_front()
+            .unwrap_or_else(|| {
+                self.submit_result
+                    .lock()
+                    .expect("submit result lock")
+                    .clone()
+            });
         async move { result }
     }
 }
@@ -489,6 +603,36 @@ async fn seed_pending_buy_with_event_key(db: &TestDb, event_key: &str) -> i64 {
     .fetch_one(&db.pool)
     .await
     .expect("intent")
+}
+
+async fn set_fixed_share_policy(db: &TestDb, intent_id: i64) {
+    set_fixed_share_policy_with_max_price(db, intent_id, "0.99").await;
+}
+
+async fn set_fixed_share_policy_with_max_price(
+    db: &TestDb,
+    intent_id: i64,
+    max_price: &str,
+) {
+    let snapshot = PolicySnapshot {
+        max_signal_age_seconds: 3600,
+        decision_window_seconds: 300,
+        price_tolerance_bps: 0,
+        price_tolerance_abs: None,
+        tick_size: "0.01".to_owned(),
+        min_price: "0.01".to_owned(),
+        max_price: max_price.to_owned(),
+        max_order_notional: "100000".to_owned(),
+        max_order_shares: Some("5".to_owned()),
+        balance_within_market: false,
+        min_leader_trade_size: "0".to_owned(),
+    };
+    sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
+        .bind(serde_json::to_string(&snapshot).unwrap())
+        .bind(intent_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
 }
 
 async fn seed_pending_sell(db: &TestDb) -> i64 {
@@ -828,6 +972,52 @@ async fn a_buy_fill_uses_the_receipt_filled_qty_not_the_requested_size() {
     assert_ne!(lot.parse::<Decimal>().unwrap(), Decimal::new(5, 0));
 }
 
+#[tokio::test]
+async fn a_fixed_share_buy_accounts_a_venue_overfill_instead_of_local_failure() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+    set_fixed_share_policy(&db, intent_id).await;
+    let filled = Decimal::new(54, 1);
+    let venue = FakeVenue::succeeding(filled);
+    *venue.submit_result.lock().unwrap() = Ok(OrderReceipt::from_fak_buy_shares(
+        Decimal::new(5, 0),
+        Decimal::new(5, 0),
+        filled,
+    )
+    .expect("overfill receipt"));
+
+    let outcome = execute_one_intent(
+        &db,
+        &FixedBalance(Decimal::new(100, 0)),
+        &venue,
+        &venue,
+        &EmptyHistory,
+        intent_id,
+        Utc::now(),
+    )
+    .await
+    .expect("overfill must be accounted");
+    assert_eq!(outcome, OrchestrateOutcome::Filled { filled_qty: filled });
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 1);
+    let lot: String = sqlx::query_scalar(
+        "SELECT qty FROM position_lots WHERE account_id = 1 AND leader_id = 1 AND token_id = '123456'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("lot");
+    assert_eq!(lot.parse::<Decimal>().unwrap(), filled);
+    let cases: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ? AND resolved_at IS NULL",
+    )
+    .bind(intent_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("cases");
+    assert_eq!(cases, 0);
+}
+
 // P0-3 status (post-step-2): two of the four audit-flagged
 // orchestrator branches are now covered end-to-end:
 //   * SubmitError::Local -> local_submission_failure (test below)
@@ -860,8 +1050,11 @@ async fn fake_venue_query_prepared_envelope_defaults_to_none_to_preserve_audit_b
             price: "0.55".to_owned(),
             size: "5".to_owned(),
             buy_budget_usdc: Some("2.75".to_owned()),
+            buy_shares_exact: false,
             salt: 1,
             order_type: "FAK".to_owned(),
+            expires_at: None,
+            post_only: false,
             expected_taker_order_id: "0xdead".to_owned(),
             signed_order_json: "{}".to_owned(),
         },
@@ -2183,15 +2376,28 @@ async fn a_definitive_rejection_prepares_one_fresh_retry_without_phantom_lot() {
 }
 
 #[tokio::test]
-async fn an_explicit_fak_no_match_is_terminal_without_a_retry_or_reconciliation_case() {
+async fn an_explicit_fak_no_match_gets_one_fresh_best_ask_retry_then_terminates() {
     let db = TestDb::new().await;
     seed_account_and_schedule(&db).await;
     seed_leader(&db, 1).await;
     let intent_id = seed_pending_buy(&db).await;
+    set_fixed_share_policy(&db, intent_id).await;
     let venue = FakeVenue::succeeding(Decimal::new(5, 0));
-    *venue.submit_result.lock().unwrap() = Err(SubmitError::Rejected(
-        "400 no orders found to match with FAK order".to_owned(),
-    ));
+    *venue.submit_results.lock().unwrap() = VecDeque::from([
+        Err(SubmitError::Rejected(
+            "400 no orders found to match with FAK order".to_owned(),
+        )),
+        Err(SubmitError::Rejected(
+            "400 no orders found to match with FAK order".to_owned(),
+        )),
+        Ok(OrderReceipt::new(
+            Decimal::new(5, 0),
+            Decimal::new(5, 0),
+            Decimal::ZERO,
+            Decimal::new(5, 0),
+        )
+        .unwrap()),
+    ]);
 
     assert_eq!(
         execute_one_intent(
@@ -2205,7 +2411,7 @@ async fn an_explicit_fak_no_match_is_terminal_without_a_retry_or_reconciliation_
         )
         .await
         .unwrap(),
-        OrchestrateOutcome::Rejected
+        OrchestrateOutcome::Resting
     );
     let intent: (String, String) = sqlx::query_as(
         "SELECT status, rejection_reason FROM copy_intents WHERE id = ?",
@@ -2214,9 +2420,59 @@ async fn an_explicit_fak_no_match_is_terminal_without_a_retry_or_reconciliation_
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!(intent.0, "rejected");
-    assert!(intent.1.contains("no matching liquidity"));
-    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 1);
+    assert_eq!(intent.0, "in_progress");
+    assert!(intent.1.is_empty(), "{}", intent.1);
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 3);
+    let gtd_json: String = sqlx::query_scalar(
+        "SELECT envelope_json FROM order_attempts WHERE intent_id = ? ORDER BY attempt_number DESC LIMIT 1",
+    )
+    .bind(intent_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let gtd: PreparedOrderEnvelope = serde_json::from_str(&gtd_json).unwrap();
+    assert_eq!(gtd.order_type, "GTD");
+    assert!(gtd.post_only);
+    assert!(gtd.expires_at.is_some());
+    venue.set_order_status("LIVE");
+    assert_eq!(
+        execute_one_intent(
+            &db,
+            &FixedBalance(Decimal::new(100, 0)),
+            &venue,
+            &venue,
+            &EmptyHistory,
+            intent_id,
+            Utc::now()
+        )
+        .await
+        .unwrap(),
+        OrchestrateOutcome::Resting
+    );
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 3, "must not resubmit a resting GTD");
+    venue.set_order_status("MATCHED");
+    venue.with_size_matched(Decimal::new(3, 0));
+    assert_eq!(
+        execute_one_intent(
+            &db,
+            &FixedBalance(Decimal::new(100, 0)),
+            &venue,
+            &venue,
+            &EmptyHistory,
+            intent_id,
+            Utc::now()
+        )
+        .await
+        .unwrap(),
+        OrchestrateOutcome::Filled { filled_qty: Decimal::new(3, 0) }
+    );
+    let lot: String = sqlx::query_scalar(
+        "SELECT qty FROM position_lots WHERE account_id = 1 AND leader_id = 1 AND token_id = '123456'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(lot, "3");
     let cases: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ? AND resolved_at IS NULL",
     )
@@ -2225,6 +2481,52 @@ async fn an_explicit_fak_no_match_is_terminal_without_a_retry_or_reconciliation_
     .await
     .unwrap();
     assert_eq!(cases, 0);
+}
+
+#[tokio::test]
+async fn an_explicit_fak_no_match_retries_once_with_a_fresh_book_sweep_and_fixed_shares() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+    set_fixed_share_policy_with_max_price(&db, intent_id, "0.55").await;
+    let venue = FakeVenue::no_fak_then_fill(Decimal::new(5, 0));
+
+    let outcome =
+        execute_one_intent(
+            &db,
+            &FixedBalance(Decimal::new(100, 0)),
+            &venue,
+            &venue,
+            &EmptyHistory,
+            intent_id,
+            Utc::now()
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        OrchestrateOutcome::Filled {
+            filled_qty: Decimal::new(5, 0)
+        },
+        "{outcome:?}"
+    );
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 2);
+    let attempts: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT status, requested_qty, envelope_json FROM order_attempts \
+         WHERE intent_id = ? ORDER BY attempt_number",
+    )
+    .bind(intent_id)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].0, "rejected");
+    assert_eq!(attempts[1].0, "finalized");
+    let retry: PreparedOrderEnvelope = serde_json::from_str(&attempts[1].2).unwrap();
+    assert_eq!(retry.price, "0.60");
+    assert_eq!(retry.size, "5");
+    assert!(retry.buy_shares_exact);
 }
 
 /// The per-Leader budget exists so one Leader running dry does not stop the

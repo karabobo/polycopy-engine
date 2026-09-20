@@ -253,9 +253,25 @@ def _post_json(url: str, body: dict, token: str = "") -> dict:
     request = urllib.request.Request(
         url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
     )
+    return _read(request)
+
+
+def _read(request: urllib.request.Request) -> dict:
+    """Always return the body, including on a 4xx.
+
+    Feishu answers a rejection with a JSON body naming the code and the
+    reason; urllib raises on the status, and discarding the exception's body
+    would turn every API-level rejection into an opaque "400 Bad Request".
+    """
+
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             return json.loads(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as error:
+        try:
+            return json.loads(error.read().decode("utf-8", "replace"))
+        except (ValueError, OSError):
+            return {"code": -1, "msg": f"HTTP {error.code} with no readable body"}
     except (urllib.error.URLError, OSError, TimeoutError, ValueError) as error:
         return {"code": -1, "msg": f"{type(error).__name__}: {error}"}
 
@@ -264,11 +280,7 @@ def _get_json(url: str, token: str) -> dict:
     request = urllib.request.Request(
         url, headers={"Authorization": f"Bearer {token}"}, method="GET"
     )
-    try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            return json.loads(response.read().decode("utf-8", "replace"))
-    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as error:
-        return {"code": -1, "msg": f"{type(error).__name__}: {error}"}
+    return _read(request)
 
 
 class Sender:

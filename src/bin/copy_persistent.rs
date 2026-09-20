@@ -155,6 +155,9 @@ mod live {
                     Ok(OrchestrateOutcome::Filled { filled_qty }) => {
                         eprintln!("intent {intent_id}: filled_qty={filled_qty}");
                     }
+                    Ok(OrchestrateOutcome::Resting) => {
+                        eprintln!("intent {intent_id}: post-only GTD remains on book");
+                    }
                     Ok(OrchestrateOutcome::Rejected) => {
                         eprintln!("intent {intent_id}: rejected");
                     }

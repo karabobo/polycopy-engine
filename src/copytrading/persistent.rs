@@ -11,7 +11,12 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 
-use crate::copytrading::orchestrate::{OrchestrateError, SubmitAttemptMarker};
+use crate::{
+    copytrading::{
+        execute::finalize_receipt_with_conn,
+        orchestrate::{OrchestrateError, SubmitAttemptMarker},
+    },
+};
 
 pub const EXIT_LOCK_COLLISION: i32 = 20;
 pub const EXIT_FUSE_OPEN: i32 = 21;
@@ -54,7 +59,7 @@ pub const MAX_BUDGET_WINDOW_SECONDS: u64 = 86_400;
 /// exists to bound the worst case, so one set well above what the operator
 /// intends to do stops bounding anything short of catastrophe. Raising it
 /// should cost a code change and a redeploy.
-pub const MAX_PERSISTENT_ORDER_NOTIONAL_USDC: Decimal = Decimal::from_parts(5, 0, 0, false, 0);
+pub const MAX_PERSISTENT_ORDER_NOTIONAL_USDC: Decimal = Decimal::from_parts(10, 0, 0, false, 0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistentRuntimeConfig {
@@ -953,6 +958,7 @@ pub async fn resolve_operator_confirmed_no_fill(
         .await
         .map_err(db_err)?;
         let [case_id] = cases.as_slice() else {
+            eprintln!("recovered-fill recovery failed: expected exactly one unresolved linked case");
             return Err(PersistentError::UnresolvedRecovery);
         };
 
@@ -1030,6 +1036,159 @@ pub async fn resolve_operator_confirmed_no_fill(
         }
     }
     result
+}
+
+/// Accounts a venue fill that was misclassified as a local pre-boundary
+/// failure. The caller must have just completed a strict authenticated
+/// trade-history lookup that recovered this attempt's exact envelope and
+/// filled quantity. This never submits an order.
+pub async fn restore_reservation_and_finalize_recovered_fill(
+    pool: &SqlitePool,
+    account_id: i64,
+    attempt_id: i64,
+    filled_qty: Decimal,
+    maker_notional_usdc: Decimal,
+) -> Result<i64, PersistentError> {
+    if filled_qty <= Decimal::ZERO || maker_notional_usdc <= Decimal::ZERO {
+        return Err(PersistentError::UnresolvedRecovery);
+    }
+    let mut conn = pool.acquire().await.map_err(db_err)?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+    let result: Result<i64, PersistentError> = async {
+        let row: Option<(i64, String, String, String)> = sqlx::query_as(
+            "SELECT ci.id, ci.status, oa.status, oa.envelope_json \
+             FROM order_attempts oa \
+             JOIN copy_intents ci ON ci.id = oa.intent_id \
+             WHERE oa.id = ? AND ci.account_id = ?",
+        )
+        .bind(attempt_id)
+        .bind(account_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        let Some((intent_id, intent_status, attempt_status, envelope_json)) = row else {
+            eprintln!("recovered-fill recovery failed: attempt/account row was not found");
+            return Err(PersistentError::UnresolvedRecovery);
+        };
+        if intent_status != "needs_reconcile" || attempt_status != "uncertain" {
+            eprintln!("recovered-fill recovery failed: intent or attempt is no longer recoverable");
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+        let envelope: crate::copytrading::reconcile::PreparedOrderEnvelope =
+            serde_json::from_str(&envelope_json).map_err(|error| {
+                eprintln!("recovered-fill recovery failed: persisted envelope is invalid: {error}");
+                PersistentError::UnresolvedRecovery
+            })?;
+        let receipt = crate::venue::intl_clob_exec::receipt_from_submitted_envelope(
+            &envelope,
+            filled_qty,
+            filled_qty,
+        )
+        .map_err(|error| {
+            eprintln!("recovered-fill recovery failed: recovered receipt is invalid: {error}");
+            PersistentError::UnresolvedRecovery
+        })?;
+        if receipt.filled_qty() != filled_qty {
+            eprintln!("recovered-fill recovery failed: recovered receipt fill disagrees with strict history");
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+
+        let cases: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM reconciliation_cases WHERE account_id = ? AND intent_id = ? \
+             AND order_attempt_id = ? AND resolved_at IS NULL \
+             AND case_type IN ('local_submission_failure', 'unknown_submission') \
+             ORDER BY id",
+        )
+        .bind(account_id)
+        .bind(intent_id)
+        .bind(attempt_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        let [case_id] = cases.as_slice() else {
+            return Err(PersistentError::UnresolvedRecovery);
+        };
+
+        let restored = sqlx::query(
+            "UPDATE persistent_budget_reservations \
+             SET amount_usdc = ?, state = 'reserved', release_reason = NULL, released_at = NULL \
+             WHERE order_attempt_id = ? AND account_id = ? \
+               AND state IN ('released_pre_boundary', 'reserved')",
+        )
+        .bind(maker_notional_usdc.to_string())
+        .bind(attempt_id)
+        .bind(account_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        if restored.rows_affected() != 1 {
+            eprintln!("recovered-fill recovery failed: reservation was not restorable");
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+        // Keep lot accounting, the attempt terminal record, and case closure
+        // inside this same IMMEDIATE transaction. A crash can therefore leave
+        // either the original uncertain state or the complete recovered state,
+        // never a restored budget without its matching virtual lot.
+        if let Err(error) = finalize_receipt_with_conn(&mut conn, intent_id, attempt_id, &receipt).await {
+            eprintln!("recovered-fill recovery failed while applying receipt: {error}");
+            return Err(PersistentError::Database(error.to_string()));
+        }
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let attempt = sqlx::query(
+            "UPDATE order_attempts SET status = 'finalized', filled_qty = ?, \
+             accepted_qty = ?, remaining_qty = '0', failure_detail = NULL, \
+             updated_at = ? WHERE id = ? AND status = 'uncertain'",
+        )
+        .bind(receipt.filled_qty().to_string())
+        .bind(receipt.accepted_qty().to_string())
+        .bind(&now)
+        .bind(attempt_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        if attempt.rows_affected() != 1 {
+            eprintln!("recovered-fill recovery failed: uncertain attempt did not finalize");
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+        let resolution = format!(
+            "operator accounted recovered venue fill: {} shares; maker USDC principal {}; exact-envelope trade-history lookup",
+            receipt.filled_qty(), maker_notional_usdc
+        );
+        let case = sqlx::query(
+            "UPDATE reconciliation_cases SET resolved_at = ?, resolution = ? \
+             WHERE id = ? AND resolved_at IS NULL",
+        )
+        .bind(&now)
+        .bind(&resolution)
+        .bind(*case_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        if case.rows_affected() != 1 {
+            eprintln!("recovered-fill recovery failed: reconciliation case did not close");
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+        Ok(*case_id)
+    }
+    .await;
+
+    match result {
+        Ok(case_id) => {
+            sqlx::query("COMMIT")
+                .execute(&mut *conn)
+                .await
+                .map_err(db_err)?;
+            Ok(case_id)
+        }
+        Err(error) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            Err(error)
+        }
+    }
 }
 
 /// Resolves a pre-submit SELL case only when the durable virtual ledger proves
@@ -1374,13 +1533,13 @@ mod tests {
     }
 
     #[test]
-    fn persistent_per_order_cap_allows_five_usdc_but_rejects_any_larger_value() {
-        let at_cap = PersistentRuntimeConfig::from_values(1, true, "1", "5", "50", 86_400, 1, 60)
-            .expect("the reviewed five-USDC cap must be accepted");
-        assert_eq!(at_cap.max_order_notional, Decimal::new(5, 0));
+    fn persistent_per_order_cap_allows_ten_usdc_but_rejects_any_larger_value() {
+        let at_cap = PersistentRuntimeConfig::from_values(1, true, "1", "10", "50", 86_400, 1, 60)
+            .expect("the reviewed ten-USDC cap must be accepted");
+        assert_eq!(at_cap.max_order_notional, Decimal::new(10, 0));
 
         assert_eq!(
-            PersistentRuntimeConfig::from_values(1, true, "1", "5.01", "50", 86_400, 1, 60),
+            PersistentRuntimeConfig::from_values(1, true, "1", "10.01", "50", 86_400, 1, 60),
             Err(PersistentError::Config(format!(
                 "persistent max order notional must be > 0 and \
                  <= {MAX_PERSISTENT_ORDER_NOTIONAL_USDC} USDC"
@@ -1440,8 +1599,11 @@ mod tests {
             price: "1".to_owned(),
             size: notional.to_owned(),
             buy_budget_usdc: Some(notional.to_owned()),
+            buy_shares_exact: false,
             salt: intent_id as u64,
             order_type: "FAK".to_owned(),
+            expires_at: None,
+            post_only: false,
             expected_taker_order_id: format!("0x{intent_id:x}"),
             signed_order_json: "{}".to_owned(),
         };
@@ -1499,8 +1661,11 @@ mod tests {
             price: "1".to_owned(),
             size: notional.to_owned(),
             buy_budget_usdc: Some(notional.to_owned()),
+            buy_shares_exact: false,
             salt: intent_id as u64,
             order_type: "FAK".to_owned(),
+            expires_at: None,
+            post_only: false,
             expected_taker_order_id: format!("0x{intent_id:x}"),
             signed_order_json: "{}".to_owned(),
         };
@@ -1891,8 +2056,11 @@ mod tests {
                     price: "1".to_owned(),
                     size: "1".to_owned(),
                     buy_budget_usdc: Some("1".to_owned()),
+                    buy_shares_exact: false,
                     salt: (100 + index) as u64,
                     order_type: "FAK".to_owned(),
+                    expires_at: None,
+                    post_only: false,
                     expected_taker_order_id: format!("0xretry{index}"),
                     signed_order_json: "{}".to_owned(),
                 };
@@ -2251,6 +2419,123 @@ mod tests {
         .expect("case status");
         assert_eq!(status, "rejected");
         assert_eq!(open_cases, 0);
+    }
+
+    #[tokio::test]
+    async fn recovered_overfill_is_accounted_instead_of_left_as_local_failure() {
+        let db = TestDb::new().await;
+        seed_base(&db).await;
+        let config = cfg();
+        let now = Utc::now();
+        let (intent_id, attempt_id) = seed_attempt(
+            &db,
+            "recovered-overfill",
+            "1",
+            now + chrono::Duration::seconds(60),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE copy_intents SET planned_qty = '5', planned_price = '0.20', \
+             planned_notional_usdc = '1', reserved_qty = '5' WHERE id = ?",
+        )
+        .bind(intent_id)
+        .execute(&db.pool)
+        .await
+        .expect("intent qty");
+        sqlx::query(
+            "UPDATE order_attempts SET envelope_json = ? WHERE id = ?",
+        )
+        .bind(
+            serde_json::to_string(&PreparedOrderEnvelope {
+                token_id: "123456".to_owned(),
+                side: "BUY".to_owned(),
+                price: "0.20".to_owned(),
+                size: "5".to_owned(),
+                buy_budget_usdc: Some("1".to_owned()),
+                buy_shares_exact: true,
+                salt: 1,
+                order_type: "FAK".to_owned(),
+                expires_at: None,
+                post_only: false,
+                expected_taker_order_id: "0xdead".to_owned(),
+                signed_order_json: "{}".to_owned(),
+            })
+            .unwrap(),
+        )
+        .bind(attempt_id)
+        .execute(&db.pool)
+        .await
+        .expect("envelope");
+        reserve_budget_and_mark_submitting(&db, &config, intent_id, attempt_id, now)
+            .await
+            .expect("reserve");
+        crate::copytrading::reconcile::open_local_submission_failure_case(
+            &db,
+            intent_id,
+            attempt_id,
+            "filled_qty (5.4) must not exceed requested_qty (5)",
+        )
+        .await
+        .expect("misclassified local failure");
+
+        restore_reservation_and_finalize_recovered_fill(
+            &db,
+            1,
+            attempt_id,
+            Decimal::new(54, 1),
+            Decimal::new(270, 2),
+        )
+        .await
+        .expect("recovered fill must be accounted");
+
+        let lot: String = sqlx::query_scalar(
+            "SELECT qty FROM position_lots WHERE account_id = 1 AND leader_id = 1 AND token_id = '123456'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("lot");
+        assert_eq!(lot.parse::<Decimal>().unwrap(), Decimal::new(54, 1));
+        let intent: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+            .bind(intent_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("intent");
+        assert_eq!(intent, "completed");
+        let attempt: String = sqlx::query_scalar("SELECT status FROM order_attempts WHERE id = ?")
+            .bind(attempt_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("attempt");
+        assert_eq!(attempt, "finalized");
+        let reservation: (String, String) = sqlx::query_as(
+            "SELECT state, amount_usdc FROM persistent_budget_reservations WHERE order_attempt_id = ?",
+        )
+        .bind(attempt_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("reservation");
+        assert_eq!(reservation.0, "reserved");
+        assert_eq!(reservation.1, "2.70");
+        let resolution: String = sqlx::query_scalar(
+            "SELECT resolution FROM reconciliation_cases WHERE intent_id = ?",
+        )
+        .bind(intent_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("resolution");
+        assert!(resolution.contains("5.4 shares"));
+        assert!(resolution.contains("2.70"));
+        let open_cases: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ? AND resolved_at IS NULL",
+        )
+        .bind(intent_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("cases");
+        assert_eq!(open_cases, 0);
+        assert_startup_clear(&db, 1)
+            .await
+            .expect("startup must be clear after accounting the fill");
     }
 
     #[test]

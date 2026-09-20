@@ -13,7 +13,8 @@ use crate::{
         execute::{
             cancel_expired_intent, claim_or_resume_intent, finalize_receipt, next_attempt_number,
             open_reconciliation_case as open_execute_case, reject_pre_submit_intent,
-            size_and_reserve, ClaimedIntent, ExecuteError, SizedDecision, SizingOutcome,
+            reprice_fixed_share_buy_after_no_fak, size_and_reserve, ClaimedIntent, ExecuteError,
+            SizedDecision, SizingOutcome,
         },
         persistent::release_pre_boundary_failure,
         reconcile::{
@@ -31,6 +32,50 @@ use crate::{
     },
 };
 
+/// A fresh-book best ask for the single FAK retry after a deterministic
+/// no-match.  This is deliberately one displayed level, never a depth sweep:
+/// the retry may take only immediately available liquidity at the best ask.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NoFakSweepQuote {
+    pub limit_price: Decimal,
+    pub visible_shares: Decimal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GtdMarketSpec {
+    pub expires_at: DateTime<Utc>,
+    pub tick_size: Decimal,
+}
+
+/// Returns the best valid displayed ask from a fresh book. `target_shares` is
+/// retained as a mandatory positive guard for the fixed-share retry contract;
+/// it must not influence the price ceiling, otherwise a thin book turns a
+/// retry into an unbounded multi-level sweep.
+pub fn no_fak_sweep_quote<I>(
+    asks: I,
+    target_shares: Decimal,
+) -> Result<NoFakSweepQuote, String>
+where
+    I: IntoIterator<Item = (Decimal, Decimal)>,
+{
+    if target_shares <= Decimal::ZERO {
+        return Err("fixed-share no-FAK retry has a non-positive target".to_owned());
+    }
+
+    let mut levels: Vec<_> = asks.into_iter().collect();
+    levels.sort_by_key(|(price, _)| *price);
+    let Some((price, size)) = levels.into_iter().next() else {
+        return Err("fresh order book has no asks".to_owned());
+    };
+    if price <= Decimal::ZERO || price >= Decimal::ONE || size <= Decimal::ZERO {
+        return Err("fresh order book contains an invalid ask level".to_owned());
+    }
+    Ok(NoFakSweepQuote {
+        limit_price: price,
+        visible_shares: size,
+    })
+}
+
 /// Operator-facing live-run guard. Only the exact value `yes` enables venue
 /// writes, matching the canary probe.
 pub fn live_execute_enabled(value: Option<&str>) -> bool {
@@ -44,6 +89,37 @@ pub trait EnvelopeFactory {
         &self,
         decision: &SizedDecision,
     ) -> impl std::future::Future<Output = Result<PreparedOrderEnvelope, String>> + Send;
+
+    /// Reads a fresh ask sweep only for the single explicit no-FAK retry.
+    /// The default is fail-closed so test or alternate factories cannot
+    /// accidentally gain a price-chasing path.
+    fn sweep_quote_for_no_fak_retry<'a>(
+        &'a self,
+        _token_id: &'a str,
+        _target_shares: Decimal,
+    ) -> Pin<Box<dyn Future<Output = Result<NoFakSweepQuote, String>> + Send + 'a>> {
+        Box::pin(async { Err("no-FAK fresh-book sweep retry is unavailable".to_owned()) })
+    }
+
+    /// Fetches the venue's authoritative market end. The default is
+    /// fail-closed: a maker order without a proven expiry is forbidden.
+    fn market_spec_for_gtd<'a>(
+        &'a self,
+        _condition_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<GtdMarketSpec, String>> + Send + 'a>> {
+        Box::pin(async { Err("market end lookup for GTD maker retry is unavailable".to_owned()) })
+    }
+
+    /// Signs the third, post-only GTD maker attempt. It receives the exact
+    /// persisted sizing decision plus the independently fetched end time;
+    /// implementations must retain both in the signed envelope.
+    fn prepare_post_only_gtd_buy<'a>(
+        &'a self,
+        _decision: &'a SizedDecision,
+        _expires_at: DateTime<Utc>,
+    ) -> Pin<Box<dyn Future<Output = Result<PreparedOrderEnvelope, String>> + Send + 'a>> {
+        Box::pin(async { Err("post-only GTD maker retry is unavailable".to_owned()) })
+    }
 }
 
 pub trait SubmitAttemptMarker {
@@ -78,6 +154,9 @@ impl SubmitAttemptMarker for StandardSubmitAttemptMarker {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrchestrateOutcome {
     Filled { filled_qty: Decimal },
+    /// A post-only GTD order is accepted by the venue and remains open. Its
+    /// reservation stays active; the next runner tick polls the exact order.
+    Resting,
     Uncertain,
     NeedsReconcile(&'static str),
     Expired,
@@ -162,6 +241,7 @@ pub async fn list_runnable_intents(
     .map_err(|error| OrchestrateError::Execute(ExecuteError::Database(error.to_string())))
 }
 
+#[derive(Clone)]
 struct AttemptRow {
     id: i64,
     status: String,
@@ -282,7 +362,19 @@ where
         ))
     })?;
     persist_expected_venue_order_id(pool, intent_id, attempt.id, &attempt.envelope).await?;
-    submit_prepared(pool, execution, marker, intent_id, attempt, now).await
+    let outcome = submit_prepared(pool, execution, marker, intent_id, attempt.clone(), now).await?;
+    maybe_retry_no_fak_once(
+        pool,
+        balance_reader,
+        execution,
+        envelopes,
+        marker,
+        &claimed,
+        &attempt,
+        outcome,
+        now,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -304,10 +396,33 @@ where
     H: StrictTradeHistoryReader,
     M: SubmitAttemptMarker,
 {
+    if attempt.envelope.order_type == "GTD" && attempt.status == "accepted" {
+        return poll_resting_gtd(pool, execution, claimed.intent_id, attempt).await;
+    }
     let window_count = attempts_in_window(pool, claimed.intent_id).await?;
     match permitted_recovery_action(&attempt.status, true, window_count) {
         RecoveryAction::MarkSubmittingThenSubmit => {
-            submit_prepared(pool, execution, marker, claimed.intent_id, attempt, now).await
+            let outcome = submit_prepared(
+                pool,
+                execution,
+                marker,
+                claimed.intent_id,
+                attempt.clone(),
+                now,
+            )
+            .await?;
+            maybe_retry_no_fak_once(
+                pool,
+                balance_reader,
+                execution,
+                envelopes,
+                marker,
+                claimed,
+                &attempt,
+                outcome,
+                now,
+            )
+            .await
         }
         RecoveryAction::QueryFirst => {
             query_first(
@@ -324,6 +439,20 @@ where
             reconcile_or_finalize(pool, execution, claimed.intent_id, attempt).await
         }
         RecoveryAction::MayPrepareNewAttempt => {
+            if is_explicit_no_fak_rejection(pool, attempt.id).await? {
+                return maybe_retry_no_fak_once(
+                    pool,
+                    balance_reader,
+                    execution,
+                    envelopes,
+                    marker,
+                    claimed,
+                    &attempt,
+                    OrchestrateOutcome::Rejected,
+                    now,
+                )
+                .await;
+            }
             match prepare_new_attempt(pool, balance_reader, envelopes, claimed).await? {
                 RetryPreparation::Prepared => {}
                 RetryPreparation::Expired => return Ok(OrchestrateOutcome::Expired),
@@ -354,10 +483,387 @@ where
     }
 }
 
+async fn poll_resting_gtd<E>(
+    pool: &SqlitePool,
+    execution: &E,
+    intent_id: i64,
+    attempt: AttemptRow,
+) -> Result<OrchestrateOutcome, OrchestrateError>
+where
+    E: CopyExecution,
+{
+    let state = execution
+        .order_for_receipt(&crate::venue::types::OrderId(
+            attempt.envelope.expected_taker_order_id.clone(),
+        ))
+        .await
+        .map_err(|detail| OrchestrateError::Receipt(format!("GTD order lookup failed: {detail}")))?;
+    if !is_terminal_gtd_status(&state.status) {
+        sqlx::query(
+            "UPDATE order_attempts SET venue_status = ?, filled_qty = ?, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND intent_id = ?",
+        )
+        .bind(&state.status)
+        .bind(state.size_matched.to_string())
+        .bind(attempt.id)
+        .bind(intent_id)
+        .execute(pool)
+        .await
+        .map_err(|error| OrchestrateError::Execute(ExecuteError::Database(error.to_string())))?;
+        return Ok(OrchestrateOutcome::Resting);
+    }
+    if state.size_matched > Decimal::ZERO {
+        let requested: Decimal = attempt
+            .envelope
+            .size
+            .parse()
+            .map_err(|_| OrchestrateError::Receipt("invalid GTD envelope size".to_owned()))?;
+        let receipt = OrderReceipt::new(requested, requested, state.size_matched, Decimal::ZERO)
+            .map_err(|error| OrchestrateError::Receipt(error.to_string()))?;
+        finalize_receipt(pool, intent_id, attempt.id, &receipt).await?;
+        mark_attempt_finalized(pool, intent_id, attempt.id).await?;
+        return Ok(OrchestrateOutcome::Filled {
+            filled_qty: state.size_matched,
+        });
+    }
+    // A terminal zero-fill GTD has reached its venue expiry/cancellation.
+    // No submission ambiguity remains, so release its reservation atomically
+    // with the terminal local state rather than treating it as a failed FAK.
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| OrchestrateError::Execute(ExecuteError::Database(error.to_string())))?;
+    sqlx::query(
+        "UPDATE order_attempts SET status = 'finalized', venue_status = ?, filled_qty = '0', \
+         failure_detail = 'GTD expired or cancelled without a fill', \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND intent_id = ?",
+    )
+    .bind(&state.status)
+    .bind(attempt.id)
+    .bind(intent_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| OrchestrateError::Execute(ExecuteError::Database(error.to_string())))?;
+    sqlx::query(
+        "UPDATE copy_intents SET status = 'cancelled', reserved_qty = '0', \
+         rejection_reason = 'post-only GTD expired or cancelled without a fill', \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND status = 'in_progress'",
+    )
+    .bind(intent_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| OrchestrateError::Execute(ExecuteError::Database(error.to_string())))?;
+    tx.commit()
+        .await
+        .map_err(|error| OrchestrateError::Execute(ExecuteError::Database(error.to_string())))?;
+    Ok(OrchestrateOutcome::Expired)
+}
+
+fn is_terminal_gtd_status(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "matched" | "filled" | "confirmed" | "mined" | "cancelled" | "canceled" | "expired"
+    )
+}
+
 enum RetryPreparation {
     Prepared,
     Expired,
     Rejected,
+}
+
+async fn is_explicit_no_fak_rejection(
+    pool: &SqlitePool,
+    attempt_id: i64,
+) -> Result<bool, OrchestrateError> {
+    let matched: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM order_attempts \
+         WHERE id = ? AND status = 'rejected' \
+           AND failure_detail LIKE '%no orders found to match with FAK order%')",
+    )
+    .bind(attempt_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| OrchestrateError::Execute(ExecuteError::Database(error.to_string())))?;
+    Ok(matched != 0)
+}
+
+async fn no_fak_rejection_count(
+    pool: &SqlitePool,
+    intent_id: i64,
+) -> Result<i64, OrchestrateError> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM order_attempts WHERE intent_id = ? AND status = 'rejected' \
+         AND failure_detail LIKE '%no orders found to match with FAK order%'",
+    )
+    .bind(intent_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| OrchestrateError::Execute(ExecuteError::Database(error.to_string())))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maybe_retry_no_fak_once<B, E, F, M>(
+    pool: &SqlitePool,
+    balance_reader: &B,
+    execution: &E,
+    envelopes: &F,
+    marker: &M,
+    claimed: &ClaimedIntent,
+    failed_attempt: &AttemptRow,
+    outcome: OrchestrateOutcome,
+    now: DateTime<Utc>,
+) -> Result<OrchestrateOutcome, OrchestrateError>
+where
+    B: StrictAccountBalanceReader,
+    E: CopyExecution,
+    F: EnvelopeFactory,
+    M: SubmitAttemptMarker,
+{
+    if outcome != OrchestrateOutcome::Rejected
+        || !is_explicit_no_fak_rejection(pool, failed_attempt.id).await?
+    {
+        return Ok(outcome);
+    }
+
+    let no_match_count = no_fak_rejection_count(pool, claimed.intent_id).await?;
+    if no_match_count == 2 {
+        return submit_post_only_gtd_after_second_no_fak(
+            pool,
+            balance_reader,
+            execution,
+            envelopes,
+            marker,
+            claimed,
+            now,
+        )
+        .await;
+    }
+    if no_match_count != 1 {
+        reject_pre_submit_intent(
+            pool,
+            claimed.intent_id,
+            "fresh-book sweep retry also found no matching FAK liquidity",
+        )
+        .await?;
+        return Ok(OrchestrateOutcome::Rejected);
+    }
+
+    // The caller may hold the pre-sizing claim (the initial submission
+    // path). Reload it so the book sweep is sized from the immutable quantity
+    // that was durably chosen before the first FAK crossed the boundary.
+    let Some(retry_claimed) = claim_or_resume_intent(pool, claimed.intent_id).await? else {
+        return Ok(OrchestrateOutcome::NotClaimed);
+    };
+    let Some((target_shares, _, _)) = retry_claimed.existing_decision else {
+        open_execute_case(pool, claimed, "no-FAK retry is missing its persisted fixed-share decision").await?;
+        return Ok(OrchestrateOutcome::NeedsReconcile(
+            "no-FAK retry is missing its persisted fixed-share decision",
+        ));
+    };
+    let sweep = match envelopes
+        .sweep_quote_for_no_fak_retry(&claimed.token_id, target_shares)
+        .await
+    {
+        Ok(quote) => quote,
+        Err(detail) => {
+            reject_pre_submit_intent(
+                pool,
+                claimed.intent_id,
+                &format!("no-FAK fresh-book sweep lookup failed: {detail}"),
+            )
+            .await?;
+            return Ok(OrchestrateOutcome::Rejected);
+        }
+    };
+    let decision = match reprice_fixed_share_buy_after_no_fak(
+        pool,
+        balance_reader,
+        &retry_claimed,
+        sweep.limit_price,
+    )
+    .await?
+    {
+        SizingOutcome::Decision(decision) => decision,
+        SizingOutcome::NeedsReconcile(reason) => {
+            open_execute_case(pool, claimed, reason).await?;
+            return Ok(OrchestrateOutcome::NeedsReconcile(reason));
+        }
+        SizingOutcome::Expired => {
+            cancel_expired_intent(pool, claimed.intent_id).await?;
+            return Ok(OrchestrateOutcome::Expired);
+        }
+        SizingOutcome::Rejected(reason) => {
+            reject_pre_submit_intent(pool, claimed.intent_id, reason).await?;
+            return Ok(OrchestrateOutcome::Rejected);
+        }
+    };
+    let envelope = match envelopes.prepare(&decision).await {
+        Ok(envelope) => envelope,
+        Err(detail) => {
+            reject_pre_submit_intent(
+                pool,
+                claimed.intent_id,
+                &format!("no-FAK retry envelope preparation failed: {detail}"),
+            )
+            .await?;
+            return Ok(OrchestrateOutcome::Rejected);
+        }
+    };
+    let attempt_number = next_attempt_number(pool, claimed.intent_id).await?;
+    load_or_prepare_attempt(pool, claimed.intent_id, attempt_number, &envelope).await?;
+    let retry_attempt = load_latest_attempt(pool, claimed.intent_id).await?.ok_or_else(|| {
+        OrchestrateError::Execute(ExecuteError::Database(
+            "missing attempt after no-FAK retry preparation".into(),
+        ))
+    })?;
+    persist_expected_venue_order_id(
+        pool,
+        claimed.intent_id,
+        retry_attempt.id,
+        &retry_attempt.envelope,
+    )
+    .await?;
+    let retry_outcome = submit_prepared(
+        pool,
+        execution,
+        marker,
+        claimed.intent_id,
+        retry_attempt.clone(),
+        now,
+    )
+    .await?;
+    if retry_outcome == OrchestrateOutcome::Rejected
+        && is_explicit_no_fak_rejection(pool, retry_attempt.id).await?
+    {
+        return submit_post_only_gtd_after_second_no_fak(
+            pool,
+            balance_reader,
+            execution,
+            envelopes,
+            marker,
+            claimed,
+            now,
+        )
+        .await;
+    }
+    Ok(retry_outcome)
+}
+
+/// The third and final path after two definitive FAK no-matches: do not chase
+/// another ask. Reuse the immutable fixed quantity, reset the reservation to
+/// the leader's own price, and submit one post-only GTD order that expires at
+/// the venue-provided market end.
+#[allow(clippy::too_many_arguments)]
+async fn submit_post_only_gtd_after_second_no_fak<B, E, F, M>(
+    pool: &SqlitePool,
+    balance_reader: &B,
+    execution: &E,
+    envelopes: &F,
+    marker: &M,
+    claimed: &ClaimedIntent,
+    now: DateTime<Utc>,
+) -> Result<OrchestrateOutcome, OrchestrateError>
+where
+    B: StrictAccountBalanceReader,
+    E: CopyExecution,
+    F: EnvelopeFactory,
+    M: SubmitAttemptMarker,
+{
+    let Some(retry_claimed) = claim_or_resume_intent(pool, claimed.intent_id).await? else {
+        return Ok(OrchestrateOutcome::NotClaimed);
+    };
+    let Some((target_qty, _, _)) = retry_claimed.existing_decision else {
+        open_execute_case(pool, claimed, "post-only GTD retry is missing its persisted fixed-share decision").await?;
+        return Ok(OrchestrateOutcome::NeedsReconcile(
+            "post-only GTD retry is missing its persisted fixed-share decision",
+        ));
+    };
+    let market = match envelopes.market_spec_for_gtd(&retry_claimed.condition_id).await {
+        Ok(market) => market,
+        Err(detail) => {
+            reject_pre_submit_intent(
+                pool,
+                claimed.intent_id,
+                &format!("post-only GTD market-end lookup failed: {detail}"),
+            )
+            .await?;
+            return Ok(OrchestrateOutcome::Rejected);
+        }
+    };
+    if market.expires_at <= now {
+        cancel_expired_intent(pool, claimed.intent_id).await?;
+        return Ok(OrchestrateOutcome::Expired);
+    }
+    let maker_price = floor_to_valid_maker_price(
+        retry_claimed.leader_price,
+        market.tick_size,
+        target_qty,
+    )?;
+    let decision = match reprice_fixed_share_buy_after_no_fak(
+        pool,
+        balance_reader,
+        &retry_claimed,
+        maker_price,
+    )
+    .await?
+    {
+        SizingOutcome::Decision(decision) => decision,
+        SizingOutcome::NeedsReconcile(reason) => {
+            open_execute_case(pool, claimed, reason).await?;
+            return Ok(OrchestrateOutcome::NeedsReconcile(reason));
+        }
+        SizingOutcome::Expired => {
+            cancel_expired_intent(pool, claimed.intent_id).await?;
+            return Ok(OrchestrateOutcome::Expired);
+        }
+        SizingOutcome::Rejected(reason) => {
+            reject_pre_submit_intent(pool, claimed.intent_id, reason).await?;
+            return Ok(OrchestrateOutcome::Rejected);
+        }
+    };
+    let envelope = match envelopes.prepare_post_only_gtd_buy(&decision, market.expires_at).await {
+        Ok(envelope) => envelope,
+        Err(detail) => {
+            reject_pre_submit_intent(
+                pool,
+                claimed.intent_id,
+                &format!("post-only GTD envelope preparation failed: {detail}"),
+            )
+            .await?;
+            return Ok(OrchestrateOutcome::Rejected);
+        }
+    };
+    let attempt_number = next_attempt_number(pool, claimed.intent_id).await?;
+    load_or_prepare_attempt(pool, claimed.intent_id, attempt_number, &envelope).await?;
+    let attempt = load_latest_attempt(pool, claimed.intent_id).await?.ok_or_else(|| {
+        OrchestrateError::Execute(ExecuteError::Database(
+            "missing attempt after post-only GTD preparation".into(),
+        ))
+    })?;
+    persist_expected_venue_order_id(pool, claimed.intent_id, attempt.id, &attempt.envelope)
+        .await?;
+    submit_prepared(pool, execution, marker, claimed.intent_id, attempt, now).await
+}
+
+fn floor_to_valid_maker_price(
+    leader_price: Decimal,
+    tick_size: Decimal,
+    qty: Decimal,
+) -> Result<Decimal, OrchestrateError> {
+    if leader_price <= Decimal::ZERO || leader_price >= Decimal::ONE || tick_size <= Decimal::ZERO {
+        return Err(OrchestrateError::Prepare("invalid leader price or market tick for GTD maker order".to_owned()));
+    }
+    let mut price = (leader_price / tick_size).floor() * tick_size;
+    // The CLOB's maker USDC amount must remain cent-denominated. Keep moving
+    // down by valid ticks, never above the leader's price, until that is true.
+    while price > Decimal::ZERO && (price * qty).normalize().scale() > 2 {
+        price -= tick_size;
+    }
+    if price <= Decimal::ZERO || price >= Decimal::ONE {
+        return Err(OrchestrateError::Prepare("no positive cent-valid maker price at or below leader price".to_owned()));
+    }
+    Ok(price.normalize())
 }
 
 async fn prepare_new_attempt<B, F>(
@@ -445,6 +951,12 @@ where
     match execution.submit_exact_envelope(&attempt.envelope).await {
         Ok(receipt) => {
             mark_attempt_accepted(pool, intent_id, attempt.id).await?;
+            if attempt.envelope.order_type == "GTD" {
+                // A post-only GTD may remain on book. Never finalize from the
+                // submit response: every later fill is accounted from a
+                // strict order-status poll against this immutable envelope.
+                return Ok(OrchestrateOutcome::Resting);
+            }
             finalize_receipt(pool, intent_id, attempt.id, &receipt).await?;
             mark_attempt_finalized(pool, intent_id, attempt.id).await?;
             Ok(OrchestrateOutcome::Filled {
@@ -460,19 +972,10 @@ where
             mark_attempt_rejected(pool, intent_id, attempt.id, &detail).await?;
             release_pre_boundary_failure(pool, attempt.id, "venue definitively rejected order")
                 .await?;
-            // A FAK response that explicitly says that it found no matching
-            // orders is a definitive zero-fill outcome. Re-preparing the same
-            // stale copy signal cannot discover new liquidity at its original
-            // limit, and a burst of such retries must not trip the account
-            // fuse. Transport errors remain query-first above.
-            if detail.contains("no orders found to match with FAK order") {
-                reject_pre_submit_intent(
-                    pool,
-                    intent_id,
-                    "venue found no matching liquidity for FAK order",
-                )
-                .await?;
-            }
+            // An explicit no-FAK response is a definitive zero-fill result.
+            // The caller may perform exactly one fresh-book retry with a new
+            // envelope; all other definitive rejections remain ordinary
+            // rejected attempts. Transport errors stay query-first above.
             Ok(OrchestrateOutcome::Rejected)
         }
         Err(SubmitError::Local(detail)) => {
@@ -784,6 +1287,81 @@ impl EnvelopeFactory for crate::venue::intl_clob_exec::IntlClobCopyAdapter {
                 .map(|prepared| prepared.envelope)
                 .map_err(|error| error.to_string())
         }
+    }
+
+    fn sweep_quote_for_no_fak_retry<'a>(
+        &'a self,
+        token_id: &'a str,
+        target_shares: Decimal,
+    ) -> Pin<Box<dyn Future<Output = Result<NoFakSweepQuote, String>> + Send + 'a>> {
+        let client = self.client().clone();
+        let token_id = token_id.to_owned();
+        Box::pin(async move {
+            let token_id = token_id
+                .parse::<alloy::primitives::U256>()
+                .map_err(|_| "invalid outcome token ID for no-FAK best-ask retry".to_owned())?;
+            let request = polymarket_client_sdk_v2::clob::types::request::OrderBookSummaryRequest::builder()
+                .token_id(token_id)
+                .build();
+            let book = client
+                .order_book(&request)
+                .await
+                .map_err(|error| format!("fresh order-book read failed: {error}"))?;
+            no_fak_sweep_quote(
+                book.asks.into_iter().map(|level| (level.price, level.size)),
+                target_shares,
+            )
+        })
+    }
+
+    fn market_spec_for_gtd<'a>(
+        &'a self,
+        condition_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<GtdMarketSpec, String>> + Send + 'a>> {
+        let client = self.client().clone();
+        let condition_id = condition_id.to_owned();
+        Box::pin(async move {
+            let market = client
+                .market(&condition_id)
+                .await
+                .map_err(|error| format!("market end lookup failed: {error}"))?;
+            let end = market.end_date_iso.ok_or_else(|| {
+                "market end lookup returned no end_date_iso; refusing GTD maker order".to_owned()
+            })?;
+            if end <= Utc::now() {
+                return Err("market end is not in the future; refusing GTD maker order".to_owned());
+            }
+            if market.minimum_tick_size <= Decimal::ZERO {
+                return Err("market end lookup returned invalid minimum_tick_size".to_owned());
+            }
+            Ok(GtdMarketSpec {
+                expires_at: end,
+                tick_size: market.minimum_tick_size,
+            })
+        })
+    }
+
+    fn prepare_post_only_gtd_buy<'a>(
+        &'a self,
+        decision: &'a SizedDecision,
+        expires_at: DateTime<Utc>,
+    ) -> Pin<Box<dyn Future<Output = Result<PreparedOrderEnvelope, String>> + Send + 'a>> {
+        let client = self.client().clone();
+        let signer = self.signer().clone();
+        let decision = decision.clone();
+        Box::pin(async move {
+            let resolver = crate::copytrading::prepare::SdkNegRiskResolver { client: &client };
+            let preparer = crate::copytrading::prepare::EnvelopePreparer {
+                client: &client,
+                signer: &signer,
+                neg_risk_resolver: &resolver,
+            };
+            preparer
+                .prepare_post_only_gtd_buy(&decision, expires_at)
+                .await
+                .map(|prepared| prepared.envelope)
+                .map_err(|error| error.to_string())
+        })
     }
 }
 

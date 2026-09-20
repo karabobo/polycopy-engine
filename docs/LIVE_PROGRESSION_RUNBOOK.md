@@ -118,7 +118,7 @@ Keep every leader that should remain active in the JSON every time it is
 reapplied.
 
 `POLYCOPY_PERSISTENT_MAX_ORDER_NOTIONAL` remains an independent runtime gate:
-it must be positive and no greater than 5 USDC. A runnable intent whose
+it must be positive and no greater than 10 USDC. A runnable intent whose
 persisted leader-policy snapshot is above this cap fails closed. The example
 retains 1 USDC; raising it to 5 is an explicit configuration change, not an
 automatic service activation.

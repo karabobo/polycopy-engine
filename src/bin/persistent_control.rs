@@ -14,7 +14,8 @@ async fn main() {
         inspect_uncertain_attempt_for_operator, open_and_migrate, pause_persistent_fuse,
         open_reconciliation_case, persistent_fuse_status, reconfigure_persistent_config, release_definitive_rejection,
         resolve_exhausted_fak_no_match, resolve_no_virtual_lot_sell_case, resolve_operator_confirmed_no_fill,
-        resolve_pre_submit_balance_case, resume_persistent_fuse, OperatorUncertainLookup,
+        resolve_pre_submit_balance_case, restore_reservation_and_finalize_recovered_fill,
+        resume_persistent_fuse, OperatorUncertainLookup,
         PersistentRuntimeConfig,
     };
     use polycopy_engine::{
@@ -30,7 +31,7 @@ async fn main() {
         })?;
         let command = std::env::args().nth(1).ok_or_else(|| {
             polycopy_engine::copytrading::PersistentError::Config(
-                "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|resolve-exhausted-fak-no-match <intent-id>|resolve-no-virtual-lot-sell <intent-id>|reconcile-uncertain <attempt-id> [--confirm-no-fill <reason>]|reconcile-preflight"
+                "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|resolve-exhausted-fak-no-match <intent-id>|resolve-no-virtual-lot-sell <intent-id>|reconcile-uncertain <attempt-id> [--confirm-no-fill <reason>]|reconcile-fill <attempt-id>|reconcile-preflight"
                     .to_owned(),
             )
         })?;
@@ -264,11 +265,87 @@ async fn main() {
                             );
                         }
                     }
-                    (OperatorUncertainLookup::Recovered { order_id }, _) => {
+                    (
+                        OperatorUncertainLookup::Recovered {
+                            order_id,
+                            filled_qty,
+                            ..
+                        },
+                        _,
+                    ) => {
                         return Err(polycopy_engine::copytrading::PersistentError::Config(format!(
-                            "strict history recovered venue order id {}; refusing no-fill resolution; reconcile its receipt instead",
+                            "strict history recovered venue order id {} filled_qty={filled_qty}; refusing no-fill resolution; run persistent_control reconcile-fill {attempt_id}",
                             order_id.0
                         )));
+                    }
+                }
+            }
+            "reconcile-fill" => {
+                let _lock = EngineLock::acquire_for_database(&db_path).map_err(|error| {
+                    polycopy_engine::copytrading::PersistentError::Config(format!(
+                        "cannot reconcile a recovered fill while an engine owns the database: {error}"
+                    ))
+                })?;
+                let account_id = account_id_from_env()?;
+                let attempt_id = std::env::args()
+                    .nth(2)
+                    .ok_or_else(|| {
+                        polycopy_engine::copytrading::PersistentError::Config(
+                            "reconcile-fill requires an attempt id".to_owned(),
+                        )
+                    })?
+                    .parse()
+                    .map_err(|_| {
+                        polycopy_engine::copytrading::PersistentError::Config(
+                            "invalid attempt id".to_owned(),
+                        )
+                    })?;
+                let adapter = IntlClobCopyAdapter::from_env().await.map_err(|error| {
+                    polycopy_engine::copytrading::PersistentError::Config(format!(
+                        "strict trade-history lookup could not authenticate: {error}"
+                    ))
+                })?;
+                let lookup = inspect_uncertain_attempt_for_operator(
+                    &pool,
+                    adapter.read_adapter(),
+                    account_id,
+                    attempt_id,
+                    chrono::Utc::now(),
+                )
+                .await
+                .map_err(|error| {
+                    polycopy_engine::copytrading::PersistentError::Config(format!(
+                        "uncertain attempt remains unresolved; strict lookup did not recover a fill: {error}"
+                    ))
+                })?;
+                match lookup {
+                    OperatorUncertainLookup::NotFound => {
+                        return Err(polycopy_engine::copytrading::PersistentError::Config(
+                            "strict history did not recover this envelope; do not invent a fill"
+                                .to_owned(),
+                        ));
+                    }
+                    OperatorUncertainLookup::Recovered {
+                        order_id,
+                        filled_qty,
+                        maker_notional_usdc,
+                    } => {
+                        eprintln!(
+                            "strict recovered fill: attempt_id={attempt_id} venue_order_id={} filled_qty={filled_qty} maker_notional_usdc={maker_notional_usdc}; accounting atomically",
+                            order_id.0
+                        );
+                        let case_id = restore_reservation_and_finalize_recovered_fill(
+                            &pool,
+                            account_id,
+                            attempt_id,
+                            filled_qty,
+                            maker_notional_usdc,
+                        )
+                        .await?;
+                        println!(
+                            "recovered fill accounted: account_id={account_id} attempt_id={attempt_id} venue_order_id={} filled_qty={filled_qty} maker_notional_usdc={maker_notional_usdc} case_id={case_id}; run persistent_control resume <reason> after reviewing remaining recovery state",
+                            order_id.0
+                        );
                     }
                 }
             }
@@ -312,7 +389,7 @@ async fn main() {
             }
             _ => {
                 return Err(polycopy_engine::copytrading::PersistentError::Config(
-                    "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|resolve-exhausted-fak-no-match <intent-id>|resolve-no-virtual-lot-sell <intent-id>|reconcile-uncertain <attempt-id> [--confirm-no-fill <reason>]|reconcile-preflight"
+                    "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|resolve-exhausted-fak-no-match <intent-id>|resolve-no-virtual-lot-sell <intent-id>|reconcile-uncertain <attempt-id> [--confirm-no-fill <reason>]|reconcile-fill <attempt-id>|reconcile-preflight"
                         .to_owned(),
                 ));
             }

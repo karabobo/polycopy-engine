@@ -90,6 +90,7 @@ pub use persistent::{
     release_definitive_rejection, release_pre_boundary_failure, reserve_budget_and_mark_submitting,
     resolve_no_virtual_lot_sell_case, resolve_operator_confirmed_no_fill,
     resolve_pre_submit_balance_case, resolve_exhausted_fak_no_match,
+    restore_reservation_and_finalize_recovered_fill,
     resume_fuse as resume_persistent_fuse, rolling_reserved_total,
     PersistentError, PersistentRuntimeConfig, PersistentSubmitMarker, EXIT_BUDGET_STATE,
     EXIT_CONFIG, EXIT_FUSE_OPEN, EXIT_LOCK_COLLISION, EXIT_UNRESOLVED_RECOVERY,

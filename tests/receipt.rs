@@ -34,6 +34,19 @@ fn buy_fak_can_receive_more_shares_than_its_requested_budget() {
 }
 
 #[test]
+fn fixed_share_buy_fak_accounts_a_fill_above_its_signed_size() {
+    // Polymarket BUY FAK still spends the maker USDC budget. A better
+    // price can return more outcome shares than the signed taker amount.
+    // That fill is real and must be accounted; rejecting it misclassifies
+    // a live order as a local pre-boundary failure.
+    let receipt = OrderReceipt::from_fak_buy_shares(qty(5), qty(5), Decimal::new(54, 1))
+        .expect("a better-priced fixed-share BUY must keep its venue fill");
+
+    assert_eq!(receipt.requested_qty(), qty(5));
+    assert_eq!(receipt.filled_qty(), Decimal::new(54, 1));
+}
+
+#[test]
 fn sell_receipt_rejects_shares_larger_than_the_request() {
     let error = OrderReceipt::from_fak_sell_shares(qty(10), qty(10), qty(11))
         .expect_err("a SELL cannot fill more shares than it offered");
