@@ -7,7 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
 use super::*;
@@ -25,6 +25,57 @@ use crate::{
         OrderReceipt,
     },
 };
+
+/// Builds a `MarketResponse` fixture with sensible defaults for everything
+/// except the fields a GTD-marker test wants to vary. Kept in tests because
+/// the SDK's `MarketResponse` is `#[non_exhaustive]` and `derive_builder`-
+/// required; a real production path never constructs one of these.
+#[cfg(test)]
+fn gtd_market_fixture(
+    closed: bool,
+    accepting_orders: bool,
+    minimum_tick_size: Decimal,
+    end_date_iso: Option<DateTime<Utc>>,
+) -> polymarket_client_sdk_v2::clob::types::response::MarketResponse {
+    use polymarket_client_sdk_v2::clob::types::response::{MarketResponse, Rewards};
+    use polymarket_client_sdk_v2::types::{address, b256};
+
+    MarketResponse::builder()
+        .enable_order_book(true)
+        .active(true)
+        .closed(closed)
+        .archived(false)
+        .accepting_orders(accepting_orders)
+        .accepting_order_timestamp(
+            "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+        )
+        .minimum_order_size(Decimal::ONE)
+        .minimum_tick_size(minimum_tick_size)
+        .condition_id(b256!("0x0000000000000000000000000000000000000000000000000000000000000001"))
+        .question_id(b256!("0x0000000000000000000000000000000000000000000000000000000000000002"))
+        .question("test market".to_owned())
+        .description("test description".to_owned())
+        .market_slug("test-slug".to_owned())
+        .end_date_iso(
+            end_date_iso
+                .unwrap_or_else(|| "2099-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap()),
+        )
+        .seconds_delay(0)
+        .fpmm(address!("0x0000000000000000000000000000000000000001"))
+        .maker_base_fee(Decimal::ZERO)
+        .taker_base_fee(Decimal::ZERO)
+        .notifications_enabled(false)
+        .neg_risk(false)
+        .neg_risk_market_id(b256!("0x0000000000000000000000000000000000000000000000000000000000000003"))
+        .neg_risk_request_id(b256!("0x0000000000000000000000000000000000000000000000000000000000000004"))
+        .icon(String::new())
+        .image(String::new())
+        .rewards(Rewards::default())
+        .is_50_50_outcome(false)
+        .tokens(Vec::new())
+        .tags(Vec::new())
+        .build()
+}
 
 struct TestDb {
     pool: SqlitePool,
@@ -2605,4 +2656,144 @@ async fn a_leader_out_of_budget_is_a_skipped_signal_not_a_halt() {
     .await
     .expect("reservation count");
     assert_eq!(reserved, 0);
+}
+
+// --- GTD maker spec derivation ----------------------------------------------
+//
+// These pin the post-only GTD retry's market validation against
+// `MarketResponse`. The bug they guard against (see
+// `docs/gtd-market-end-lookup-bug.md`) is treating `end_date_iso` as this
+// market slot's real resolution time: on auto-generated recurring crypto
+// slots it is a day-level placeholder, so anchoring a maker expiry to it
+// rejects genuinely-open markets and lengthens resting exposure on
+// soon-to-resolve ones. The four cases below mirror the live venue samples
+// cited in the bug report.
+
+#[test]
+fn derive_gtd_spec_accepts_an_open_market_with_a_stale_end_date_iso() {
+    // Real-world shape from row 4 of the bug report: still tradeable on the
+    // venue (closed=false, accepting_orders=true), yet end_date_iso is the
+    // midnight-UTC placeholder that has already passed. The current code
+    // rejected this; the fixed code must accept it and bound the expiry
+    // independently of that field.
+    let now = "2026-09-21T07:07:00Z".parse::<DateTime<Utc>>().unwrap();
+    let market = gtd_market_fixture(
+        false,
+        true,
+        Decimal::new(1, 2),
+        Some("2026-09-21T00:00:00Z".parse::<DateTime<Utc>>().unwrap()),
+    );
+
+    let spec = derive_gtd_market_spec(&market, now).expect("open market must be accepted");
+
+    assert_eq!(
+        spec.expires_at,
+        now + GTD_MAKER_EXPIRY,
+        "expires_at must come from `now + GTD_MAKER_EXPIRY`, not end_date_iso",
+    );
+    assert_eq!(spec.tick_size, Decimal::new(1, 2));
+}
+
+#[test]
+fn derive_gtd_spec_rejects_a_closed_market_regardless_of_end_date_iso() {
+    let now = "2026-09-21T07:07:00Z".parse::<DateTime<Utc>>().unwrap();
+    let market = gtd_market_fixture(
+        true, // closed
+        true,
+        Decimal::new(1, 2),
+        Some("2099-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap()),
+    );
+
+    let error = derive_gtd_market_spec(&market, now)
+        .expect_err("a closed market must be refused even with a future end_date_iso");
+    assert!(
+        error.contains("closed or not accepting orders"),
+        "rejection must identify the open-state failure: {error}",
+    );
+}
+
+#[test]
+fn derive_gtd_spec_rejects_a_market_that_is_not_accepting_orders() {
+    let now = "2026-09-21T07:07:00Z".parse::<DateTime<Utc>>().unwrap();
+    let market = gtd_market_fixture(
+        false, // not closed...
+        false, // ...but venue has paused accepting orders
+        Decimal::new(1, 2),
+        Some("2099-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap()),
+    );
+
+    let error = derive_gtd_market_spec(&market, now)
+        .expect_err("a market with accepting_orders=false must be refused");
+    assert!(
+        error.contains("closed or not accepting orders"),
+        "rejection must identify the open-state failure: {error}",
+    );
+}
+
+#[test]
+fn derive_gtd_spec_never_sources_expires_at_from_end_date_iso() {
+    // Public contract: regardless of what the wire sends for `end_date_iso`,
+    // a successfully-derived spec must have its `expires_at` pinned to
+    // `now + GTD_MAKER_EXPIRY`. Any caller passing a None-equivalent or a
+    // far-past value still observes a bounded, near-future expiry. This is
+    // the behavioural promise that decouples GTD correctness from the API
+    // field the bug report identifies as unreliable for recurring crypto
+    // slots.
+    let now = "2026-09-21T07:07:00Z".parse::<DateTime<Utc>>().unwrap();
+    let cases = [
+        // Already-passed placeholder, like the row-4 market in the bug
+        // report (closed=false but end_date_iso = midnight UTC that has
+        // already gone by).
+        Some("2026-09-21T00:00:00Z".parse::<DateTime<Utc>>().unwrap()),
+        // Far-future placeholder; would otherwise pin a maker order open
+        // for the entire slot lifetime.
+        Some("2099-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap()),
+    ];
+
+    for end_date_iso in cases {
+        let market =
+            gtd_market_fixture(false, true, Decimal::new(1, 2), end_date_iso);
+        let spec = derive_gtd_market_spec(&market, now).expect("open market must be accepted");
+        assert_eq!(
+            spec.expires_at,
+            now + GTD_MAKER_EXPIRY,
+            "expires_at must come from `now + GTD_MAKER_EXPIRY`, not end_date_iso={end_date_iso:?}",
+        );
+    }
+}
+
+#[test]
+fn derive_gtd_spec_still_rejects_a_market_with_a_non_positive_tick_size() {
+    // Preserved invariant: a malformed `minimum_tick_size` is still a
+    // refusal, independent of the open-state check.
+    let now = "2026-09-21T07:07:00Z".parse::<DateTime<Utc>>().unwrap();
+    let market = gtd_market_fixture(
+        false,
+        true,
+        Decimal::ZERO,
+        Some("2099-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap()),
+    );
+
+    let error = derive_gtd_market_spec(&market, now)
+        .expect_err("a zero tick_size must be refused");
+    assert!(
+        error.contains("invalid minimum_tick_size"),
+        "rejection must identify the tick-size failure: {error}",
+    );
+}
+
+#[test]
+fn gtd_maker_expiry_constant_is_a_short_relative_window() {
+    // Pin the constant: anchoring GTD maker expiry to anything other than a
+    // short relative window regresses the bug we just fixed (see
+    // `docs/gtd-market-end-lookup-bug.md` for why a short window is the
+    // right call regardless of which API field supplies the timestamp).
+    assert!(
+        GTD_MAKER_EXPIRY <= chrono::Duration::minutes(5),
+        "GTD maker resting lifetime must be short; a longer value is a regression",
+    );
+    assert!(
+        GTD_MAKER_EXPIRY >= chrono::Duration::seconds(1),
+        "GTD maker resting lifetime must be at least one second",
+    );
 }

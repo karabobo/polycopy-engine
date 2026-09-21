@@ -47,6 +47,40 @@ pub struct GtdMarketSpec {
     pub tick_size: Decimal,
 }
 
+/// Bounded resting lifetime for the post-only GTD maker retry. Deliberately
+/// short and unrelated to `MarketResponse.end_date_iso`: that field is a
+/// day-level placeholder for auto-generated recurring crypto slots, not the
+/// real per-window resolution instant, so anchoring a maker order's expiry
+/// to it leaves resting orders open far longer than intended (and, in some
+/// genuinely-still-open markets, rejects the order outright). A short
+/// relative window keeps resting exposure tight; a market that is already
+/// closed will still refuse the submission venue-side.
+pub const GTD_MAKER_EXPIRY: chrono::Duration = chrono::Duration::seconds(30);
+
+/// Validates a freshly-fetched `MarketResponse` and derives the bounded GTD
+/// maker spec used by the post-only retry. Pure: takes `now` explicitly so
+/// callers (and tests) can pin the expected `expires_at`. The "is this
+/// market still open?" question is answered by `closed`/`accepting_orders`,
+/// not by `end_date_iso`, because the latter is not a reliable per-window
+/// timestamp on Polymarket's recurring crypto slots.
+pub fn derive_gtd_market_spec(
+    market: &polymarket_client_sdk_v2::clob::types::response::MarketResponse,
+    now: DateTime<Utc>,
+) -> Result<GtdMarketSpec, String> {
+    if market.closed || !market.accepting_orders {
+        return Err(
+            "market is closed or not accepting orders; refusing GTD maker order".to_owned(),
+        );
+    }
+    if market.minimum_tick_size <= Decimal::ZERO {
+        return Err("market end lookup returned invalid minimum_tick_size".to_owned());
+    }
+    Ok(GtdMarketSpec {
+        expires_at: now + GTD_MAKER_EXPIRY,
+        tick_size: market.minimum_tick_size,
+    })
+}
+
 /// Returns the best valid displayed ask from a fresh book. `target_shares` is
 /// retained as a mandatory positive guard for the fixed-share retry contract;
 /// it must not influence the price ceiling, otherwise a thin book turns a
@@ -101,8 +135,10 @@ pub trait EnvelopeFactory {
         Box::pin(async { Err("no-FAK fresh-book sweep retry is unavailable".to_owned()) })
     }
 
-    /// Fetches the venue's authoritative market end. The default is
-    /// fail-closed: a maker order without a proven expiry is forbidden.
+    /// Validates that the fetched market is still open and returns the
+    /// bounded GTD maker spec used by the post-only retry. The default is
+    /// fail-closed so alternate factories cannot accidentally relax the
+    /// "no maker order without a proven spec" invariant.
     fn market_spec_for_gtd<'a>(
         &'a self,
         _condition_id: &'a str,
@@ -1230,19 +1266,7 @@ impl EnvelopeFactory for crate::venue::intl_clob_exec::IntlClobCopyAdapter {
                 .market(&condition_id)
                 .await
                 .map_err(|error| format!("market end lookup failed: {error}"))?;
-            let end = market.end_date_iso.ok_or_else(|| {
-                "market end lookup returned no end_date_iso; refusing GTD maker order".to_owned()
-            })?;
-            if end <= Utc::now() {
-                return Err("market end is not in the future; refusing GTD maker order".to_owned());
-            }
-            if market.minimum_tick_size <= Decimal::ZERO {
-                return Err("market end lookup returned invalid minimum_tick_size".to_owned());
-            }
-            Ok(GtdMarketSpec {
-                expires_at: end,
-                tick_size: market.minimum_tick_size,
-            })
+            derive_gtd_market_spec(&market, Utc::now())
         })
     }
 
