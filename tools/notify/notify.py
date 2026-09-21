@@ -2,8 +2,8 @@
 """Push leader trades and copy outcomes to Feishu, as they happen.
 
 Runs beside the engine, never inside it. The engine's job is to copy trades;
-a webhook that hangs, a malformed card, or a Feishu outage must not be able
-to stall the executor or take the process down. This reads the engine's
+a call that hangs, a malformed card, or a Feishu outage must not be able to
+stall the executor or take the process down. This reads the engine's
 SQLite database read-only, keeps its own cursor in its own directory, and
 writes nothing the engine will ever read. Killing it costs notifications and
 nothing else.
@@ -35,44 +35,13 @@ from typing import Any
 
 DB_PATH = os.environ.get("POLYCOPY_DB_PATH", "/var/lib/polycopy-engine/polycopy.sqlite")
 STATE_DIR = os.environ.get("NOTIFY_STATE_DIR", "/var/lib/polycopy-engine-notify")
-def _credentials() -> dict[str, str]:
-    """Read app credentials, preferring systemd's credential store.
-
-    A value in the environment is readable from /proc for the life of the
-    process; LoadCredential keeps it in a file only this unit can open. The
-    app secret is a signing credential for the whole app, so it gets the same
-    handling as the engine's own key, not less.
-    """
-
-    values: dict[str, str] = {}
-    wanted = ("FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_CHAT_ID")
-
-    directory = os.environ.get("CREDENTIALS_DIRECTORY", "")
-    if directory:
-        try:
-            with open(os.path.join(directory, "feishu"), encoding="utf-8") as handle:
-                for line in handle:
-                    line = line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    key, value = line.split("=", 1)
-                    key = key.strip()
-                    if key in wanted:
-                        values[key] = value.strip().strip("\"'")
-        except OSError:
-            pass
-
-    for key in wanted:
-        from_env = os.environ.get(key, "").strip()
-        if from_env and key not in values:
-            values[key] = from_env
-    return values
 POLL_SECONDS = float(os.environ.get("NOTIFY_POLL_SECONDS", "2"))
 ENGINE_UNIT = os.environ.get("NOTIFY_ENGINE_UNIT", "polycopy-engine-persistent")
 
-#: Feishu's custom-bot quota is well above anything this can generate, but a
-#: bug that notifies in a loop would burn it and get the bot throttled for
-#: everything else. The bucket is the backstop for that, not for normal use.
+#: Feishu's per-app quota is well above anything this can generate, but a bug
+#: that notifies in a loop would burn it and get the app throttled for
+#: everything else it does. The bucket is the backstop for that, not for
+#: normal traffic.
 MAX_PER_MINUTE = int(os.environ.get("NOTIFY_MAX_PER_MINUTE", "20"))
 
 STATE_PATH = os.path.join(STATE_DIR, "cursor.json")
@@ -81,7 +50,7 @@ POLYMARKET_EVENT_URL = "https://polymarket.com/event/"
 
 
 def log(message: str) -> None:
-    """One line per notable action, to the journal. Never the webhook URL."""
+    """One line per notable action, to the journal. Never a credential."""
 
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {message}", flush=True)
 
@@ -235,6 +204,40 @@ def intent_rows(db: sqlite3.Connection, after_id: int, watching: list[int]) -> l
 
 
 # --- Feishu --------------------------------------------------------------
+
+
+def _credentials() -> dict[str, str]:
+    """Read app credentials, preferring systemd's credential store.
+
+    A value in the environment is readable from /proc for the life of the
+    process; LoadCredential keeps it in a file only this unit can open. The
+    app secret is a signing credential for the whole app, so it gets the same
+    handling as the engine's own key, not less.
+    """
+
+    values: dict[str, str] = {}
+    wanted = ("FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_CHAT_ID")
+
+    directory = os.environ.get("CREDENTIALS_DIRECTORY", "")
+    if directory:
+        try:
+            with open(os.path.join(directory, "feishu"), encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    if key in wanted:
+                        values[key] = value.strip().strip("\"'")
+        except OSError:
+            pass
+
+    for key in wanted:
+        from_env = os.environ.get(key, "").strip()
+        if from_env and key not in values:
+            values[key] = from_env
+    return values
 
 
 TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
