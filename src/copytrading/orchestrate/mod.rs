@@ -48,14 +48,20 @@ pub struct GtdMarketSpec {
 }
 
 /// Bounded resting lifetime for the post-only GTD maker retry. Deliberately
-/// short and unrelated to `MarketResponse.end_date_iso`: that field is a
-/// day-level placeholder for auto-generated recurring crypto slots, not the
-/// real per-window resolution instant, so anchoring a maker order's expiry
-/// to it leaves resting orders open far longer than intended (and, in some
-/// genuinely-still-open markets, rejects the order outright). A short
-/// relative window keeps resting exposure tight; a market that is already
-/// closed will still refuse the submission venue-side.
-pub const GTD_MAKER_EXPIRY: chrono::Duration = chrono::Duration::seconds(30);
+/// unrelated to `MarketResponse.end_date_iso`: that field is a day-level
+/// placeholder for auto-generated recurring crypto slots, not the real
+/// per-window resolution instant, so anchoring a maker order's expiry to it
+/// leaves resting orders open far longer than intended (and, in some
+/// genuinely-still-open markets, rejects the order outright). The value is
+/// pinned above the venue's hard floor of 180 seconds (Polymarket rejects
+/// GTD expirations closer than that with `"expiration is less than 180
+/// seconds in the future"`), with a small margin to absorb clock skew and
+/// the time between computing `expires_at` here and the venue receiving the
+/// signed request. It remains short relative to a market's actual lifetime
+/// (these are 5/15-minute crypto slots), so the original design goal --
+/// bounded resting exposure, decoupled from the unreliable `end_date_iso`
+/// field -- is unaffected.
+pub const GTD_MAKER_EXPIRY: chrono::Duration = chrono::Duration::seconds(200);
 
 /// Validates a freshly-fetched `MarketResponse` and derives the bounded GTD
 /// maker spec used by the post-only retry. Pure: takes `now` explicitly so

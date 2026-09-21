@@ -2783,17 +2783,26 @@ fn derive_gtd_spec_still_rejects_a_market_with_a_non_positive_tick_size() {
 }
 
 #[test]
-fn gtd_maker_expiry_constant_is_a_short_relative_window() {
-    // Pin the constant: anchoring GTD maker expiry to anything other than a
-    // short relative window regresses the bug we just fixed (see
-    // `docs/gtd-market-end-lookup-bug.md` for why a short window is the
-    // right call regardless of which API field supplies the timestamp).
+fn gtd_maker_expiry_constant_is_above_the_venue_floor_and_short_relative_to_slot_life() {
+    // The venue rejects GTD expirations closer than 180 seconds in the
+    // future with "expiration is less than 180 seconds in the future"
+    // (post-deploy incident on intent 536, 2026-09-21 -- see
+    // `docs/gtd-maker-expiry-too-short.md`). Pin that floor plus a small
+    // safety margin so this specific regression can't recur silently.
+    // Also pin the upper bound so the constant stays short relative to a
+    // market's actual lifetime (5/15-minute crypto slots), which is the
+    // original design goal of decoupling `expires_at` from
+    // `MarketResponse.end_date_iso`.
     assert!(
-        GTD_MAKER_EXPIRY <= chrono::Duration::minutes(5),
-        "GTD maker resting lifetime must be short; a longer value is a regression",
+        GTD_MAKER_EXPIRY >= chrono::Duration::seconds(180),
+        "GTD maker resting lifetime must meet the venue's 180s minimum; \
+         a shorter value is rejected pre-book with \"expiration is less \
+         than 180 seconds in the future\"",
     );
     assert!(
-        GTD_MAKER_EXPIRY >= chrono::Duration::seconds(1),
-        "GTD maker resting lifetime must be at least one second",
+        GTD_MAKER_EXPIRY <= chrono::Duration::minutes(5),
+        "GTD maker resting lifetime must stay short relative to a slot's \
+         lifetime; a longer value regresses the bounded-exposure design \
+         that the original bug fix introduced",
     );
 }
