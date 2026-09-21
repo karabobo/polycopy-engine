@@ -627,8 +627,12 @@ where
     }
 
     let no_match_count = no_fak_rejection_count(pool, claimed.intent_id).await?;
-    if no_match_count == 2 {
-        return submit_post_only_gtd_after_second_no_fak(
+    // A definitive zero-fill on the initial FAK is the only trigger for the
+    // maker fallback.  Do not fetch a new book or submit a second taker
+    // order: that best-ask retry is intentionally disabled because it can
+    // introduce materially worse slippage than the leader's own execution.
+    if no_match_count == 1 {
+        return submit_post_only_gtd_after_initial_no_fak(
             pool,
             balance_reader,
             execution,
@@ -643,119 +647,20 @@ where
         reject_pre_submit_intent(
             pool,
             claimed.intent_id,
-            "fresh-book sweep retry also found no matching FAK liquidity",
+            "unexpected repeated no-FAK rejection after maker fallback selection",
         )
         .await?;
         return Ok(OrchestrateOutcome::Rejected);
     }
-
-    // The caller may hold the pre-sizing claim (the initial submission
-    // path). Reload it so the book sweep is sized from the immutable quantity
-    // that was durably chosen before the first FAK crossed the boundary.
-    let Some(retry_claimed) = claim_or_resume_intent(pool, claimed.intent_id).await? else {
-        return Ok(OrchestrateOutcome::NotClaimed);
-    };
-    let Some((target_shares, _, _)) = retry_claimed.existing_decision else {
-        open_execute_case(pool, claimed, "no-FAK retry is missing its persisted fixed-share decision").await?;
-        return Ok(OrchestrateOutcome::NeedsReconcile(
-            "no-FAK retry is missing its persisted fixed-share decision",
-        ));
-    };
-    let sweep = match envelopes
-        .sweep_quote_for_no_fak_retry(&claimed.token_id, target_shares)
-        .await
-    {
-        Ok(quote) => quote,
-        Err(detail) => {
-            reject_pre_submit_intent(
-                pool,
-                claimed.intent_id,
-                &format!("no-FAK fresh-book sweep lookup failed: {detail}"),
-            )
-            .await?;
-            return Ok(OrchestrateOutcome::Rejected);
-        }
-    };
-    let decision = match reprice_fixed_share_buy_after_no_fak(
-        pool,
-        balance_reader,
-        &retry_claimed,
-        sweep.limit_price,
-    )
-    .await?
-    {
-        SizingOutcome::Decision(decision) => decision,
-        SizingOutcome::NeedsReconcile(reason) => {
-            open_execute_case(pool, claimed, reason).await?;
-            return Ok(OrchestrateOutcome::NeedsReconcile(reason));
-        }
-        SizingOutcome::Expired => {
-            cancel_expired_intent(pool, claimed.intent_id).await?;
-            return Ok(OrchestrateOutcome::Expired);
-        }
-        SizingOutcome::Rejected(reason) => {
-            reject_pre_submit_intent(pool, claimed.intent_id, reason).await?;
-            return Ok(OrchestrateOutcome::Rejected);
-        }
-    };
-    let envelope = match envelopes.prepare(&decision).await {
-        Ok(envelope) => envelope,
-        Err(detail) => {
-            reject_pre_submit_intent(
-                pool,
-                claimed.intent_id,
-                &format!("no-FAK retry envelope preparation failed: {detail}"),
-            )
-            .await?;
-            return Ok(OrchestrateOutcome::Rejected);
-        }
-    };
-    let attempt_number = next_attempt_number(pool, claimed.intent_id).await?;
-    load_or_prepare_attempt(pool, claimed.intent_id, attempt_number, &envelope).await?;
-    let retry_attempt = load_latest_attempt(pool, claimed.intent_id).await?.ok_or_else(|| {
-        OrchestrateError::Execute(ExecuteError::Database(
-            "missing attempt after no-FAK retry preparation".into(),
-        ))
-    })?;
-    persist_expected_venue_order_id(
-        pool,
-        claimed.intent_id,
-        retry_attempt.id,
-        &retry_attempt.envelope,
-    )
-    .await?;
-    let retry_outcome = submit_prepared(
-        pool,
-        execution,
-        marker,
-        claimed.intent_id,
-        retry_attempt.clone(),
-        now,
-    )
-    .await?;
-    if retry_outcome == OrchestrateOutcome::Rejected
-        && is_explicit_no_fak_rejection(pool, retry_attempt.id).await?
-    {
-        return submit_post_only_gtd_after_second_no_fak(
-            pool,
-            balance_reader,
-            execution,
-            envelopes,
-            marker,
-            claimed,
-            now,
-        )
-        .await;
-    }
-    Ok(retry_outcome)
+    Ok(OrchestrateOutcome::Rejected)
 }
 
-/// The third and final path after two definitive FAK no-matches: do not chase
+/// The final path after one definitive initial FAK no-match: do not chase
 /// another ask. Reuse the immutable fixed quantity, reset the reservation to
 /// the leader's own price, and submit one post-only GTD order that expires at
 /// the venue-provided market end.
 #[allow(clippy::too_many_arguments)]
-async fn submit_post_only_gtd_after_second_no_fak<B, E, F, M>(
+async fn submit_post_only_gtd_after_initial_no_fak<B, E, F, M>(
     pool: &SqlitePool,
     balance_reader: &B,
     execution: &E,

@@ -2376,7 +2376,7 @@ async fn a_definitive_rejection_prepares_one_fresh_retry_without_phantom_lot() {
 }
 
 #[tokio::test]
-async fn an_explicit_fak_no_match_gets_one_fresh_best_ask_retry_then_terminates() {
+async fn an_explicit_initial_fak_no_match_goes_directly_to_leader_price_gtd() {
     let db = TestDb::new().await;
     seed_account_and_schedule(&db).await;
     seed_leader(&db, 1).await;
@@ -2384,9 +2384,6 @@ async fn an_explicit_fak_no_match_gets_one_fresh_best_ask_retry_then_terminates(
     set_fixed_share_policy(&db, intent_id).await;
     let venue = FakeVenue::succeeding(Decimal::new(5, 0));
     *venue.submit_results.lock().unwrap() = VecDeque::from([
-        Err(SubmitError::Rejected(
-            "400 no orders found to match with FAK order".to_owned(),
-        )),
         Err(SubmitError::Rejected(
             "400 no orders found to match with FAK order".to_owned(),
         )),
@@ -2422,7 +2419,7 @@ async fn an_explicit_fak_no_match_gets_one_fresh_best_ask_retry_then_terminates(
     .unwrap();
     assert_eq!(intent.0, "in_progress");
     assert!(intent.1.is_empty(), "{}", intent.1);
-    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 3);
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 2);
     let gtd_json: String = sqlx::query_scalar(
         "SELECT envelope_json FROM order_attempts WHERE intent_id = ? ORDER BY attempt_number DESC LIMIT 1",
     )
@@ -2449,7 +2446,7 @@ async fn an_explicit_fak_no_match_gets_one_fresh_best_ask_retry_then_terminates(
         .unwrap(),
         OrchestrateOutcome::Resting
     );
-    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 3, "must not resubmit a resting GTD");
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 2, "must not resubmit a resting GTD");
     venue.set_order_status("MATCHED");
     venue.with_size_matched(Decimal::new(3, 0));
     assert_eq!(
@@ -2484,7 +2481,7 @@ async fn an_explicit_fak_no_match_gets_one_fresh_best_ask_retry_then_terminates(
 }
 
 #[tokio::test]
-async fn an_explicit_fak_no_match_retries_once_with_a_fresh_book_sweep_and_fixed_shares() {
+async fn an_explicit_fak_no_match_does_not_submit_a_best_ask_retry() {
     let db = TestDb::new().await;
     seed_account_and_schedule(&db).await;
     seed_leader(&db, 1).await;
@@ -2504,13 +2501,7 @@ async fn an_explicit_fak_no_match_retries_once_with_a_fresh_book_sweep_and_fixed
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        OrchestrateOutcome::Filled {
-            filled_qty: Decimal::new(5, 0)
-        },
-        "{outcome:?}"
-    );
+    assert_eq!(outcome, OrchestrateOutcome::Resting, "{outcome:?}");
     assert_eq!(venue.submit_count.load(Ordering::SeqCst), 2);
     let attempts: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT status, requested_qty, envelope_json FROM order_attempts \
@@ -2522,9 +2513,11 @@ async fn an_explicit_fak_no_match_retries_once_with_a_fresh_book_sweep_and_fixed
     .unwrap();
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].0, "rejected");
-    assert_eq!(attempts[1].0, "finalized");
+    assert_eq!(attempts[1].0, "accepted");
     let retry: PreparedOrderEnvelope = serde_json::from_str(&attempts[1].2).unwrap();
-    assert_eq!(retry.price, "0.60");
+    assert_eq!(retry.order_type, "GTD");
+    assert!(retry.post_only);
+    assert_eq!(retry.price, "0.55", "must use the leader price, not fresh best ask");
     assert_eq!(retry.size, "5");
     assert!(retry.buy_shares_exact);
 }
