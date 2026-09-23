@@ -915,6 +915,116 @@ pub async fn resolve_exhausted_fak_no_match(
 /// `unknown_submission` case and records a distinct reservation state.  The
 /// caller is responsible for the venue query; keeping this module
 /// database-only makes it impossible for this function to submit an order.
+/// Closes the recovery state produced when an intent exhausted its retry budget
+/// solely through explicit post-only crossing rejections from the venue. This is
+/// the maker-only analogue of `resolve_exhausted_fak_no_match`; the WHERE clause
+/// checks for `order crosses book` instead of `FAK no-match`. The invariant is
+/// identical: every attempt must be a confirmed crossing rejection -- an
+/// uncertain/non-rejected row or a still-reserved budget slot means the intent
+/// cannot be safely resolved without replaying the order.
+pub async fn resolve_exhausted_maker_only_crossing(
+    pool: &SqlitePool,
+    account_id: i64,
+    intent_id: i64,
+) -> Result<i64, PersistentError> {
+    let mut conn = pool.acquire().await.map_err(db_err)?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+    let result: Result<i64, PersistentError> = async {
+        let rows: Vec<i64> = sqlx::query_scalar(
+            "SELECT rc.id FROM reconciliation_cases rc \
+             JOIN copy_intents ci ON ci.id = rc.intent_id \
+             WHERE rc.account_id = ? AND rc.intent_id = ? \
+               AND ci.status = 'needs_reconcile' AND rc.resolved_at IS NULL \
+               AND rc.case_type = 'blocked_recovery' \
+               AND rc.detail = 'retry budget exhausted'",
+        )
+        .bind(account_id)
+        .bind(intent_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        let [case_id] = rows.as_slice() else {
+            return Err(PersistentError::UnresolvedRecovery);
+        };
+
+        let (total, verified): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), \
+                    SUM(CASE WHEN status = 'rejected' \
+                              AND submission_started_at IS NOT NULL \
+                              AND failure_detail LIKE '%order crosses book%' \
+                             THEN 1 ELSE 0 END) \
+             FROM order_attempts WHERE intent_id = ?",
+        )
+        .bind(intent_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        if total < crate::copytrading::reconcile::MAX_ATTEMPTS_PER_WINDOW || total != verified {
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+
+        let reserved: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM persistent_budget_reservations p \
+             JOIN order_attempts oa ON oa.id = p.order_attempt_id \
+             WHERE oa.intent_id = ? AND p.account_id = ? AND p.state = 'reserved'",
+        )
+        .bind(intent_id)
+        .bind(account_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        if reserved != 0 {
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let reason = "all retry-budget attempts received explicit post-only crossing rejections; signal will not be replayed";
+        let intent = sqlx::query(
+            "UPDATE copy_intents SET status = 'rejected', rejection_reason = ?, reserved_qty = '0', \
+             updated_at = ? WHERE id = ? AND account_id = ? AND status = 'needs_reconcile'",
+        )
+        .bind(reason)
+        .bind(&now)
+        .bind(intent_id)
+        .bind(account_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        if intent.rows_affected() != 1 {
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+        let case = sqlx::query(
+            "UPDATE reconciliation_cases SET resolved_at = ?, resolution = ? \
+             WHERE id = ? AND resolved_at IS NULL",
+        )
+        .bind(&now)
+        .bind(reason)
+        .bind(case_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        if case.rows_affected() != 1 {
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+        Ok(*case_id)
+    }
+    .await;
+
+    match result {
+        Ok(case_id) => {
+            sqlx::query("COMMIT").execute(&mut *conn).await.map_err(db_err)?;
+            Ok(case_id)
+        }
+        Err(error) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            Err(error)
+        }
+    }
+}
 pub async fn resolve_operator_confirmed_no_fill(
     pool: &SqlitePool,
     account_id: i64,
