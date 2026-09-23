@@ -2543,6 +2543,231 @@ async fn an_attempt_in_an_unrecognized_status_opens_a_blocked_recovery_case() {
 }
 
 #[tokio::test]
+async fn a_gtd_poll_lookup_failure_promotes_the_attempt_to_uncertain_instead_of_crashing() {
+    // Regression test for the live incident captured in
+    // `docs/poll-resting-gtd-404-permanently-blocks-startup.md`:
+    // `poll_resting_gtd` used to bubble any error from
+    // `execution.order_for_receipt` up as `OrchestrateError::Receipt`,
+    // which `copy_persistent` treated as fuse-worthy. The runner
+    // would open the runtime fuse, exit with status 21, and -- because
+    // the attempt row never moved past `accepted` -- every subsequent
+    // `persistent_control resume` + startup would hit the same 1.5s
+    // 404 against the same accepted-GTD attempt and crash again.
+    // That's the "permanently blocks startup" shape the report names.
+    //
+    // The fix must do three observable things on a lookup failure
+    // inside `poll_resting_gtd`:
+    //
+    //   1. Return `OrchestrateOutcome::Uncertain`, NOT an `Err` --
+    //      so the runner doesn't latch a fresh fuse every tick and
+    //      the orchestrator's control flow stays inside the
+    //      controlled-outcome set.
+    //   2. Promote the attempt from `accepted` to `uncertain`, with
+    //      `failure_detail` carrying the underlying lookup error --
+    //      so on every later startup `walk_existing_attempt` routes
+    //      through `permitted_recovery_action('uncertain', ...)` and
+    //      never reaches `poll_resting_gtd` for this attempt again.
+    //      That is the actual unblock: the second startup is no
+    //      longer the same crash.
+    //   3. Open a `strict_query_failure` reconciliation case with the
+    //      same detail string, so the operator dashboard surfaces the
+    //      case alongside the FAK-side failure cases the existing
+    //      branches already produce.
+    //
+    // Two-pass setup: first pass submits the maker-only GTD order so
+    // the attempt is `accepted` with `submission_started_at` set (the
+    // preconditions for `poll_resting_gtd`'s GTD arm and for the
+    // `'uncertain'` strict-lookup window the recovery matrix requires
+    // later); second pass swaps the venue to a strict-lookup-failure
+    // variant so `poll_resting_gtd` runs through the failure arm.
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+    set_maker_only_policy(&db, intent_id).await;
+
+    // First pass: produce an `accepted` GTD attempt the way a real
+    // successful submit would.
+    let submit_venue = FakeVenue::succeeding(Decimal::new(5, 0));
+    let first = execute_one_intent(
+        &db,
+        &FixedBalance(Decimal::new(100, 0)),
+        &submit_venue,
+        &submit_venue,
+        &EmptyHistory,
+        intent_id,
+        Utc::now(),
+    )
+    .await
+    .expect("first-pass submit must be a controlled outcome");
+    assert_eq!(
+        first,
+        OrchestrateOutcome::Resting,
+        "the maker-only GTD submit response must persist the attempt as `accepted` and return Resting",
+    );
+    assert_eq!(submit_venue.submit_count.load(Ordering::SeqCst), 1);
+
+    // Sanity-check the preconditions: the attempt must be in the
+    // `accepted` state, must have a GTD/post-only envelope, and must
+    // have `submission_started_at` set (the recovery matrix strict-
+    // lookup window depends on it, and the helper uses COALESCE if
+    // NULL -- this fixture shouldn't be the COALESCE arm).
+    let (accepted_precondition_status, accepted_precondition_order_type, accepted_precondition_submission): (
+        String, String, Option<String>,
+    ) = sqlx::query_as(
+        "SELECT status, json_extract(envelope_json, '$.order_type'), \
+                submission_started_at \
+         FROM order_attempts WHERE intent_id = ?",
+    )
+    .bind(intent_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("attempt row after first pass");
+    assert_eq!(
+        accepted_precondition_status, "accepted",
+        "precondition: first pass must leave the attempt `accepted` so `walk_existing_attempt` routes to `poll_resting_gtd`",
+    );
+    assert_eq!(
+        accepted_precondition_order_type, "GTD",
+        "precondition: the attempt must be GTD for `poll_resting_gtd` to be the GTD arm's lookup path",
+    );
+    assert!(
+        accepted_precondition_submission.is_some(),
+        "precondition: `submission_started_at` must be set after a successful submit (the `'uncertain'` recovery matrix path requires it)",
+    );
+
+    // Second pass: a fresh venue whose `order_for_receipt` always
+    // returns Err -- modelling both a transient 5xx and the canonical
+    // 404-on-aged-out-described-order shapes (the SDK collapses them
+    // to the same `String` error, which is why `poll_resting_gtd`
+    // catches the whole error arm, not a specific status code).
+    let lookup_venue =
+        FakeVenue::order_lookup_failure("venue returned 404: order not found");
+    let second = execute_one_intent(
+        &db,
+        &FixedBalance(Decimal::new(100, 0)),
+        &lookup_venue,
+        &lookup_venue,
+        &EmptyHistory,
+        intent_id,
+        Utc::now(),
+    )
+    .await
+    .expect("a GTD lookup failure must be a controlled outcome, never a runner-fatal Err");
+    assert_eq!(
+        second,
+        OrchestrateOutcome::Uncertain,
+        "a GTD live-order lookup failure must surface as `Uncertain` (and not loop back into `Err`), so the runner never latches the runtime fuse again on the same attempt",
+    );
+    assert_eq!(
+        lookup_venue.submit_count.load(Ordering::SeqCst),
+        0,
+        "the strict-query failure path must never re-call `submit_exact_envelope`",
+    );
+
+    // Postcondition 1: the attempt must be `uncertain` now, with
+    // `failure_detail` carrying the lookup error. A future startup
+    // walking this attempt will see `status != 'accepted'` and skip
+    // `poll_resting_gtd` entirely, taking the `RecoveryAction::
+    // QueryFirst` arm against authenticated trade history instead.
+    let (post_status, post_failure_detail, post_submission): (
+        String, Option<String>, Option<String>,
+    ) = sqlx::query_as(
+        "SELECT status, failure_detail, submission_started_at \
+         FROM order_attempts WHERE intent_id = ?",
+    )
+    .bind(intent_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("attempt row after second pass");
+    assert_eq!(
+        post_status, "uncertain",
+        "the failed GTD lookup must promote the attempt from `accepted` to `uncertain`, so subsequent startups route through `RecoveryAction::QueryFirst` instead of re-hitting the same 404",
+    );
+    assert!(
+        post_failure_detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("venue returned 404: order not found"),
+        "the attempt's failure_detail must carry the underlying lookup error verbatim so the operator dashboard can show it; got: {post_failure_detail:?}",
+    );
+    assert_eq!(
+        post_submission, accepted_precondition_submission,
+        "`submission_started_at` must be preserved across the `accepted`->`uncertain` transition (the strict-lookup recovery path's window depends on it not jumping)",
+    );
+
+    // Postcondition 2: a `strict_query_failure` reconciliation case
+    // is opened with the lookup-error detail, mirroring the
+    // `query_first` strict-lookup failure branch the FAK side uses.
+    let case: (String, String, i64) = sqlx::query_as(
+        "SELECT case_type, detail, order_attempt_id \
+         FROM reconciliation_cases \
+         WHERE intent_id = ? AND case_type = 'strict_query_failure' \
+           AND resolved_at IS NULL",
+    )
+    .bind(intent_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("strict_query_failure reconciliation case must exist");
+    assert_eq!(
+        case.2, 1,
+        "the case must be linked to attempt id 1 (this fixture only has one attempt)",
+    );
+    assert!(
+        case.1.contains("venue returned 404: order not found"),
+        "case detail must surface the underlying lookup error verbatim, got: {}",
+        case.1,
+    );
+
+    // Postcondition 3: the intent is blocked in `needs_reconcile` so
+    // later intents on the same account/token cannot race while the
+    // operator reviews (mirrors what `query_first`'s strict-lookup
+    // failure branch already does).
+    let intent_status: String =
+        sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+            .bind(intent_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("intent status");
+    assert_eq!(
+        intent_status, "needs_reconcile",
+        "an unresolved strict-lookup failure must leave the intent blocked in `needs_reconcile`",
+    );
+
+    // Postcondition 4: rerunning the runner on the SAME Db must not
+    // recurse into `poll_resting_gtd` and crash again. The intent has
+    // been moved to `needs_reconcile` by `open_reconciliation_case`,
+    // so `claim_or_resume_intent` returns `None` and the orchestrator
+    // returns `NotClaimed` -- a controlled non-submitted outcome that
+    // never reaches `poll_resting_gtd`'s 404 path and never latches
+    // the runtime fuse. This is the actual unblock: the third-pass
+    // invocation is recoverable without any operator action. The
+    // alternative unblock path -- an operator `reconcile-uncertain 1`
+    // resolving the case and the next startup routing through
+    // `RecoveryAction::QueryFirst` -- is covered end-to-end by
+    // `a_strict_order_lookup_failure_opens_strict_query_failure_without_resubmit`
+    // (the FAK-side counterpart this test is the GTD-side twin of).
+    let third = execute_one_intent(
+        &db,
+        &FixedBalance(Decimal::new(100, 0)),
+        &lookup_venue,
+        &lookup_venue,
+        &EmptyHistory,
+        intent_id,
+        Utc::now(),
+    )
+    .await
+    .expect("third-pass execution must be a controlled outcome, never an unhandled Err");
+    assert_eq!(
+        third,
+        OrchestrateOutcome::NotClaimed,
+        "after the first lookup failure, later startups must observe the intent in `needs_reconcile` and skip the runner entirely \
+         (the runner exposes `NotClaimed` for that branch and does NOT latch the runtime fuse), \
+         instead of re-hitting `poll_resting_gtd`'s 404 path",
+    );
+}
+
+#[tokio::test]
 async fn a_terminal_status_with_zero_matched_size_opens_an_unknown_submission_case() {
     // P0-3 step 8 (end-to-end): the audit and every regression
     // audit since flagged the zero-matched-size Err branch in

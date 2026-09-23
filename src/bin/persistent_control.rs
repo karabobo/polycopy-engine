@@ -11,8 +11,9 @@ async fn main() {
 
     use polycopy_engine::copytrading::{
         cancel_overdue_pre_submit_intent, init_persistent_config,
-        inspect_uncertain_attempt_for_operator, open_and_migrate, pause_persistent_fuse,
-        open_reconciliation_case, persistent_fuse_status, reconfigure_persistent_config, release_definitive_rejection,
+        inspect_uncertain_attempt_for_operator, mark_attempt_gtd_lookup_failed, open_and_migrate,
+        open_reconciliation_case, pause_persistent_fuse, persistent_fuse_status,
+        reconfigure_persistent_config, release_definitive_rejection,
         resolve_exhausted_fak_no_match,
         resolve_exhausted_maker_only_crossing,
         resolve_no_virtual_lot_sell_case,
@@ -34,7 +35,7 @@ async fn main() {
         })?;
         let command = std::env::args().nth(1).ok_or_else(|| {
             polycopy_engine::copytrading::PersistentError::Config(
-                "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|resolve-exhausted-fak-no-match <intent-id>|resolve-exhausted-maker-only-crossing <intent-id>|resolve-no-virtual-lot-sell <intent-id>|reconcile-uncertain <attempt-id> [--confirm-no-fill <reason>]|reconcile-fill <attempt-id>|reconcile-preflight"
+                "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|resolve-exhausted-fak-no-match <intent-id>|resolve-exhausted-maker-only-crossing <intent-id>|resolve-no-virtual-lot-sell <intent-id>|reconcile-uncertain <attempt-id> [--confirm-no-fill <reason>]|reconcile-fill <attempt-id>|reconcile-preflight|mark-attempt-gtd-uncertain <attempt-id>"
                     .to_owned(),
             )
         })?;
@@ -411,9 +412,129 @@ async fn main() {
                     "pre-submit reconciliation resolved: case_id={case_id} usable_collateral={usable}"
                 );
             }
+            // Operator command for `docs/poll-resting-gtd-404-permanently-blocks-startup.md`
+            // Part 2: transitions one stuck `'accepted'` GTD attempt (the
+            // canonical example is intent 723's attempt 537, which
+            // `poll_resting_gtd` rejected via unhandled `Err` on every
+            // startup before the orchestrator-side fix could run) to
+            // `'uncertain'` so `walk_existing_attempt` no longer routes
+            // it through `poll_resting_gtd`. GTD maker reconciliation
+            // still needs a dedicated workflow; `reconcile-uncertain`
+            // is FAK/taker-only and must NOT be used for this attempt.
+            //
+            // Strictly narrower than the orchestrator helper:
+            //   * require `account_id` match (the existing convention
+            //     for every account-scoped command above; refusing
+            //     cross-account writes is a defense-in-depth check
+            //     against the operator working on the wrong database
+            //     row);
+            //   * require the attempt's envelope be GTD (a non-GTD
+            //     `'accepted'` attempt was already covered by the
+            //     strict-lookup machinery before this fix; if
+            //     `mark_attempt_gtd_lookup_failed` somehow fires on a
+            //     FAK, refuse);
+            //   * require `status = 'accepted'` (the only startup-
+            //     deadlocking state this command exists to resolve; on
+            //     any other status the orchestrator machinery already
+            //     owns the next step).
+            //
+            // This command only blocks replay and records the unresolved
+            // attempt. It does not prove a fill or no-fill; do not resume
+            // until GTD maker trade history is reconciled separately.
+            "mark-attempt-gtd-uncertain" => {
+                let _lock = EngineLock::acquire_for_database(&db_path).map_err(|error| {
+                    polycopy_engine::copytrading::PersistentError::Config(format!(
+                        "cannot mark an attempt uncertain while an engine owns the database: {error}"
+                    ))
+                })?;
+                let account_id = account_id_from_env()?;
+                let attempt_id = std::env::args()
+                    .nth(2)
+                    .ok_or_else(|| {
+                        polycopy_engine::copytrading::PersistentError::Config(
+                            "mark-attempt-gtd-uncertain requires an attempt id".to_owned(),
+                        )
+                    })?
+                    .parse()
+                    .map_err(|_| {
+                        polycopy_engine::copytrading::PersistentError::Config(
+                            "invalid attempt id".to_owned(),
+                        )
+                    })?;
+                // Account-bound lookup: refuse if the attempt either
+                // does not exist or belongs to a different account.
+                // The same predicate is used by `inspect_uncertain_
+                // attempt_for_operator` (the FAK-side counterpart);
+                // staying symmetrical keeps the audit on the operator
+                // command surface bounded by what the orchestrator
+                // itself enforces.
+                let lookup: Option<(i64, String, String)> = sqlx::query_as(
+                    "SELECT oa.intent_id, oa.status, \
+                            json_extract(oa.envelope_json, '$.order_type') \
+                     FROM order_attempts oa \
+                     JOIN copy_intents ci ON ci.id = oa.intent_id \
+                     WHERE oa.id = ? AND ci.account_id = ?",
+                )
+                .bind(attempt_id)
+                .bind(account_id)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|error| {
+                    polycopy_engine::copytrading::PersistentError::Database(error.to_string())
+                })?;
+                let (intent_id, attempt_status, order_type) = lookup.ok_or_else(|| {
+                    polycopy_engine::copytrading::PersistentError::Config(format!(
+                        "attempt {attempt_id} not found for account {account_id} \
+                         (wrong account or unknown attempt)"
+                    ))
+                })?;
+                if order_type != "GTD" {
+                    return Err(polycopy_engine::copytrading::PersistentError::Config(format!(
+                        "mark-attempt-gtd-uncertain only applies to GTD attempts; \
+                         attempt {attempt_id} has order_type={order_type:?} \
+                         (the orchestrator already has recovery machinery for non-GTD `'accepted'` attempts)"
+                    )));
+                }
+                if attempt_status != "accepted" {
+                    return Err(polycopy_engine::copytrading::PersistentError::Config(format!(
+                        "mark-attempt-gtd-uncertain only applies to `'accepted'` GTD attempts; \
+                         attempt {attempt_id} has status={attempt_status:?} \
+                         (re-routing through the recovery matrix is the orchestrator's job, not this command's)"
+                    )));
+                }
+                let detail = "operator manually marked GTD attempt uncertain after \
+                     poll_resting_gtd's live-order lookup went cold \
+                     (see docs/poll-resting-gtd-404-permanently-blocks-startup.md)"
+                    .to_owned();
+                let transitioned =
+                    mark_attempt_gtd_lookup_failed(&pool, intent_id, attempt_id, &detail)
+                        .await
+                        .map_err(|error| {
+                            polycopy_engine::copytrading::PersistentError::Database(
+                                error.to_string(),
+                            )
+                        })?;
+                if !transitioned {
+                    return Err(polycopy_engine::copytrading::PersistentError::Config(
+                        "mark-attempt-gtd-uncertain: attempt row was no longer in \
+                         `'accepted'` state when the update ran; another runner tick \
+                         or operator command already moved it. Re-run reconcile-uncertain \
+                         to inspect the current status."
+                            .to_owned(),
+                    ));
+                }
+                println!(
+                    "GTD attempt marked uncertain: account_id={account_id} \
+                     attempt_id={attempt_id} intent_id={intent_id}; \
+                     strict_query_failure case opened atomically. \
+                     GTD maker fills require separate reconciliation; \
+                     do not run the FAK-only reconcile-uncertain command \
+                     or resume the service yet."
+                );
+            }
             _ => {
                 return Err(polycopy_engine::copytrading::PersistentError::Config(
-                    "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|resolve-exhausted-fak-no-match <intent-id>|resolve-exhausted-maker-only-crossing <intent-id>|resolve-no-virtual-lot-sell <intent-id>|reconcile-uncertain <attempt-id> [--confirm-no-fill <reason>]|reconcile-fill <attempt-id>|reconcile-preflight"
+                    "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|resolve-exhausted-fak-no-match <intent-id>|resolve-exhausted-maker-only-crossing <intent-id>|resolve-no-virtual-lot-sell <intent-id>|reconcile-uncertain <attempt-id> [--confirm-no-fill <reason>]|reconcile-fill <attempt-id>|reconcile-preflight|mark-attempt-gtd-uncertain <attempt-id>"
                         .to_owned(),
                 ));
             }

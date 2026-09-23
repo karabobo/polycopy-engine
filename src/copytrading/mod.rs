@@ -67,7 +67,8 @@ pub use execute::{
 #[cfg(feature = "execute")]
 pub use reconcile::{
     attempts_in_window, inspect_uncertain_attempt_for_operator, load_or_prepare_attempt,
-    mark_attempt_rejected, mark_attempt_submitting, mark_attempt_uncertain_after_submission_error,
+    mark_attempt_gtd_lookup_failed, mark_attempt_rejected, mark_attempt_submitting,
+    mark_attempt_uncertain_after_submission_error,
     open_reconciliation_case, permitted_recovery_action, recover_fak_taker_order_from_trades,
     recover_lost_submission_response, CopyExecution, LostSubmissionRecoveryOutcome,
     OperatorUncertainLookup, OrderId, PreparedOrderEnvelope, ReconcileError, RecoveryAction,

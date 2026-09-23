@@ -18,11 +18,12 @@ use crate::{
         },
         persistent::release_pre_boundary_failure,
         reconcile::{
-            attempts_in_window, load_or_prepare_attempt, mark_attempt_rejected,
-            mark_attempt_submitting, mark_attempt_uncertain_after_submission_error,
-            open_reconciliation_case, permitted_recovery_action, recover_lost_submission_response,
-            CopyExecution, LostSubmissionRecoveryOutcome, PreparedOrderEnvelope, ReconcileError,
-            RecoveryAction, SubmitError,
+            attempts_in_window, load_or_prepare_attempt, mark_attempt_gtd_lookup_failed,
+            mark_attempt_rejected, mark_attempt_submitting,
+            mark_attempt_uncertain_after_submission_error, open_reconciliation_case,
+            permitted_recovery_action, recover_lost_submission_response, CopyExecution,
+            LostSubmissionRecoveryOutcome, PreparedOrderEnvelope, ReconcileError, RecoveryAction,
+            SubmitError,
         },
     },
     venue::{
@@ -715,12 +716,46 @@ async fn poll_resting_gtd<E>(
 where
     E: CopyExecution,
 {
-    let state = execution
+    // A failed GTD lookup leaves venue truth unknown, whether the error is
+    // a transient 5xx or a 404. The venue documents that /data/order/{id}
+    // can also return canceled and fully matched orders; a 404 does not
+    // establish zero fill. Move the attempt and tracking case together into
+    // reconciliation rather than repeating the same lookup on every startup.
+    // The existing FAK/taker trade-history matcher CANNOT reconcile a GTD
+    // maker order; resolving this case needs a separate maker-side workflow.
+    let state = match execution
         .order_for_receipt(&crate::venue::types::OrderId(
             attempt.envelope.expected_taker_order_id.clone(),
         ))
         .await
-        .map_err(|detail| OrchestrateError::Receipt(format!("GTD order lookup failed: {detail}")))?;
+    {
+        Ok(state) => state,
+        Err(detail) => {
+            // Preserve the lookup error for the operator; neither this
+            // error nor a subsequent FAK-only lookup establishes a GTD fill.
+            let failure_detail = format!(
+                "GTD live-order lookup failed and could not be retried here: {detail}"
+            );
+            let transitioned = mark_attempt_gtd_lookup_failed(
+                pool,
+                intent_id,
+                attempt.id,
+                &failure_detail,
+            )
+            .await
+            .map_err(OrchestrateError::Reconcile)?;
+            if !transitioned {
+                return Ok(OrchestrateOutcome::NeedsReconcile(
+                    "GTD lookup failed; attempt already transitioned",
+                ));
+            }
+            // The helper atomically marks the attempt uncertain and opens
+            // a strict_query_failure case. The runner may still latch its
+            // fuse, but startup cannot silently retry or resubmit this order.
+            // Do not resume until a GTD-maker-aware reconciliation is done.
+            return Ok(OrchestrateOutcome::Uncertain);
+        }
+    };
     if !is_terminal_gtd_status(&state.status) {
         sqlx::query(
             "UPDATE order_attempts SET venue_status = ?, filled_qty = ?, \

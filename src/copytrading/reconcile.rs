@@ -377,6 +377,89 @@ async fn persist_recovered_order_id(
     Ok(())
 }
 
+/// Transitions a single `accepted` GTD attempt to `uncertain` after its
+/// live order lookup (`order_for_receipt`) returned an error. A 404 does not
+/// establish whether the order filled, expired, or is still available via
+/// another venue endpoint. Fail closed and require operator reconciliation.
+///
+/// This is the explicit structural companion to
+/// [`persist_recovered_order_id`] (which only fires from the FAK-side
+/// `submitting`/`uncertain` arms of [`recover_lost_submission_response`]):
+/// it covers the distinct GTD path where the order was accepted by the
+/// venue and is now being polled, where `persist_recovered_order_id`'s
+/// `IN ('submitting', 'uncertain')` predicate does not match.
+///
+/// Caller guarantees this is invoked under the right preconditions:
+/// * the attempt's `envelope.order_type == "GTD"`
+/// * the attempt's `status == "accepted"`
+/// * a venue live-order lookup for `expected_taker_order_id` just failed
+///
+/// `failure_detail` is recorded on the attempt so the operator dashboard
+/// can surface why the lookup went cold. `submission_started_at` is
+/// backfilled from `created_at` if it was somehow NULL -- `created_at` is
+/// the row's persistence instant, which is the closest timestamp to the
+/// original venue submit we keep for this attempt, and is what the strict
+/// trade-history lookup window needs to bound itself.
+///
+/// The attempt update, intent block and tracking case commit atomically.
+/// Returns `false` without changing anything if the attempt is no longer
+/// accepted. GTD maker reconciliation is not supported by the FAK-only
+/// trade-history matcher; this transition does not prove a fill or no-fill.
+pub async fn mark_attempt_gtd_lookup_failed(
+    pool: &SqlitePool,
+    intent_id: i64,
+    attempt_id: i64,
+    failure_detail: &str,
+) -> Result<bool, ReconcileError> {
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    let result = sqlx::query(
+        "UPDATE order_attempts \
+         SET status = 'uncertain', \
+             failure_detail = ?, \
+             submission_started_at = COALESCE(submission_started_at, created_at), \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE id = ? AND intent_id = ? AND status = 'accepted' \
+           AND json_extract(envelope_json, '$.order_type') = 'GTD'",
+    )
+    .bind(failure_detail)
+    .bind(attempt_id)
+    .bind(intent_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if result.rows_affected() != 1 {
+        return Ok(false); // transaction rolls back on drop
+    }
+    let (account_id, token_id): (i64, String) =
+        sqlx::query_as("SELECT account_id, token_id FROM copy_intents WHERE id = ?")
+            .bind(intent_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    sqlx::query(
+        "UPDATE copy_intents SET status = 'needs_reconcile', \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+    )
+    .bind(intent_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    sqlx::query(
+        "INSERT INTO reconciliation_cases (account_id, token_id, intent_id, order_attempt_id, case_type, detail) \
+         VALUES (?, ?, ?, ?, 'strict_query_failure', ?)",
+    )
+    .bind(account_id)
+    .bind(token_id)
+    .bind(intent_id)
+    .bind(attempt_id)
+    .bind(failure_detail)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+    Ok(true)
+}
+
 /// Uses authenticated trade history to recover an order ID after a lost POST
 /// response. It performs only reads against the venue. Any unavailable,
 /// incomplete, delayed, contradictory, or non-identifying result atomically
@@ -1752,6 +1835,346 @@ mod tests {
             .unwrap()
             .get(0);
         assert_eq!(case_count, 1);
+    }
+
+    #[tokio::test]
+    async fn mark_attempt_gtd_lookup_failed_promotes_an_accepted_attempt_to_uncertain() {
+        // Unit pin for the helper that backs both
+        // `poll_resting_gtd`'s lookup-error arm in the orchestrator
+        // and the `mark-attempt-gtd-uncertain` operator command (see
+        // `docs/poll-resting-gtd-404-permanently-blocks-startup.md`).
+        //
+        // Three properties to pin -- the orchestrator fix needs all
+        // three; missing any of them re-creates the startup deadlock:
+        //
+        //   1. The transition only fires from `status = 'accepted'`.
+        //      `'submitting'` / `'uncertain'` / `'rejected'` /
+        //      `'finalized'` attempts must NOT silently move -- the
+        //      orchestrator and operator command already cover those
+        //      transitions via other helpers, and double-transitioning
+        //      here would silently violate the recovery-matrix
+        //      ordering.
+        //   2. `submission_started_at` is preserved when it is
+        //      already set (the FAK-then-flip-to-GTD path is rare but
+        //      valid; the recovery-matrix window must not jump), and
+        //      backfilled from `created_at` when NULL (defense in
+        //      depth for any pre-migration-0006 historical attempt
+        //      that lands on this code path).
+        //   3. `failure_detail` carries the lookup error verbatim so
+        //      the operator dashboard sees the same string the runner
+        //      would otherwise have crashed with.
+        let db = TestDb::new().await;
+        let intent_id = seed_intent(&db).await;
+        let mut gtd = envelope(42);
+        gtd.order_type = "GTD".to_owned();
+        gtd.post_only = true;
+        load_or_prepare_attempt(&db, intent_id, 1, &gtd)
+            .await
+            .unwrap();
+        let attempt_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM order_attempts WHERE intent_id = ? AND attempt_number = 1",
+        )
+        .bind(intent_id)
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        let now = Utc::now();
+        mark_attempt_submitting(&db, intent_id, attempt_id, now)
+            .await
+            .unwrap();
+        // submit boundary passed; venue responded with accepted. Submit-
+        // ting -> accepted does NOT clear submission_started_at, so
+        // mark_attempt_accepted-style behavior here is emulated by direct
+        // UPDATE (the production helper is in orchestrate not reconcile).
+        sqlx::query(
+            "UPDATE order_attempts SET status = 'accepted', \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ? AND intent_id = ?",
+        )
+        .bind(attempt_id)
+        .bind(intent_id)
+        .execute(&*db)
+        .await
+        .unwrap();
+        let pre_started: Option<String> =
+            sqlx::query_scalar("SELECT submission_started_at FROM order_attempts WHERE id = ?")
+                .bind(attempt_id)
+                .fetch_one(&*db)
+                .await
+                .unwrap();
+        assert_eq!(pre_started.as_deref(), Some(now.to_rfc3339().as_str()));
+
+        // Property 1 + 3: a single call from `'accepted'` lands
+        // the attempt on `'uncertain'`, records the detail, and
+        // returns `Ok(true)`.
+        let transitioned = mark_attempt_gtd_lookup_failed(
+            &db,
+            intent_id,
+            attempt_id,
+            "venue returned 404: order not found",
+        )
+        .await
+        .expect("the helper must translate a clean accepted attempt");
+        assert!(transitioned, "the helper must report true when the row was in 'accepted'");
+
+        let (status, detail, started): (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, failure_detail, submission_started_at \
+             FROM order_attempts WHERE id = ?",
+        )
+        .bind(attempt_id)
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        assert_eq!(
+            status, "uncertain",
+            "the accepted GTD attempt must move to 'uncertain' so subsequent startups \
+             route through the recovery matrix, not poll_resting_gtd's 404 path"
+        );
+        assert_eq!(
+            detail.as_deref(),
+            Some("venue returned 404: order not found"),
+            "failure_detail must carry the lookup error verbatim for the operator dashboard"
+        );
+        assert_eq!(
+            started, pre_started,
+            "submission_started_at must be preserved across the accepted -> uncertain transition"
+        );
+        let intent_status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+            .bind(intent_id)
+            .fetch_one(&*db)
+            .await
+            .unwrap();
+        assert_eq!(intent_status, "needs_reconcile");
+        let cases: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ? AND order_attempt_id = ? AND case_type = 'strict_query_failure' AND resolved_at IS NULL",
+        )
+        .bind(intent_id)
+        .bind(attempt_id)
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        assert_eq!(cases, 1, "the same transaction must open exactly one case");
+
+        // Idempotence: a second call observes 'uncertain' (not
+        // 'accepted') and returns Ok(false); the call site uses that
+        // to decide whether to open the reconciliation case.
+        let transitioned_again = mark_attempt_gtd_lookup_failed(
+            &db,
+            intent_id,
+            attempt_id,
+            "second call must be a no-op",
+        )
+        .await
+        .expect("the helper must be safe on already-promoted rows");
+        assert!(!transitioned_again);
+        let cases_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ? AND order_attempt_id = ?",
+        )
+        .bind(intent_id)
+        .bind(attempt_id)
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        assert_eq!(cases_after, 1, "repeat calls must not duplicate the case");
+    }
+
+    #[tokio::test]
+    async fn gtd_lookup_failure_rolls_back_the_attempt_when_case_insertion_fails() {
+        let db = TestDb::new().await;
+        let intent_id = seed_intent(&db).await;
+        let mut gtd = envelope(42);
+        gtd.order_type = "GTD".to_owned();
+        load_or_prepare_attempt(&db, intent_id, 1, &gtd).await.unwrap();
+        let attempt_id: i64 = sqlx::query_scalar("SELECT id FROM order_attempts WHERE intent_id = ?")
+            .bind(intent_id)
+            .fetch_one(&*db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE order_attempts SET status = 'accepted' WHERE id = ?")
+            .bind(attempt_id)
+            .execute(&*db)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER block_gtd_case BEFORE INSERT ON reconciliation_cases BEGIN SELECT RAISE(ABORT, 'case insert failed'); END")
+            .execute(&*db)
+            .await
+            .unwrap();
+        assert!(mark_attempt_gtd_lookup_failed(&db, intent_id, attempt_id, "404")
+            .await
+            .is_err());
+        let status: String = sqlx::query_scalar("SELECT status FROM order_attempts WHERE id = ?")
+            .bind(attempt_id)
+            .fetch_one(&*db)
+            .await
+            .unwrap();
+        assert_eq!(status, "accepted", "failed case insertion must roll back attempt transition");
+        let intent_status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+            .bind(intent_id)
+            .fetch_one(&*db)
+            .await
+            .unwrap();
+        assert_ne!(intent_status, "needs_reconcile", "intent update must roll back too");
+    }
+
+    #[tokio::test]
+    async fn a_promoted_gtd_attempt_is_not_falsely_resolved_by_the_fak_only_history_matcher() {
+        let db = TestDb::new().await;
+        let intent_id = seed_intent(&db).await;
+        let mut gtd = envelope(42);
+        gtd.order_type = "GTD".to_owned();
+        gtd.post_only = true;
+        load_or_prepare_attempt(&db, intent_id, 1, &gtd).await.unwrap();
+        let attempt_id: i64 = sqlx::query_scalar("SELECT id FROM order_attempts WHERE intent_id = ?")
+            .bind(intent_id)
+            .fetch_one(&*db)
+            .await
+            .unwrap();
+        let now = Utc::now();
+        sqlx::query("UPDATE order_attempts SET status = 'accepted', submission_started_at = ? WHERE id = ?")
+            .bind(now.to_rfc3339())
+            .bind(attempt_id)
+            .execute(&*db)
+            .await
+            .unwrap();
+        assert!(mark_attempt_gtd_lookup_failed(&db, intent_id, attempt_id, "404")
+            .await
+            .unwrap());
+        let reader = FakeTradeHistoryReader {
+            reply: FakeTradeHistoryReply::Trades(vec![]),
+        };
+        let error = inspect_uncertain_attempt_for_operator(&db, &reader, 1, attempt_id, Utc::now())
+            .await
+            .expect_err("FAK-only recovery cannot classify a GTD maker order as no-fill");
+        assert!(matches!(error, ReconcileError::StrictTradeHistoryLookup(detail) if detail.contains("only supports FAK")));
+        let status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+            .bind(intent_id)
+            .fetch_one(&*db)
+            .await
+            .unwrap();
+        assert_eq!(status, "needs_reconcile");
+    }
+
+    #[tokio::test]
+    async fn mark_attempt_gtd_lookup_failed_backfills_submission_started_at_when_null() {
+        // Defense-in-depth pin: if a legacy attempt (pre-migration-
+        // 0006, or any code path that ever cleared submission_started_at)
+        // arrives with `submission_started_at IS NULL`, the helper must
+        // backfill it from `created_at` so the strict trade-history
+        // window the recovery matrix uses has a non-null `after` bound.
+        let db = TestDb::new().await;
+        let intent_id = seed_intent(&db).await;
+        let mut gtd = envelope(42);
+        gtd.order_type = "GTD".to_owned();
+        gtd.post_only = true;
+        load_or_prepare_attempt(&db, intent_id, 1, &gtd)
+            .await
+            .unwrap();
+        let attempt_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM order_attempts WHERE intent_id = ? AND attempt_number = 1",
+        )
+        .bind(intent_id)
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE order_attempts SET status = 'accepted', submission_started_at = NULL \
+             WHERE id = ? AND intent_id = ?",
+        )
+        .bind(attempt_id)
+        .bind(intent_id)
+        .execute(&*db)
+        .await
+        .unwrap();
+
+        let transitioned = mark_attempt_gtd_lookup_failed(
+            &db,
+            intent_id,
+            attempt_id,
+            "venue returned 404: order not found",
+        )
+        .await
+        .expect("a NULL submission_started_at must not break the helper");
+        assert!(transitioned);
+
+        let (status, started): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, submission_started_at FROM order_attempts WHERE id = ?",
+        )
+        .bind(attempt_id)
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        assert_eq!(status, "uncertain");
+        assert!(
+            started.is_some(),
+            "the helper must COALESCE submission_started_at from created_at so \
+             the recovery matrix's strict-lookup window has a non-null `after` bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_attempt_gtd_lookup_failed_refuses_to_move_a_non_accepted_attempt() {
+        // The GTD-version of the existing helper contract: only
+        // `'accepted'` may transition here. Other statuses are handled
+        // by their own helpers (`mark_attempt_rejected`,
+        // `mark_attempt_finalized`, `mark_attempt_uncertain_after_submission_error`,
+        // ...); silently moving them here would violate the recovery
+        // matrix. The orchestrator fix reaches this helper only via
+        // `walk_existing_attempt`'s explicit `'accepted' && GTD' arm,
+        // and the operator command enforces the same status guard at
+        // its own call site, so this unit pin guards against a future
+        // refactor of either caller.
+        let db = TestDb::new().await;
+        let intent_id = seed_intent(&db).await;
+        let mut gtd = envelope(42);
+        gtd.order_type = "GTD".to_owned();
+        gtd.post_only = true;
+        load_or_prepare_attempt(&db, intent_id, 1, &gtd)
+            .await
+            .unwrap();
+        let attempt_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM order_attempts WHERE intent_id = ? AND attempt_number = 1",
+        )
+        .bind(intent_id)
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        for status in ["submitting", "uncertain", "rejected", "finalized"] {
+            sqlx::query(
+                "UPDATE order_attempts SET status = ?, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                 WHERE id = ? AND intent_id = ?",
+            )
+            .bind(status)
+            .bind(attempt_id)
+            .bind(intent_id)
+            .execute(&*db)
+            .await
+            .unwrap();
+            let transitioned = mark_attempt_gtd_lookup_failed(
+                &db,
+                intent_id,
+                attempt_id,
+                "must not move non-accepted",
+            )
+            .await
+            .expect("the helper itself never errors on a non-match; it just returns Ok(false)");
+            assert!(
+                !transitioned,
+                "the helper must NOT move an attempt whose status is {status:?}; \
+                 only `'accepted'` is the supported from-state"
+            );
+            let still: String = sqlx::query_scalar(
+                "SELECT status FROM order_attempts WHERE id = ?",
+            )
+            .bind(attempt_id)
+            .fetch_one(&*db)
+            .await
+            .unwrap();
+            assert_eq!(
+                still, status,
+                "the helper must leave status={status:?} rows untouched"
+            );
+        }
     }
 
     #[tokio::test]
