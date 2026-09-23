@@ -1141,6 +1141,21 @@ async fn submit_prepared<E>(
 where
     E: CopyExecution,
 {
+    if attempt.envelope.order_type == "GTD" {
+        if let Err(error) = ensure_gtd_order_id_before_submit(pool, intent_id, &attempt).await {
+            open_reconciliation_case(
+                pool,
+                intent_id,
+                Some(attempt.id),
+                "blocked_recovery",
+                &format!("GTD prepared order ID could not be verified before submission: {error}"),
+            )
+            .await?;
+            return Ok(OrchestrateOutcome::NeedsReconcile(
+                "GTD prepared order ID is not verified",
+            ));
+        }
+    }
     if let Err(error) = marker
         .mark_submitting(pool, intent_id, attempt.id, now)
         .await
@@ -1223,6 +1238,71 @@ where
             ))
         }
     }
+}
+
+/// A historical prepared GTD may have committed its immutable envelope just
+/// before the process died, leaving the separate order-ID write undone. It is
+/// safe to complete that write only while the row is still prepared and only
+/// with the ID already recorded in that same envelope. This commits before
+/// the submission marker, which in turn commits before venue I/O.
+async fn ensure_gtd_order_id_before_submit(
+    pool: &SqlitePool,
+    intent_id: i64,
+    attempt: &AttemptRow,
+) -> Result<(), OrchestrateError> {
+    let mut tx = pool.begin().await.map_err(|error| {
+        OrchestrateError::Execute(ExecuteError::Database(error.to_string()))
+    })?;
+    let row: Option<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT status, venue_order_id, envelope_json FROM order_attempts WHERE id = ? AND intent_id = ?",
+    )
+    .bind(attempt.id)
+    .bind(intent_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|error| OrchestrateError::Execute(ExecuteError::Database(error.to_string())))?;
+    let Some((status, stored_id, raw_envelope)) = row else {
+        return Err(OrchestrateError::Reconcile(ReconcileError::AttemptNotFound));
+    };
+    let stored_envelope: PreparedOrderEnvelope = serde_json::from_str(&raw_envelope)
+        .map_err(|_| OrchestrateError::Reconcile(ReconcileError::InvalidEnvelope))?;
+    let expected_id = attempt.envelope.expected_taker_order_id.as_str();
+    if status != "prepared"
+        || stored_envelope != attempt.envelope
+        || stored_envelope.order_type != "GTD"
+        || expected_id.trim().is_empty()
+        || expected_id.trim() != expected_id
+    {
+        return Err(OrchestrateError::Reconcile(ReconcileError::InvalidEnvelope));
+    }
+    match stored_id.as_deref() {
+        Some(id) if id == expected_id => {}
+        Some(_) => {
+            return Err(OrchestrateError::Reconcile(
+                ReconcileError::ConflictingRecoveredOrderId,
+            ));
+        }
+        None => {
+            let updated = sqlx::query(
+                "UPDATE order_attempts SET venue_order_id = ? \
+                 WHERE id = ? AND intent_id = ? AND status = 'prepared' AND venue_order_id IS NULL",
+            )
+            .bind(expected_id)
+            .bind(attempt.id)
+            .bind(intent_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| OrchestrateError::Execute(ExecuteError::Database(error.to_string())))?;
+            if updated.rows_affected() != 1 {
+                return Err(OrchestrateError::Reconcile(
+                    ReconcileError::InvalidAttemptTransition,
+                ));
+            }
+        }
+    }
+    tx.commit().await.map_err(|error| {
+        OrchestrateError::Execute(ExecuteError::Database(error.to_string()))
+    })
 }
 
 async fn query_first<E, H>(

@@ -900,6 +900,153 @@ async fn a_crash_after_prepare_does_not_rebuild_the_envelope() {
     assert_eq!(*venue.last_salt.lock().unwrap(), Some(1000));
 }
 
+struct AssertGtdIdBeforeSubmitting<'a> {
+    expected_id: &'a str,
+    fail_before_mark: bool,
+}
+
+impl SubmitAttemptMarker for AssertGtdIdBeforeSubmitting<'_> {
+    fn mark_submitting<'a>(
+        &'a self,
+        pool: &'a SqlitePool,
+        intent_id: i64,
+        attempt_id: i64,
+        now: DateTime<Utc>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), OrchestrateError>> + Send + 'a>> {
+        Box::pin(async move {
+            let row: (String, Option<String>, String) = sqlx::query_as(
+                "SELECT status, venue_order_id, envelope_json FROM order_attempts WHERE id = ? AND intent_id = ?",
+            )
+            .bind(attempt_id)
+            .bind(intent_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            let envelope: PreparedOrderEnvelope = serde_json::from_str(&row.2).unwrap();
+            assert_eq!(row.0, "prepared");
+            assert_eq!(row.1.as_deref(), Some(self.expected_id));
+            assert_eq!(envelope.expected_taker_order_id, self.expected_id);
+            if self.fail_before_mark {
+                return Err(OrchestrateError::Prepare("injected crash before submit marker".to_owned()));
+            }
+            StandardSubmitAttemptMarker.mark_submitting(pool, intent_id, attempt_id, now).await
+        })
+    }
+}
+
+#[tokio::test]
+async fn legacy_prepared_gtd_backfills_original_id_before_submit_marker() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+    set_maker_only_policy(&db, intent_id).await;
+    let venue = FakeVenue::succeeding(Decimal::new(5, 0));
+    let claimed = claim_or_resume_intent(&db, intent_id).await.unwrap().unwrap();
+    let SizingOutcome::Decision(decision) =
+        size_and_reserve(&db, &FixedBalance(Decimal::new(100, 0)), &claimed).await.unwrap()
+    else { panic!("decision"); };
+    let envelope = venue.prepare_post_only_gtd_buy(
+        &decision, Utc::now() + chrono::Duration::minutes(5),
+    ).await.unwrap();
+    load_or_prepare_attempt(&db, intent_id, 1, &envelope).await.unwrap();
+    sqlx::query("UPDATE order_attempts SET venue_order_id = NULL WHERE intent_id = ?")
+        .bind(intent_id).execute(&db.pool).await.unwrap();
+
+    let outcome = execute_one_intent_with_marker(
+        &db, &FixedBalance(Decimal::new(100, 0)), &venue, &venue,
+        &EmptyHistory, &AssertGtdIdBeforeSubmitting {
+            expected_id: &envelope.expected_taker_order_id,
+            fail_before_mark: false,
+        }, intent_id, Utc::now(),
+    ).await.unwrap();
+    assert_eq!(outcome, OrchestrateOutcome::Resting);
+    assert_eq!(venue.prepare_count.load(Ordering::SeqCst), 1, "resume must not sign again");
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn gtd_id_backfill_replays_without_resigning_after_pre_marker_crash() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+    set_maker_only_policy(&db, intent_id).await;
+    let venue = FakeVenue::succeeding(Decimal::new(5, 0));
+    let claimed = claim_or_resume_intent(&db, intent_id).await.unwrap().unwrap();
+    let SizingOutcome::Decision(decision) =
+        size_and_reserve(&db, &FixedBalance(Decimal::new(100, 0)), &claimed).await.unwrap()
+    else { panic!("decision"); };
+    let envelope = venue.prepare_post_only_gtd_buy(
+        &decision, Utc::now() + chrono::Duration::minutes(5),
+    ).await.unwrap();
+    load_or_prepare_attempt(&db, intent_id, 1, &envelope).await.unwrap();
+    sqlx::query("UPDATE order_attempts SET venue_order_id = NULL WHERE intent_id = ?")
+        .bind(intent_id).execute(&db.pool).await.unwrap();
+    let failing_marker = AssertGtdIdBeforeSubmitting {
+        expected_id: &envelope.expected_taker_order_id,
+        fail_before_mark: true,
+    };
+    let first = execute_one_intent_with_marker(
+        &db, &FixedBalance(Decimal::new(100, 0)), &venue, &venue,
+        &EmptyHistory, &failing_marker, intent_id, Utc::now(),
+    ).await;
+    assert!(first.is_err());
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 0);
+    let state: (String, Option<String>) = sqlx::query_as(
+        "SELECT status, venue_order_id FROM order_attempts WHERE intent_id = ?",
+    ).bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(state, ("prepared".to_owned(), Some(envelope.expected_taker_order_id.clone())));
+
+    let outcome = execute_one_intent_with_marker(
+        &db, &FixedBalance(Decimal::new(100, 0)), &venue, &venue,
+        &EmptyHistory, &AssertGtdIdBeforeSubmitting {
+            expected_id: &envelope.expected_taker_order_id,
+            fail_before_mark: false,
+        }, intent_id, Utc::now(),
+    ).await.unwrap();
+    assert_eq!(outcome, OrchestrateOutcome::Resting);
+    assert_eq!(venue.prepare_count.load(Ordering::SeqCst), 1);
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn conflicting_prepared_gtd_order_id_blocks_before_marker_and_venue() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+    set_maker_only_policy(&db, intent_id).await;
+    let venue = FakeVenue::succeeding(Decimal::new(5, 0));
+    let claimed = claim_or_resume_intent(&db, intent_id).await.unwrap().unwrap();
+    let SizingOutcome::Decision(decision) =
+        size_and_reserve(&db, &FixedBalance(Decimal::new(100, 0)), &claimed).await.unwrap()
+    else { panic!("decision"); };
+    let envelope = venue.prepare_post_only_gtd_buy(
+        &decision, Utc::now() + chrono::Duration::minutes(5),
+    ).await.unwrap();
+    load_or_prepare_attempt(&db, intent_id, 1, &envelope).await.unwrap();
+    sqlx::query("UPDATE order_attempts SET venue_order_id = 'other-id' WHERE intent_id = ?")
+        .bind(intent_id).execute(&db.pool).await.unwrap();
+
+    let outcome = execute_one_intent(
+        &db, &FixedBalance(Decimal::new(100, 0)), &venue, &venue,
+        &EmptyHistory, intent_id, Utc::now(),
+    ).await.unwrap();
+    assert_eq!(outcome, OrchestrateOutcome::NeedsReconcile(
+        "GTD prepared order ID is not verified",
+    ));
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 0);
+    let row: (String, String) = sqlx::query_as(
+        "SELECT status, venue_order_id FROM order_attempts WHERE intent_id = ?",
+    ).bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(row, ("prepared".to_owned(), "other-id".to_owned()));
+    let cases: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ? AND resolved_at IS NULL",
+    ).bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(cases, 1);
+}
+
 #[tokio::test]
 async fn a_transport_error_marks_uncertain_and_never_resubmits() {
     let db = TestDb::new().await;

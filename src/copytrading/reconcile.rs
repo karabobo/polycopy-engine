@@ -132,14 +132,24 @@ pub async fn load_or_prepare_attempt(
         }
 
         let envelope_json = serde_json::to_string(candidate).map_err(|_| ReconcileError::InvalidEnvelope)?;
+        let gtd_order_id = if candidate.order_type == "GTD" {
+            let id = candidate.expected_taker_order_id.trim();
+            if id.is_empty() || id != candidate.expected_taker_order_id {
+                return Err(ReconcileError::MissingVenueOrderId);
+            }
+            Some(id)
+        } else {
+            None
+        };
         sqlx::query(
-            "INSERT INTO order_attempts (intent_id, attempt_number, envelope_json, status, requested_qty) \
-             VALUES (?, ?, ?, 'prepared', ?)",
+            "INSERT INTO order_attempts (intent_id, attempt_number, envelope_json, status, requested_qty, venue_order_id) \
+             VALUES (?, ?, ?, 'prepared', ?, ?)",
         )
         .bind(intent_id)
         .bind(attempt_number)
         .bind(envelope_json)
         .bind(candidate.buy_budget_usdc.as_deref().unwrap_or(&candidate.size))
+        .bind(gtd_order_id)
         .execute(&mut *conn)
         .await
         .map_err(db_err)?;
@@ -1056,6 +1066,36 @@ mod tests {
         envelope.post_only = true;
         envelope.buy_shares_exact = true;
         envelope
+    }
+
+    #[tokio::test]
+    async fn new_gtd_attempt_persists_order_id_with_immutable_envelope() {
+        let db = TestDb::new().await;
+        let intent_id = seed_intent(&db).await;
+        let envelope = gtd_envelope(42);
+        load_or_prepare_attempt(&db, intent_id, 1, &envelope).await.unwrap();
+        let (status, order_id, raw): (String, Option<String>, String) = sqlx::query_as(
+            "SELECT status, venue_order_id, envelope_json FROM order_attempts WHERE intent_id = ?",
+        ).bind(intent_id).fetch_one(&*db).await.unwrap();
+        assert_eq!(status, "prepared");
+        assert_eq!(order_id.as_deref(), Some(envelope.expected_taker_order_id.as_str()));
+        assert_eq!(serde_json::from_str::<PreparedOrderEnvelope>(&raw).unwrap(), envelope);
+    }
+
+    #[tokio::test]
+    async fn new_gtd_attempt_without_a_valid_expected_id_writes_nothing() {
+        let db = TestDb::new().await;
+        let intent_id = seed_intent(&db).await;
+        let mut envelope = gtd_envelope(42);
+        envelope.expected_taker_order_id = " ".to_owned();
+        assert!(matches!(
+            load_or_prepare_attempt(&db, intent_id, 1, &envelope).await,
+            Err(ReconcileError::MissingVenueOrderId)
+        ));
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM order_attempts WHERE intent_id = ?",
+        ).bind(intent_id).fetch_one(&*db).await.unwrap();
+        assert_eq!(count, 0);
     }
 
     fn maker_fill(order_id: &str, matched_amount: Decimal, price: Decimal) -> AccountTradeMakerFill {
@@ -2566,7 +2606,7 @@ mod tests {
             .unwrap();
         let now = Utc::now();
         sqlx::query(
-            "UPDATE order_attempts SET status = 'accepted', submission_started_at = ? \
+            "UPDATE order_attempts SET status = 'accepted', venue_order_id = NULL, submission_started_at = ? \
              WHERE id = ?",
         )
         .bind(now.to_rfc3339())
