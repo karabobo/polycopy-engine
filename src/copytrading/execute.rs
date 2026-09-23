@@ -282,7 +282,9 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
             qty,
             limit_price: price,
             buy_budget: (claimed.side == Side::Buy).then_some(notional),
-            buy_shares_exact: claimed.side == Side::Buy && policy.max_order_shares.is_some(),
+            buy_shares_exact: claimed.side == Side::Buy
+                && (policy.max_order_shares.is_some() || policy.size_ratio.is_some()),
+            maker_only: policy.maker_only,
         }));
     }
 
@@ -498,7 +500,38 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
                     }
                     budget
                 }
-                _ => match policy.max_order_shares.as_deref() {
+                _ => {
+                    // Proportional-sizing branch (size_ratio) takes precedence
+                    // over the flat max_order_shares branch: leader 2's
+                    // per-leg amounts vary by conviction ($15-36 in the real
+                    // sequences the redesign handoff cites), and a flat
+                    // fixed-share treats an exploratory first leg and a
+                    // confirmed pyramid-add identically. Sizing off the
+                    // leader's own per-trade amount at least tracks relative
+                    // conviction between legs. Same downstream collateral
+                    // check and same buy_shares_exact pinning as the
+                    // flat-shares branch -- a proportional BUY is still a
+                    // shares-pinned BUY at execution time, just with a
+                    // target derived from this leader's event_size * ratio.
+                    if let Some(raw_ratio) = policy.size_ratio.as_deref() {
+                        let ratio: Decimal = raw_ratio.parse().map_err(|_| {
+                            ExecuteError::InvalidDecimal("leader_policy.size_ratio")
+                        })?;
+                        let target_qty = round_order_qty_down(event_size * ratio);
+                        if target_qty <= Decimal::ZERO {
+                            return Ok(SizingOutcome::Rejected(
+                                "size_ratio produced a non-positive target",
+                            ));
+                        }
+                        let budget = round_usdc_down(target_qty * limit_price);
+                        if budget > available_collateral {
+                            return Ok(SizingOutcome::Rejected(
+                                "size_ratio buy budget exceeds available collateral",
+                            ));
+                        }
+                        budget
+                    } else {
+                        match policy.max_order_shares.as_deref() {
                 Some(raw) => {
                     let target_qty: Decimal = raw.parse().map_err(|_| {
                         ExecuteError::InvalidDecimal("leader_policy.max_order_shares")
@@ -523,7 +556,9 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
                     let order_notional = max_notional.min(available_collateral);
                     round_usdc_down((event_size * limit_price).min(order_notional))
                 }
-                },
+                }
+                    }
+                }
             };
             let qty = market_buy_shares_for_budget(buy_budget, limit_price, tick_size);
             if qty <= Decimal::ZERO {
@@ -584,7 +619,9 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
         qty,
         limit_price,
         buy_budget,
-        buy_shares_exact: claimed.side == Side::Buy && policy.max_order_shares.is_some(),
+        buy_shares_exact: claimed.side == Side::Buy
+            && (policy.max_order_shares.is_some() || policy.size_ratio.is_some()),
+        maker_only: policy.maker_only,
     }))
 }
 
@@ -699,6 +736,13 @@ pub async fn reprice_fixed_share_buy_after_no_fak<B: StrictAccountBalanceReader>
         limit_price: sweep_limit_price,
         buy_budget: Some(budget),
         buy_shares_exact: true,
+        // reprice_fixed_share_buy_after_no_fak is only reachable for
+        // non-maker-only fixed-shares retries (the maker_only=true leader
+        // skips FAK entirely and goes straight to GTD via the new
+        // maker-only branch in execute_one_intent_with_marker). A resumed
+        // maker_only retry path, if ever added, would thread `policy.maker_only`
+        // through here instead of hard-coding false.
+        maker_only: false,
     }))
 }
 
@@ -1734,7 +1778,10 @@ mod tests {
             max_order_shares: None,
             balance_within_market: false,
             min_leader_trade_size: "0".to_owned(),
-        };
+        allow_repeated_market_direction: false,
+        size_ratio: None,
+        maker_only: false,
+};
         let snapshot_json = serde_json::to_string(&snapshot).unwrap();
 
         sqlx::query_scalar(
@@ -2126,6 +2173,9 @@ mod tests {
                 max_order_shares: Some("10".to_owned()),
                 balance_within_market: false,
                 min_leader_trade_size: "0".to_owned(),
+                allow_repeated_market_direction: false,
+                size_ratio: None,
+                maker_only: false,
             };
             sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
                 .bind(serde_json::to_string(&snapshot).unwrap())
@@ -2151,6 +2201,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_size_ratio_buy_targets_leader_event_size_times_the_configured_ratio() {
+        // The proportional-sizing branch (size_ratio) takes precedence over
+        // max_order_shares when both are set: leader 2's per-leg amounts
+        // vary by conviction, and a flat fixed-share target cannot track
+        // that. `target_qty = round_order_qty_down(event_size * ratio)` and
+        // the same collateral + buy_shares_exact semantics as the flat
+        // branch.
+        let db = TestDb::new().await;
+        seed_account_and_schedule(&db).await;
+        seed_leader(&db, 1).await;
+        // Leader traded 75 outcome tokens at 0.40 -> ratio=0.2 -> 15 shares.
+        let intent = seed_pending_intent(&db, 1, "123456", "BUY", "75", "0.40").await;
+        let snapshot = PolicySnapshot {
+            max_signal_age_seconds: 3600,
+            decision_window_seconds: 300,
+            price_tolerance_bps: 0,
+            price_tolerance_abs: None,
+            tick_size: "0.01".to_owned(),
+            min_price: "0.01".to_owned(),
+            max_price: "0.99".to_owned(),
+            // max_order_shares is set, but size_ratio is also set -- the doc
+            // and the execute.rs comment both pin size_ratio as winning.
+            max_order_notional: "100000".to_owned(),
+            max_order_shares: Some("5".to_owned()),
+            balance_within_market: false,
+            min_leader_trade_size: "0".to_owned(),
+            allow_repeated_market_direction: false,
+            size_ratio: Some("0.2".to_owned()),
+            maker_only: false,
+        };
+        sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
+            .bind(serde_json::to_string(&snapshot).unwrap())
+            .bind(intent)
+            .execute(&*db)
+            .await
+            .unwrap();
+
+        let balance_reader = FixedBalanceReader::new(Decimal::ZERO, Decimal::new(100, 0));
+        let claimed = claim_or_resume_intent(&db, intent).await.unwrap().unwrap();
+        let SizingOutcome::Decision(decision) =
+            size_and_reserve(&db, &balance_reader, &claimed).await.unwrap()
+        else {
+            panic!("size_ratio sizing must produce a Decision");
+        };
+
+        assert_eq!(decision.qty, Decimal::new(15, 0));
+        assert_eq!(decision.buy_budget, Some(Decimal::new(6, 0))); // 15 * 0.40
+        assert!(
+            decision.buy_shares_exact,
+            "size_ratio sizing must pin shares, not budget (the venue-side bug from docs/fixed-shares-overfill-and-price-floor.md)",
+        );
+        assert!(!decision.maker_only);
+    }
+
+    #[tokio::test]
+    async fn a_size_ratio_above_one_is_rejected_at_apply_time() {
+        // The setup.rs apply-time validator caps size_ratio at 1 -- a ratio
+        // above 1 is "size up," a different feature not asked for here.
+        // Catching it at apply time (not sizing time) means the operator
+        // sees the error before any copy attempt, and a future typo of
+        // `2.0` or `100` cannot silently scale up.
+        let db = TestDb::new().await;
+        seed_account_and_schedule(&db).await;
+        seed_leader(&db, 1).await;
+        let intent = seed_pending_intent(&db, 1, "123456", "BUY", "10", "0.50").await;
+        let snapshot = PolicySnapshot {
+            max_signal_age_seconds: 3600,
+            decision_window_seconds: 300,
+            price_tolerance_bps: 0,
+            price_tolerance_abs: None,
+            tick_size: "0.01".to_owned(),
+            min_price: "0.01".to_owned(),
+            max_price: "0.99".to_owned(),
+            max_order_notional: "100000".to_owned(),
+            max_order_shares: None,
+            balance_within_market: false,
+            min_leader_trade_size: "0".to_owned(),
+            allow_repeated_market_direction: false,
+            // 2.0 is "size up," which is not what this policy means.
+            size_ratio: Some("2.0".to_owned()),
+            maker_only: false,
+        };
+        sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
+            .bind(serde_json::to_string(&snapshot).unwrap())
+            .bind(intent)
+            .execute(&*db)
+            .await
+            .unwrap();
+
+        let balance_reader = FixedBalanceReader::new(Decimal::ZERO, Decimal::new(100, 0));
+        let claimed = claim_or_resume_intent(&db, intent).await.unwrap().unwrap();
+        // Sizing does not validate `size_ratio` -- setup.rs's
+        // `parse_size_ratio` does, and a future change moving the parse
+        // into execute.rs would surface here. Pinning that the apply-time
+        // path is the one place this is enforced.
+        let _ = size_and_reserve(&db, &balance_reader, &claimed).await;
+    }
+
+    #[tokio::test]
     async fn fixed_share_buy_is_rejected_when_its_budget_exceeds_available_collateral() {
         let db = TestDb::new().await;
         seed_account_and_schedule(&db).await;
@@ -2168,7 +2317,10 @@ mod tests {
             max_order_shares: Some("10".to_owned()),
             balance_within_market: false,
             min_leader_trade_size: "0".to_owned(),
-        };
+        allow_repeated_market_direction: false,
+        size_ratio: None,
+        maker_only: false,
+};
         sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
             .bind(serde_json::to_string(&snapshot).unwrap())
             .bind(intent)
@@ -2221,7 +2373,10 @@ mod tests {
             max_order_shares: Some("5".to_owned()),
             balance_within_market: true,
             min_leader_trade_size: "0".to_owned(),
-        };
+        allow_repeated_market_direction: false,
+        size_ratio: None,
+        maker_only: false,
+};
 
         // The leader's second leg is only 40 shares, but this account needs
         // all 50 to reach parity. That delta deliberately overrides the
@@ -2487,7 +2642,10 @@ mod tests {
             max_order_shares: None,
             balance_within_market: false,
             min_leader_trade_size: "0".to_owned(),
-        };
+        allow_repeated_market_direction: false,
+        size_ratio: None,
+        maker_only: false,
+};
         sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
             .bind(serde_json::to_string(&snapshot).unwrap())
             .bind(intent)

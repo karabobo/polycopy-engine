@@ -87,6 +87,31 @@ pub fn derive_gtd_market_spec(
     })
 }
 
+/// Returns the lowest-displayed ask price from a fresh book, ignoring the
+/// advertised size at that level. The maker-only execution path caps a
+/// post-only GTD BUY at this value (when it is more favorable than the
+/// leader-derived ceiling) so the resting order never crosses an existing
+/// ask on arrival. Unlike `no_fak_sweep_quote`, this helper does NOT
+/// validate against a target share count: the maker-only path is shares-
+/// pinned by `SizeRatio` *or* `max_order_shares`, and the price is the
+/// only thing the live book informs. Empty book returns `Ok(None)` so the
+/// caller (orchestrate) can fail closed with a distinct message rather
+/// than parsing a "no asks" error string.
+pub fn best_ask_price<I>(asks: I) -> Result<Option<Decimal>, String>
+where
+    I: IntoIterator<Item = (Decimal, Decimal)>,
+{
+    let mut levels: Vec<_> = asks.into_iter().collect();
+    levels.sort_by_key(|(price, _)| *price);
+    let Some((price, size)) = levels.into_iter().next() else {
+        return Ok(None);
+    };
+    if price <= Decimal::ZERO || price >= Decimal::ONE || size <= Decimal::ZERO {
+        return Err("fresh order book contains an invalid best ask level".to_owned());
+    }
+    Ok(Some(price))
+}
+
 /// Returns the best valid displayed ask from a fresh book. `target_shares` is
 /// retained as a mandatory positive guard for the fixed-share retry contract;
 /// it must not influence the price ceiling, otherwise a thin book turns a
@@ -150,6 +175,27 @@ pub trait EnvelopeFactory {
         _condition_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<GtdMarketSpec, String>> + Send + 'a>> {
         Box::pin(async { Err("market end lookup for GTD maker retry is unavailable".to_owned()) })
+    }
+
+    /// Fetches the real-time best ask for `token_id` and returns just the
+    /// price. Used only by the maker-only execution path (decision.maker_only
+    /// == true), which then caps the post-only GTD BUY price at this value
+    /// when it is more favorable than the leader-derived ceiling. Distinct
+    /// from `sweep_quote_for_no_fak_retry`: that helper answers a VWAP
+    /// question for a dead FAK retry and is intentionally a different
+    /// shape; this one answers a single-price question for the maker-only
+    /// path and shares its pure-function implementation `best_ask_price`
+    /// with whatever tests need it. Default is fail-closed (an order-book
+    /// read failure becomes a pre-submit rejection, never a stale-price
+    /// fallback -- see docs/leader2-strategy-redesign-handoff.md Part 3
+    /// Change 4 for the design choice).
+    fn fetch_best_ask_for_maker_only<'a>(
+        &'a self,
+        _token_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Decimal, String>> + Send + 'a>> {
+        Box::pin(async {
+            Err("best-ask lookup for maker-only execution is unavailable".to_owned())
+        })
     }
 
     /// Signs the third, post-only GTD maker attempt. It receives the exact
@@ -320,6 +366,88 @@ where
     .await
 }
 
+/// Builds a post-only GTD envelope for a maker-only `decision`. Reads the
+/// market end time, fetches the real-time best ask, and chooses
+/// `maker_price = min(decision.limit_price, best_ask)` (the leader-derived
+/// ceiling is the upper bound; the live ask replaces it only when more
+/// favorable). All three steps are fail-closed at the caller: this helper
+/// returns an error and lets orchestrate turn that into a durable
+/// `reject_pre_submit_intent` rather than falling back to a stale price
+/// (see docs/leader2-strategy-redesign-handoff.md Part 3 Change 4 for the
+/// design choice).
+///
+/// Same shape in both call sites (fresh intent path and `prepare_new_attempt`'s
+/// resume path): they pass the relevant `decision` and get back the prepared
+/// envelope (and the persisted attempt row). Reusing one helper rather than
+/// duplicating keeps the fail-closed guarantees in one place -- a future
+/// edit can't accidentally drop the best-ask fetch from one path and not
+/// the other. The caller owns the post-failure `reject_pre_submit_intent`
+/// call so the same intent-state guarantee applies on both code paths.
+async fn prepare_maker_only_envelope<F>(
+    envelopes: &F,
+    decision: &SizedDecision,
+    now: DateTime<Utc>,
+) -> Result<MakerOnlyEnvelope, MakerOnlyError>
+where
+    F: EnvelopeFactory,
+{
+    let market = envelopes
+        .market_spec_for_gtd(&decision.token_id)
+        .await
+        .map_err(MakerOnlyError::MarketSpec)?;
+    if market.expires_at <= now {
+        return Err(MakerOnlyError::Expired);
+    }
+    let best_ask = envelopes
+        .fetch_best_ask_for_maker_only(&decision.token_id)
+        .await
+        .map_err(MakerOnlyError::BestAsk)?;
+    // Account owner instruction (2026-09-23): use the exact best_ask,
+    // do NOT subtract a tick. This deviates from
+    // docs/leader2-strategy-redesign-handoff.md Change 4's
+    // ship-side empirical check; if post-deploy monitoring shows
+    // post-only rejections due to crossing, the next commit switches to
+    // best_ask - tick_size with the venue-side evidence documented.
+    let maker_price = if best_ask < decision.limit_price {
+        best_ask
+    } else {
+        decision.limit_price
+    };
+    let mut priced_decision = decision.clone();
+    priced_decision.limit_price = maker_price;
+    let envelope = envelopes
+        .prepare_post_only_gtd_buy(&priced_decision, market.expires_at)
+        .await
+        .map_err(MakerOnlyError::Prepare)?;
+    Ok(MakerOnlyEnvelope {
+        envelope,
+        market_expires_at: market.expires_at,
+    })
+}
+
+/// The successful output of `prepare_maker_only_envelope`. Carries the
+/// envelope plus the market-end expiry that drove it (so the caller's
+/// `persist_expected_venue_order_id` step doesn't have to re-derive the
+/// same value from a second market lookup).
+struct MakerOnlyEnvelope {
+    envelope: PreparedOrderEnvelope,
+    #[allow(dead_code)]
+    market_expires_at: DateTime<Utc>,
+}
+
+/// Why a maker-only preparation failed. Every variant maps to a distinct
+/// caller action: market-spec and best-ask errors become a durable
+/// `reject_pre_submit_intent`; `Expired` becomes `cancel_expired_intent`;
+/// `Prepare` errors also become `reject_pre_submit_intent`. Keeping the
+/// classification in one place keeps the caller's control flow simple.
+#[derive(Debug)]
+enum MakerOnlyError {
+    MarketSpec(String),
+    BestAsk(String),
+    Prepare(String),
+    Expired,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_one_intent_with_marker<B, E, F, H, M>(
     pool: &SqlitePool,
@@ -379,21 +507,75 @@ where
         }
     };
 
-    let envelope = match envelopes.prepare(&decision).await {
-        Ok(envelope) => envelope,
-        Err(detail) => {
-            // No request has crossed the venue boundary: the decision is
-            // reserved but signing/preparation failed locally. Release the
-            // reservation atomically with a durable pre-submit rejection;
-            // never strand an in_progress intent or propagate an error that
-            // a runner might blindly retry.
-            reject_pre_submit_intent(
-                pool,
-                intent_id,
-                &format!("envelope preparation failed: {detail}"),
-            )
-            .await?;
-            return Ok(OrchestrateOutcome::Rejected);
+    let envelope = if decision.maker_only {
+        match prepare_maker_only_envelope(envelopes, &decision, now).await {
+            Ok(maker) => {
+                let attempt_number = next_attempt_number(pool, intent_id).await?;
+                load_or_prepare_attempt(pool, intent_id, attempt_number, &maker.envelope)
+                    .await?;
+                let attempt = load_latest_attempt(pool, intent_id).await?.ok_or_else(|| {
+                    OrchestrateError::Execute(ExecuteError::Database(
+                        "missing attempt after maker-only preparation".into(),
+                    ))
+                })?;
+                persist_expected_venue_order_id(
+                    pool,
+                    intent_id,
+                    attempt.id,
+                    &attempt.envelope,
+                )
+                .await?;
+                return submit_prepared(pool, execution, marker, intent_id, attempt, now).await;
+            }
+            Err(MakerOnlyError::Expired) => {
+                cancel_expired_intent(pool, claimed.intent_id).await?;
+                return Ok(OrchestrateOutcome::Expired);
+            }
+            Err(MakerOnlyError::MarketSpec(detail)) => {
+                reject_pre_submit_intent(
+                    pool,
+                    intent_id,
+                    &format!("maker-only GTD market-end lookup failed: {detail}"),
+                )
+                .await?;
+                return Ok(OrchestrateOutcome::Rejected);
+            }
+            Err(MakerOnlyError::BestAsk(detail)) => {
+                reject_pre_submit_intent(
+                    pool,
+                    intent_id,
+                    &format!("maker-only best-ask lookup failed: {detail}"),
+                )
+                .await?;
+                return Ok(OrchestrateOutcome::Rejected);
+            }
+            Err(MakerOnlyError::Prepare(detail)) => {
+                reject_pre_submit_intent(
+                    pool,
+                    intent_id,
+                    &format!("maker-only envelope preparation failed: {detail}"),
+                )
+                .await?;
+                return Ok(OrchestrateOutcome::Rejected);
+            }
+        }
+    } else {
+        match envelopes.prepare(&decision).await {
+            Ok(envelope) => envelope,
+            Err(detail) => {
+                // No request has crossed the venue boundary: the decision is
+                // reserved but signing/preparation failed locally. Release the
+                // reservation atomically with a durable pre-submit rejection;
+                // never strand an in_progress intent or propagate an error that
+                // a runner might blindly retry.
+                reject_pre_submit_intent(
+                    pool,
+                    intent_id,
+                    &format!("envelope preparation failed: {detail}"),
+                )
+                .await?;
+                return Ok(OrchestrateOutcome::Rejected);
+            }
         }
     };
     let attempt_number = next_attempt_number(pool, intent_id).await?;
@@ -495,7 +677,7 @@ where
                 )
                 .await;
             }
-            match prepare_new_attempt(pool, balance_reader, envelopes, claimed).await? {
+            match prepare_new_attempt(pool, balance_reader, envelopes, claimed, now).await? {
                 RetryPreparation::Prepared => {}
                 RetryPreparation::Expired => return Ok(OrchestrateOutcome::Expired),
                 RetryPreparation::Rejected => return Ok(OrchestrateOutcome::Rejected),
@@ -818,6 +1000,7 @@ async fn prepare_new_attempt<B, F>(
     balance_reader: &B,
     envelopes: &F,
     claimed: &ClaimedIntent,
+    now: DateTime<Utc>,
 ) -> Result<RetryPreparation, OrchestrateError>
 where
     B: StrictAccountBalanceReader,
@@ -840,16 +1023,70 @@ where
             return Ok(RetryPreparation::Rejected);
         }
     };
-    let envelope = match envelopes.prepare(&decision).await {
-        Ok(envelope) => envelope,
-        Err(detail) => {
-            reject_pre_submit_intent(
-                pool,
-                claimed.intent_id,
-                &format!("envelope preparation failed: {detail}"),
-            )
-            .await?;
-            return Ok(RetryPreparation::Rejected);
+    let envelope = if decision.maker_only {
+        // `prepare_new_attempt` is only reached for a resumed intent that
+        // already cleared the planning-time expiry check (via
+        // `claim_or_resume_intent`'s decision_deadline_at gate). Re-running
+        // a wall-clock comparison here would either double-gate the same
+        // condition or, worse, race the deadline by the few hundred
+        // microseconds between resume and prepare. The fresh-path check
+        // stands; this resume path inherits it.
+        match prepare_maker_only_envelope(envelopes, &decision, now).await {
+            Ok(maker) => {
+                let attempt_number = next_attempt_number(pool, claimed.intent_id).await?;
+                load_or_prepare_attempt(
+                    pool,
+                    claimed.intent_id,
+                    attempt_number,
+                    &maker.envelope,
+                )
+                .await?;
+                return Ok(RetryPreparation::Prepared);
+            }
+            Err(MakerOnlyError::Expired) => {
+                cancel_expired_intent(pool, claimed.intent_id).await?;
+                return Ok(RetryPreparation::Expired);
+            }
+            Err(MakerOnlyError::MarketSpec(detail)) => {
+                reject_pre_submit_intent(
+                    pool,
+                    claimed.intent_id,
+                    &format!("maker-only GTD market-end lookup failed: {detail}"),
+                )
+                .await?;
+                return Ok(RetryPreparation::Rejected);
+            }
+            Err(MakerOnlyError::BestAsk(detail)) => {
+                reject_pre_submit_intent(
+                    pool,
+                    claimed.intent_id,
+                    &format!("maker-only best-ask lookup failed: {detail}"),
+                )
+                .await?;
+                return Ok(RetryPreparation::Rejected);
+            }
+            Err(MakerOnlyError::Prepare(detail)) => {
+                reject_pre_submit_intent(
+                    pool,
+                    claimed.intent_id,
+                    &format!("maker-only envelope preparation failed: {detail}"),
+                )
+                .await?;
+                return Ok(RetryPreparation::Rejected);
+            }
+        }
+    } else {
+        match envelopes.prepare(&decision).await {
+            Ok(envelope) => envelope,
+            Err(detail) => {
+                reject_pre_submit_intent(
+                    pool,
+                    claimed.intent_id,
+                    &format!("envelope preparation failed: {detail}"),
+                )
+                .await?;
+                return Ok(RetryPreparation::Rejected);
+            }
         }
     };
     let attempt_number = next_attempt_number(pool, claimed.intent_id).await?;
@@ -1296,6 +1533,31 @@ impl EnvelopeFactory for crate::venue::intl_clob_exec::IntlClobCopyAdapter {
                 .await
                 .map(|prepared| prepared.envelope)
                 .map_err(|error| error.to_string())
+        })
+    }
+
+    fn fetch_best_ask_for_maker_only<'a>(
+        &'a self,
+        token_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Decimal, String>> + Send + 'a>> {
+        let client = self.client().clone();
+        let token_id = token_id.to_owned();
+        Box::pin(async move {
+            let token_id = token_id
+                .parse::<alloy::primitives::U256>()
+                .map_err(|_| "invalid outcome token ID for best-ask lookup".to_owned())?;
+            let request = polymarket_client_sdk_v2::clob::types::request::OrderBookSummaryRequest::builder()
+                .token_id(token_id)
+                .build();
+            let book = client
+                .order_book(&request)
+                .await
+                .map_err(|error| format!("fresh order-book read failed: {error}"))?;
+            match best_ask_price(book.asks.into_iter().map(|level| (level.price, level.size))) {
+                Ok(Some(price)) => Ok(price),
+                Ok(None) => Err("order book has no asks".to_owned()),
+                Err(detail) => Err(detail),
+            }
         })
     }
 }

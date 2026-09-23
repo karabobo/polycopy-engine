@@ -103,8 +103,18 @@ pub async fn plan_next_batch_with_limit(
         // can be made runnable. A later signal for the same outcome, including
         // one from another Leader, becomes an auditable rejection; the
         // opposite outcome token remains independently eligible.
+        //
+        // Per-leader opt-out: when `decision.allow_repeated_market_direction`
+        // is true, this leader's events skip both the INSERT and the
+        // rejection-on-second-signal logic. The opt-out is a real safety
+        // backstop removal (see migrations/0018) and is leader-scoped so
+        // other leaders keep their first-wins gate intact. The combined
+        // condition `is_none() && inserted == 1 && !allow_repeated` matches
+        // the original `is_none() && inserted == 1` for every leader that
+        // does not opt out -- nothing about the default behaviour changes.
         let market_limit_rejected = if decision.rejection_reason.is_none()
             && inserted.rows_affected() == 1
+            && !decision.allow_repeated_market_direction
         {
             let intent_id: i64 = sqlx::query_scalar(
                 "SELECT id FROM copy_intents WHERE event_id = ? AND account_id = ?",
@@ -275,6 +285,13 @@ struct Decision {
     shard_id: i64,
     rejection_reason: Option<&'static str>,
     decision_deadline_at: Option<String>,
+    /// Whether the leader's policy opts out of the market_direction_order_locks
+    /// safety backstop for this event. When true, plan_next_batch_with_limit
+    /// skips the INSERT (and the rejection-on-second-signal logic). Mirrors
+    /// `PolicySnapshot::allow_repeated_market_direction` -- the snapshot is
+    /// read once in evaluate_event, so we thread the decision-relevant subset
+    /// here to keep plan_next_batch_with_limit a single round-trip per event.
+    allow_repeated_market_direction: bool,
 }
 
 impl Decision {
@@ -313,7 +330,7 @@ async fn evaluate_event(
     let policy = sqlx::query_as::<_, PolicySnapshot>(
         "SELECT max_signal_age_seconds, decision_window_seconds, price_tolerance_bps, \
                 tick_size, min_price, max_price, max_order_notional, max_order_shares, balance_within_market, min_leader_trade_size, \
-                price_tolerance_abs \
+                price_tolerance_abs, allow_repeated_market_direction, size_ratio, maker_only \
          FROM leader_policy WHERE leader_id = ?",
     )
     .bind(event.leader_id)
@@ -364,6 +381,7 @@ async fn evaluate_event(
         decision_deadline_at: Some(
             decision_deadline_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         ),
+        allow_repeated_market_direction: policy.allow_repeated_market_direction,
     })
 }
 
@@ -374,6 +392,13 @@ fn reject(shard_id: i64, reason: &'static str) -> Decision {
         shard_id,
         rejection_reason: Some(reason),
         decision_deadline_at: None,
+        // A rejection never reaches the market_direction_order_locks INSERT
+        // (the `if decision.rejection_reason.is_none() && inserted.rows_affected() == 1`
+        // guard short-circuits before the INSERT), so the flag value here
+        // is inert. Mirror the accept path's default (off) so a future
+        // refactor that drops the guard fails loud instead of inheriting a
+        // surprising default.
+        allow_repeated_market_direction: false,
     }
 }
 
@@ -408,6 +433,28 @@ pub struct PolicySnapshot {
     #[serde(default)]
     pub balance_within_market: bool,
     pub min_leader_trade_size: String,
+    /// Opt-out for the account-wide market_direction_order_locks safety
+    /// backstop, scoped per leader. Default false leaves the backstop on;
+    /// true skips the INSERT in plan_next_batch_with_limit so this leader's
+    /// repeated same-direction signals each become a new copy order. See
+    /// migrations/0018 for the safety-net removal note.
+    #[serde(default)]
+    pub allow_repeated_market_direction: bool,
+    /// Optional proportional-sizing mode for a leader's BUY. When present
+    /// (and leader 2's case, "0.2" = 1/5), execute.rs's BUY branch sizes
+    /// target_qty = leader_event_size * ratio. When both this and
+    /// max_order_shares are set, `size_ratio` wins. Defaulting keeps
+    /// snapshots written before this field executable.
+    #[serde(default)]
+    pub size_ratio: Option<String>,
+    /// When true, orchestrate/mod.rs branches the persisted decision onto
+    /// the maker-only GTD path. Read from `leader_policy.maker_only` once at
+    /// planning time and snapshotted here so size_and_reserve (which reads
+    /// the persisted snapshot, not live policy) can populate SizedDecision
+    /// without a second DB round-trip. See migrations/0019 + the leader-2
+    /// redesign handoff Part 3.
+    #[serde(default)]
+    pub maker_only: bool,
 }
 
 fn shard_for(account_id: i64, token_id: &str, lane_count: i64) -> i64 {
@@ -547,6 +594,45 @@ mod tests {
         .execute(&**db)
         .await
         .expect("policy must insert");
+    }
+
+    /// Seeds two leaders (1, 2) and their policies so a single
+    /// plan_next_batch_with_limit call can exercise both leaders'
+    /// `allow_repeated_market_direction` settings in isolation. Leader 1
+    /// keeps the backstop on; leader 2 opts out. Returns nothing; the
+    /// caller arranges events and leader_config rows before this.
+    async fn seed_two_leaders_with_repeat_policy(
+        db: &TestDb,
+        leader1_repeat: bool,
+        leader2_repeat: bool,
+    ) {
+        // leader_config rows: leader 2 mirrors leader 1 (enabled, label
+        // chosen so config-driven tests elsewhere still parse).
+        sqlx::query(
+            "INSERT INTO leader_config (id, label, enabled) VALUES (2, 'leader-2-test', 1)",
+        )
+        .execute(&**db)
+        .await
+        .expect("leader_config 2 must insert");
+        // Two distinct policies, one per leader. Each row sets
+        // max_signal_age wide enough (3600s) that a freshly-inserted
+        // event is never stale; the backstop under test is the
+        // market_direction_order_locks INSERT, which depends only on
+        // allow_repeated_market_direction.
+        for (leader_id, repeat) in [(1, leader1_repeat), (2, leader2_repeat)] {
+            sqlx::query(
+                "INSERT INTO leader_policy \
+                 (leader_id, max_signal_age_seconds, decision_window_seconds, \
+                  price_tolerance_bps, tick_size, max_order_notional, \
+                  min_leader_trade_size, allow_repeated_market_direction) \
+                 VALUES (?, 3600, 300, 100, '0.01', '1000', '0', ?)",
+            )
+            .bind(leader_id)
+            .bind(if repeat { 1i64 } else { 0i64 })
+            .execute(&**db)
+            .await
+            .expect("policy must insert");
+        }
     }
 
     async fn insert_event(db: &TestDb, size: &str, occurred_at: &str) -> i64 {
@@ -753,6 +839,102 @@ mod tests {
                 .await
                 .expect("market-direction locks must be queryable");
         assert_eq!(locks, 2);
+    }
+
+    #[tokio::test]
+    async fn allow_repeated_market_direction_is_a_leader_scoped_opt_out() {
+        // The market_direction_order_locks safety backstop is account-wide,
+        // but the opt-out is leader-scoped: leader 1 keeps the backstop on
+        // (second same-direction signal becomes a durable rejection), while
+        // leader 2 opts out (every repeated same-direction signal becomes
+        // a new pending intent). One batch exercises both leaders' policies
+        // in isolation, so the test cannot be fooled by a global flag or
+        // a leaky read.
+        //
+        // Why the assertion is shape-specific: leader 2's two same-direction
+        // events both become pending intents AND each event persists a
+        // copy_intents row, so the leader-2 count of pending == 2; leader
+        // 1's two same-direction events produce one pending + one
+        // market-direction-limited rejection, so leader 1's pending == 1
+        // and rejected == 1. The market_direction_order_locks table holds
+        // exactly one row per (account, condition, token, direction): for
+        // leader 1 that's 1 (the lock), for leader 2 that's 0 (no lock
+        // taken because of the opt-out). That last assertion is the one
+        // that catches the silent regression of the leader-scoping.
+        let db = TestDb::new().await;
+        seed_account_and_leader(&db).await;
+        seed_two_leaders_with_repeat_policy(&db, false, true).await;
+
+        // Two real-time events from each leader, all targeting the same
+        // (condition_id, token_id) -> same market direction. Insert the
+        // leader-1 pair first so the lock (or absence of it) is observed
+        // before leader 2's batch lands.
+        let now = chrono::Utc::now().to_rfc3339();
+        let l1_e1 = insert_event(&db, "5", &now).await;
+        let l1_e2 = insert_event(&db, "5", &now).await;
+        let l2_e1 = insert_event(&db, "5", &now).await;
+        let l2_e2 = insert_event(&db, "5", &now).await;
+        sqlx::query("UPDATE leader_events SET leader_id = 2 WHERE id IN (?, ?)")
+            .bind(l2_e1)
+            .bind(l2_e2)
+            .execute(&*db)
+            .await
+            .expect("leader 2 event re-tagging must succeed");
+
+        // cursor starts at 0; planning 4 events.
+        let summary = plan_next_batch(&db, 1).await.expect("planning must succeed");
+        assert_eq!(
+            summary,
+            PlanSummary { processed: 4, pending: 3, rejected: 1 },
+            "leader 1: 1 pending + 1 rejected; leader 2: 2 pending (no backstop)",
+        );
+
+        // The pending rows must come from both leaders, not all from one.
+        let leader_1_pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM copy_intents WHERE leader_id = 1 AND status = 'pending'",
+        )
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        let leader_2_pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM copy_intents WHERE leader_id = 2 AND status = 'pending'",
+        )
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        let leader_1_rejected: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM copy_intents WHERE leader_id = 1 \
+             AND status = 'rejected' AND rejection_reason LIKE 'market direction already%'",
+        )
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        assert_eq!(leader_1_pending, 1, "leader 1: first event wins the lock");
+        assert_eq!(
+            leader_1_rejected, 1,
+            "leader 1: second same-direction signal must be rejected by the backstop",
+        );
+        assert_eq!(
+            leader_2_pending, 2,
+            "leader 2 opted out: both same-direction signals become pending intents",
+        );
+
+        // The decisive assertion: market_direction_order_locks holds exactly
+        // one row (leader 1's winning signal) and zero rows for leader 2's
+        // repeated same-direction signals. This is the only assertion that
+        // catches a silent regression of the leader-scoping, because the
+        // pending/rejected counts above can pass if both leaders' rows are
+        // accidentally stored under one leader_id by a buggy test seed.
+        let lock_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM market_direction_order_locks")
+                .fetch_one(&*db)
+                .await
+                .unwrap();
+        assert_eq!(
+            lock_count, 1,
+            "exactly one lock exists -- leader 1's first event; leader 2's opt-out took none",
+        );
+        let _ = (l1_e1, l1_e2); // silence unused-bind warnings if any
     }
 
     #[tokio::test]

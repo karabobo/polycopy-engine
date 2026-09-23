@@ -95,6 +95,14 @@ pub struct SizedDecision {
     /// `qty`, rather than treating `buy_budget` as a spend-to amount whose
     /// share fill can grow when the venue improves the price.
     pub buy_shares_exact: bool,
+    /// When true, orchestrate/mod.rs branches this decision onto the maker-only
+    /// GTD path: `envelopes.prepare_post_only_gtd_buy` with a real-time
+    /// best-ask price cap, instead of `envelopes.prepare` (FAK). Sourced
+    /// from `leader_policy.maker_only` in execute.rs's size_and_reserve
+    /// (the same PolicySnapshot load that already feeds `buy_shares_exact`)
+    /// so the branch point in orchestrate is a single in-scope field read,
+    /// not a second policy round-trip. See migrations/0019 + docs/leader2-strategy-redesign-handoff.md Part 3.
+    pub maker_only: bool,
 }
 
 /// The exact, plainly-serializable fields of one signed order attempt.

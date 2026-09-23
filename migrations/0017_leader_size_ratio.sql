@@ -1,0 +1,22 @@
+-- 0017_leader_size_ratio.sql
+--
+-- Optional proportional-sizing mode for a leader's BUY. Stored as a decimal
+-- string ("0.2" = 1/5) for the same additive-migration shape as
+-- max_order_shares (migrations/0012). NULL/absent keeps the existing
+-- max_order_shares / max_order_notional sizing behaviour exactly as before.
+--
+-- When present, execute.rs's BUY branch sizes target_qty = event_size * ratio
+-- before the same downstream collateral check max_order_shares already gets.
+-- Validated at apply time as a positive decimal <= 1; the upper bound rules
+-- out a "size up" mode that this feature was never asked for, and is enforced
+-- by a dedicated parser in setup.rs rather than the unbounded
+-- parse_positive_decimal helper.
+--
+-- Precedence if both size_ratio and max_order_shares are set on one leader
+-- (shouldn't happen given how config is applied here, but execute.rs's
+-- docstring at the BUY branch spells it out anyway): size_ratio wins, since
+-- it is the newer proportional mode and was designed for leaders whose legs
+-- vary by conviction -- a misconfiguration that picks the older flat mode
+-- would silently break that intent.
+
+ALTER TABLE leader_policy ADD COLUMN size_ratio TEXT;

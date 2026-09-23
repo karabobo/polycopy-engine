@@ -130,6 +130,33 @@ pub struct LeaderPolicyInput {
     /// sets only bps keeps the behaviour it had before this field existed.
     #[serde(default)]
     pub price_tolerance_abs: Option<String>,
+    /// Optional proportional-sizing mode for a leader's BUY. Stored as a
+    /// decimal string ("0.2" = 1/5). NULL/absent keeps the existing
+    /// max_order_shares / max_order_notional sizing behaviour exactly as
+    /// before. When present, target_qty = leader_event_size * ratio, with
+    /// the same downstream collateral check fixed-shares already gets.
+    /// Validated at apply time as positive and <= 1; the upper bound rules
+    /// out a "size up" mode that this feature was never asked for, and is
+    /// enforced by a dedicated parser rather than the unbounded
+    /// `parse_positive_decimal` helper.
+    ///
+    /// Precedence if both `size_ratio` and `max_order_shares` are set on one
+    /// leader: `size_ratio` wins. Spelled out at execute.rs's BUY branch
+    /// (with the same comment block) so the choice is explicit at both the
+    /// apply-time and the sizing-time read sites.
+    #[serde(default)]
+    pub size_ratio: Option<String>,
+    /// Opt-out for the account-wide market_direction_order_locks safety
+    /// backstop, scoped per leader. Default false leaves every existing
+    /// leader on the original behaviour; setting this on a leader removes
+    /// a real safety net (see migrations/0018 for the audit note).
+    #[serde(default)]
+    pub allow_repeated_market_direction: bool,
+    /// Skip the FAK-first execution path; go straight to a post-only GTD
+    /// BUY with a real-time best-ask price cap. Default false leaves every
+    /// existing leader on the FAK-first path exactly as before.
+    #[serde(default)]
+    pub maker_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -510,8 +537,8 @@ async fn insert_policy(
          (leader_id, max_signal_age_seconds, decision_window_seconds, price_tolerance_bps, \
           tick_size, min_price, max_price, max_order_notional, min_leader_trade_size, \
           rolling_budget_usdc, budget_window_seconds, max_order_shares, balance_within_market, \
-          price_tolerance_abs) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          price_tolerance_abs, size_ratio, allow_repeated_market_direction, maker_only) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(leader_id)
     .bind(policy.max_signal_age_seconds)
@@ -527,6 +554,9 @@ async fn insert_policy(
     .bind(&policy.max_order_shares)
     .bind(policy.balance_within_market)
     .bind(&policy.price_tolerance_abs)
+    .bind(&policy.size_ratio)
+    .bind(policy.allow_repeated_market_direction)
+    .bind(policy.maker_only)
     .execute(&mut **tx)
     .await
     .map_err(ConfigError::Database)?;
@@ -552,6 +582,9 @@ struct StoredPolicy {
     max_order_shares: Option<String>,
     balance_within_market: bool,
     price_tolerance_abs: String,
+    size_ratio: Option<String>,
+    allow_repeated_market_direction: bool,
+    maker_only: bool,
 }
 
 async fn update_policy_if_changed(
@@ -563,7 +596,7 @@ async fn update_policy_if_changed(
         "SELECT max_signal_age_seconds, decision_window_seconds, price_tolerance_bps, \
          tick_size, min_price, max_price, max_order_notional, min_leader_trade_size, \
          rolling_budget_usdc, budget_window_seconds, max_order_shares, balance_within_market, \
-         price_tolerance_abs \
+         price_tolerance_abs, size_ratio, allow_repeated_market_direction, maker_only \
          FROM leader_policy WHERE leader_id = ?",
     )
     .bind(leader_id)
@@ -585,6 +618,9 @@ async fn update_policy_if_changed(
         max_order_shares: policy.max_order_shares.clone(),
         balance_within_market: policy.balance_within_market,
         price_tolerance_abs: policy.price_tolerance_abs.clone(),
+        size_ratio: policy.size_ratio.clone(),
+        allow_repeated_market_direction: policy.allow_repeated_market_direction,
+        maker_only: policy.maker_only,
     };
     if current.as_ref() == Some(&desired) {
         return Ok(false);
@@ -597,6 +633,7 @@ async fn update_policy_if_changed(
              max_order_notional = ?, min_leader_trade_size = ?, \
              rolling_budget_usdc = ?, budget_window_seconds = ?, max_order_shares = ?, \
              balance_within_market = ?, price_tolerance_abs = ?, \
+             size_ratio = ?, allow_repeated_market_direction = ?, maker_only = ?, \
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE leader_id = ?",
         )
         .bind(policy.max_signal_age_seconds)
@@ -612,6 +649,9 @@ async fn update_policy_if_changed(
         .bind(&policy.max_order_shares)
         .bind(policy.balance_within_market)
         .bind(&policy.price_tolerance_abs)
+        .bind(&policy.size_ratio)
+        .bind(policy.allow_repeated_market_direction)
+        .bind(policy.maker_only)
         .bind(leader_id)
         .execute(&mut **tx)
         .await
@@ -636,6 +676,9 @@ struct NormalizedPolicy {
     max_order_shares: Option<String>,
     balance_within_market: bool,
     price_tolerance_abs: String,
+    size_ratio: Option<String>,
+    allow_repeated_market_direction: bool,
+    maker_only: bool,
 }
 
 /// A flat tolerance is a licence to cross the spread, not a target price --
@@ -725,6 +768,17 @@ fn normalize_policy(
         }
     };
 
+    // size_ratio is bounded above by 1: a ratio above 1 is "size up," a
+    // different feature not asked for here. Validated by `parse_size_ratio`
+    // (not the unbounded `parse_positive_decimal` helper) so the upper
+    // bound is enforced at apply time, not only at sizing time. Absent
+    // (None) means this leader sizes from max_order_shares /
+    // max_order_notional exactly as before.
+    let size_ratio = match policy.size_ratio.as_deref() {
+        None => None,
+        Some(raw) => Some(parse_size_ratio(raw, "size_ratio")?),
+    };
+
     Ok(NormalizedPolicy {
         max_signal_age_seconds: policy.max_signal_age_seconds,
         decision_window_seconds: policy.decision_window_seconds,
@@ -739,6 +793,9 @@ fn normalize_policy(
         max_order_shares,
         balance_within_market: policy.balance_within_market,
         price_tolerance_abs: price_tolerance_abs.to_string(),
+        size_ratio,
+        allow_repeated_market_direction: policy.allow_repeated_market_direction,
+        maker_only: policy.maker_only,
     })
 }
 
@@ -750,6 +807,22 @@ fn parse_positive_decimal(value: &str, field: &'static str) -> Result<Decimal, C
         return Err(ConfigError::InvalidPolicyField(field));
     }
     Ok(parsed)
+}
+
+/// Parses a `size_ratio` policy field. Positive and bounded above by 1
+/// (inclusive) -- a ratio above 1 is "size up," a different feature not
+/// asked for here, and the limit rules it out at apply time so a future
+/// typo can't silently set 2.0 or 100. The string form is preserved through
+/// parse-and-emit so the on-disk decimal shape stays identical to what the
+/// operator wrote (e.g. "0.2" round-trips as "0.2", not "0.20").
+fn parse_size_ratio(value: &str, field: &'static str) -> Result<String, ConfigError> {
+    let parsed: Decimal = value
+        .parse()
+        .map_err(|_| ConfigError::InvalidPolicyField(field))?;
+    if parsed <= Decimal::ZERO || parsed > Decimal::ONE {
+        return Err(ConfigError::InvalidPolicyField(field));
+    }
+    Ok(parsed.normalize().to_string())
 }
 
 fn non_empty(value: &str, field: &'static str) -> Result<String, ConfigError> {
@@ -908,6 +981,9 @@ mod tests {
             budget_window_seconds: None,
             max_order_shares: None,
             balance_within_market: false,
+            size_ratio: None,
+            allow_repeated_market_direction: false,
+            maker_only: false,
         }
     }
 
@@ -1645,6 +1721,58 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(ConfigError::InvalidPolicyField(_))));
+    }
+
+    #[tokio::test]
+    async fn size_ratio_must_be_positive_and_at_most_one() {
+        // The size_ratio parser is bounded above by 1 -- a ratio above 1 is
+        // "size up," a different feature not asked for here. Catching
+        // 0/negative/above-1 at apply time means the operator sees the
+        // error before any copy attempt, and a future typo of `2.0` or
+        // `100` cannot silently scale up.
+        let db = TestDb::new().await;
+        for bad in ["0", "-0.1", "1.0000001", "2", "abc"] {
+            let mut config = config_with_one_leader("1");
+            config.leaders[0].policy.size_ratio = Some(bad.to_owned());
+            let result = apply_trading_config(
+                &db,
+                &config,
+                SIGNING_ADDRESS,
+                &ConfigApplyOptions::default(),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(ConfigError::InvalidPolicyField(_))),
+                "size_ratio={bad:?} must be rejected at apply time",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn size_ratio_at_one_is_accepted_and_normalized_to_one() {
+        // Boundary: 1.0 is exactly the upper bound and is allowed (inclusive).
+        // The parser normalizes to the canonical decimal form ("1") so a
+        // round-trip read of the stored value matches the input.
+        let db = TestDb::new().await;
+        let mut config = config_with_one_leader("1");
+        config.leaders[0].policy.size_ratio = Some("1".to_owned());
+
+        let summary = apply_trading_config(
+            &db,
+            &config,
+            SIGNING_ADDRESS,
+            &ConfigApplyOptions::default(),
+        )
+        .await
+        .unwrap();
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT size_ratio FROM leader_policy WHERE leader_id = ?",
+        )
+        .bind(summary.leaders[0].leader_id)
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        assert_eq!(stored.as_deref(), Some("1"));
     }
 
     #[tokio::test]

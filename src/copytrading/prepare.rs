@@ -481,6 +481,7 @@ mod tests {
             limit_price: Decimal::from_str("0.55").unwrap(),
             buy_budget: (side == crate::copytrading::execute::Side::Buy).then(|| Decimal::from(55)),
             buy_shares_exact: false,
+        maker_only: false,
         }
     }
 

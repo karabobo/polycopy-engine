@@ -19,6 +19,7 @@ fn production_buy(budget: Decimal) -> SizedDecision {
         limit_price: Decimal::new(58, 2),
         buy_budget: Some(budget),
         buy_shares_exact: false,
+    maker_only: false,
     }
 }
 
@@ -32,6 +33,7 @@ fn fixed_share_production_buy_uses_a_taker_share_amount() {
         limit_price: Decimal::new(58, 2),
         buy_budget: Some(Decimal::new(290, 2)),
         buy_shares_exact: true,
+    maker_only: false,
     };
 
     assert_eq!(
@@ -50,6 +52,7 @@ fn fixed_share_buy_refuses_a_non_cent_maker_amount_before_signing() {
         limit_price: Decimal::new(58, 2),
         buy_budget: Some(Decimal::new(99, 2)),
         buy_shares_exact: true,
+    maker_only: false,
     };
 
     let error = prepare::construction_amount(&decision)
@@ -108,6 +111,7 @@ fn sell_canary_and_production_keep_share_amounts() {
         limit_price: Decimal::new(58, 2),
         buy_budget: None,
         buy_shares_exact: false,
+    maker_only: false,
     };
 
     let expected = ClobOrderAmount::SellMakerShares(Decimal::new(17241, 4));
