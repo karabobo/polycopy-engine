@@ -3330,6 +3330,85 @@ async fn an_explicit_fak_no_match_does_not_submit_a_best_ask_retry() {
     assert!(retry.buy_shares_exact);
 }
 
+async fn set_ratio_retry_policy(db: &TestDb, intent_id: i64, flat_shares: Option<&str>) {
+    let raw: String =
+        sqlx::query_scalar("SELECT config_snapshot_json FROM copy_intents WHERE id = ?")
+            .bind(intent_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let mut policy: PolicySnapshot = serde_json::from_str(&raw).unwrap();
+    policy.size_ratio = Some("0.2".to_owned());
+    policy.max_order_shares = flat_shares.map(str::to_owned);
+    sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
+        .bind(serde_json::to_string(&policy).unwrap())
+        .bind(intent_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE leader_events SET size = '75' WHERE id = (SELECT event_id FROM copy_intents WHERE id = ?)")
+        .bind(intent_id).execute(&db.pool).await.unwrap();
+}
+
+async fn assert_ratio_fak_fallback(db: &TestDb, intent_id: i64) {
+    let venue = FakeVenue::no_fak_then_fill(Decimal::new(15, 0));
+    let outcome = execute_one_intent(
+        db,
+        &FixedBalance(Decimal::new(100, 0)),
+        &venue,
+        &venue,
+        &EmptyHistory,
+        intent_id,
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, OrchestrateOutcome::Resting);
+    let planned_qty: String =
+        sqlx::query_scalar("SELECT planned_qty FROM copy_intents WHERE id = ?")
+            .bind(intent_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(planned_qty, "15");
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT status, envelope_json FROM order_attempts WHERE intent_id = ? ORDER BY attempt_number",
+    ).bind(intent_id).fetch_all(&db.pool).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "one rejected FAK followed by one resting GTD"
+    );
+    assert_eq!(rows[0].0, "rejected");
+    let gtd: PreparedOrderEnvelope = serde_json::from_str(&rows[1].1).unwrap();
+    assert_eq!(gtd.order_type, "GTD");
+    assert_eq!(
+        gtd.size, "15",
+        "fallback must retain the persisted share decision"
+    );
+    assert!(gtd.buy_shares_exact);
+}
+
+#[tokio::test]
+async fn ratio_only_buy_keeps_persisted_shares_after_fak_no_match() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+    set_ratio_retry_policy(&db, intent_id, None).await;
+    assert_ratio_fak_fallback(&db, intent_id).await;
+}
+
+#[tokio::test]
+async fn ratio_wins_over_different_flat_target_after_fak_no_match() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+    set_ratio_retry_policy(&db, intent_id, Some("5")).await;
+    assert_ratio_fak_fallback(&db, intent_id).await;
+}
+
 /// The per-Leader budget exists so one Leader running dry does not stop the
 /// others. That only holds if the runner's own path turns the error into a
 /// skipped signal; the variant was introduced with a comment saying the

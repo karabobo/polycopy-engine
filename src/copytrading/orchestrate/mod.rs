@@ -782,7 +782,6 @@ where
         let receipt = OrderReceipt::new(requested, requested, state.size_matched, Decimal::ZERO)
             .map_err(|error| OrchestrateError::Receipt(error.to_string()))?;
         finalize_receipt(pool, intent_id, attempt.id, &receipt).await?;
-        mark_attempt_finalized(pool, intent_id, attempt.id).await?;
         return Ok(OrchestrateOutcome::Filled {
             filled_qty: state.size_matched,
         });
@@ -1179,7 +1178,6 @@ where
                 return Ok(OrchestrateOutcome::Resting);
             }
             finalize_receipt(pool, intent_id, attempt.id, &receipt).await?;
-            mark_attempt_finalized(pool, intent_id, attempt.id).await?;
             Ok(OrchestrateOutcome::Filled {
                 filled_qty: receipt.filled_qty(),
             })
@@ -1277,9 +1275,7 @@ where
                     ));
                 }
             };
-            mark_attempt_accepted(pool, intent_id, attempt.id).await?;
             finalize_receipt(pool, intent_id, attempt.id, &receipt).await?;
-            mark_attempt_finalized(pool, intent_id, attempt.id).await?;
             Ok(OrchestrateOutcome::Filled {
                 filled_qty: receipt.filled_qty(),
             })
@@ -1318,7 +1314,6 @@ where
     };
     if let Some(receipt) = receipt {
         finalize_receipt(pool, intent_id, attempt.id, &receipt).await?;
-        mark_attempt_finalized(pool, intent_id, attempt.id).await?;
         return Ok(OrchestrateOutcome::Filled {
             filled_qty: receipt.filled_qty(),
         });
@@ -1465,24 +1460,6 @@ async fn mark_attempt_accepted(
             ReconcileError::InvalidAttemptTransition,
         ));
     }
-    Ok(())
-}
-
-async fn mark_attempt_finalized(
-    pool: &SqlitePool,
-    intent_id: i64,
-    attempt_id: i64,
-) -> Result<(), OrchestrateError> {
-    sqlx::query(
-        "UPDATE order_attempts SET status = 'finalized', \
-         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-         WHERE id = ? AND intent_id = ? AND status IN ('accepted', 'finalized', 'submitting')",
-    )
-    .bind(attempt_id)
-    .bind(intent_id)
-    .execute(pool)
-    .await
-    .map_err(|error| OrchestrateError::Execute(ExecuteError::Database(error.to_string())))?;
     Ok(())
 }
 

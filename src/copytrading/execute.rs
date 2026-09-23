@@ -648,23 +648,36 @@ pub async fn reprice_fixed_share_buy_after_no_fak<B: StrictAccountBalanceReader>
         return Ok(SizingOutcome::Rejected("no-FAK best-ask retry is BUY-only"));
     }
     let policy = load_policy_snapshot(pool, claimed.intent_id).await?;
-    let Some(raw_target) = policy.max_order_shares.as_deref() else {
+    if policy.size_ratio.is_none() && policy.max_order_shares.is_none() {
         return Ok(SizingOutcome::Rejected(
-            "no-FAK best-ask retry requires a fixed-share policy",
+            "no-FAK maker fallback requires a shares-pinned policy",
         ));
-    };
-    let target_qty: Decimal = raw_target
-        .parse()
-        .map_err(|_| ExecuteError::InvalidDecimal("leader_policy.max_order_shares"))?;
+    }
     let Some((qty, _, _)) = claimed.existing_decision else {
         return Ok(SizingOutcome::NeedsReconcile(
             "no-FAK retry is missing its persisted fixed-share decision",
         ));
     };
-    if qty != target_qty {
+    if qty <= Decimal::ZERO {
         return Ok(SizingOutcome::NeedsReconcile(
-            "persisted quantity differs from fixed-share policy snapshot",
+            "persisted share quantity is non-positive",
         ));
+    }
+    // A proportional BUY is also shares-pinned. Its original target was
+    // derived from the event once and persisted; never recalculate it here or
+    // compare it with the lower-priority flat-share field.
+    if policy.size_ratio.is_none() {
+        let target_qty: Decimal = policy
+            .max_order_shares
+            .as_deref()
+            .expect("checked above")
+            .parse()
+            .map_err(|_| ExecuteError::InvalidDecimal("leader_policy.max_order_shares"))?;
+        if qty != target_qty {
+            return Ok(SizingOutcome::NeedsReconcile(
+                "persisted quantity differs from fixed-share policy snapshot",
+            ));
+        }
     }
     if sweep_limit_price <= Decimal::ZERO || sweep_limit_price >= Decimal::ONE {
         return Ok(SizingOutcome::Rejected(
@@ -1255,7 +1268,7 @@ async fn record_attempt(
 
 /// Applies only the *newly confirmed* fill delta to `position_lots`,
 /// updates `accounted_filled_qty`, releases the reservation, and finalizes
-/// the intent -- in one short transaction. Idempotent: replaying the same
+/// the intent and attempt in one short transaction. Idempotent: replaying the same
 /// receipt (including after a crash between the external response and this
 /// commit) leaves the lot unchanged on the second pass, because the delta
 /// is computed against the already-accounted amount, not applied blindly.
@@ -1265,12 +1278,43 @@ pub async fn finalize_receipt(
     attempt_id: i64,
     receipt: &OrderReceipt,
 ) -> Result<(), ExecuteError> {
+    finalize_receipt_transaction(pool, intent_id, attempt_id, receipt, false).await
+}
+
+async fn finalize_receipt_transaction(
+    pool: &SqlitePool,
+    intent_id: i64,
+    attempt_id: i64,
+    receipt: &OrderReceipt,
+    fail_before_commit: bool,
+) -> Result<(), ExecuteError> {
     let mut tx = pool
         .begin()
         .await
         .map_err(|error| ExecuteError::Database(error.to_string()))?;
 
     finalize_receipt_with_conn(&mut tx, intent_id, attempt_id, receipt).await?;
+
+    let updated = sqlx::query(
+        "UPDATE order_attempts SET status = 'finalized', \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE id = ? AND intent_id = ? AND status IN ('accepted', 'finalized', 'submitting', 'uncertain')",
+    )
+    .bind(attempt_id)
+    .bind(intent_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| ExecuteError::Database(error.to_string()))?;
+    if updated.rows_affected() != 1 {
+        return Err(ExecuteError::Database(
+            "attempt cannot be finalized from its current state".to_owned(),
+        ));
+    }
+    if fail_before_commit {
+        return Err(ExecuteError::Database(
+            "injected pre-commit failure".to_owned(),
+        ));
+    }
 
     tx.commit()
         .await
@@ -2488,12 +2532,33 @@ mod tests {
         let budget = decision.buy_budget.expect("BUY decision has a budget");
         let receipt = OrderReceipt::from_fak_buy_budget(budget, budget, decision.qty).unwrap();
         let attempt_id = record_attempt(&db, &decision, 1, &receipt).await.unwrap();
+        sqlx::query("UPDATE order_attempts SET status = 'accepted' WHERE id = ?")
+            .bind(attempt_id)
+            .execute(&*db)
+            .await
+            .unwrap();
 
         // First pass: applies the fill.
         finalize_receipt(&db, intent, attempt_id, &receipt)
             .await
             .unwrap();
         assert_eq!(lot_qty(&db, 1, "123456").await, Decimal::new(5, 0));
+        let first: (String, String, String, Option<String>) = sqlx::query_as(
+            "SELECT status, reserved_qty, planned_qty, rejection_reason FROM copy_intents WHERE id = ?",
+        ).bind(intent).fetch_one(&*db).await.unwrap();
+        assert_eq!(first.0, "completed");
+        assert_eq!(first.1, "0");
+        assert_eq!(first.2, decision.qty.to_string());
+        let attempt_after_first: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT status, accounted_filled_qty, receipt_json FROM order_attempts WHERE id = ?",
+        )
+        .bind(attempt_id)
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        assert_eq!(attempt_after_first.0, "finalized");
+        assert_eq!(attempt_after_first.1, "5");
+        assert!(attempt_after_first.2.is_some());
 
         // Second pass over the identical receipt (as if the process crashed
         // between the venue response and the first commit, and this is a
@@ -2506,6 +2571,59 @@ mod tests {
             Decimal::new(5, 0),
             "a replayed receipt must not double-apply"
         );
+        let attempt_after_replay: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT status, accounted_filled_qty, receipt_json FROM order_attempts WHERE id = ?",
+        )
+        .bind(attempt_id)
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        assert_eq!(attempt_after_replay, attempt_after_first);
+    }
+
+    #[tokio::test]
+    async fn confirmed_fill_failure_before_commit_rolls_back_every_durable_effect() {
+        let db = TestDb::new().await;
+        seed_account_and_schedule(&db).await;
+        seed_leader(&db, 1).await;
+        let intent = seed_pending_intent(&db, 1, "123456", "BUY", "5", "0.50").await;
+        let claimed = claim_or_resume_intent(&db, intent).await.unwrap().unwrap();
+        let balance_reader = FixedBalanceReader::new(Decimal::ZERO, Decimal::new(100, 0));
+        let SizingOutcome::Decision(decision) = size_and_reserve(&db, &balance_reader, &claimed)
+            .await
+            .unwrap()
+        else {
+            panic!("must size successfully");
+        };
+        let budget = decision.buy_budget.unwrap();
+        let receipt = OrderReceipt::from_fak_buy_budget(budget, budget, decision.qty).unwrap();
+        let attempt_id = record_attempt(&db, &decision, 1, &receipt).await.unwrap();
+        sqlx::query("UPDATE order_attempts SET status = 'accepted' WHERE id = ?")
+            .bind(attempt_id)
+            .execute(&*db)
+            .await
+            .unwrap();
+
+        let error = finalize_receipt_transaction(&db, intent, attempt_id, &receipt, true)
+            .await
+            .expect_err("injected pre-commit failure");
+        assert!(error.to_string().contains("injected pre-commit failure"));
+        assert_eq!(lot_qty(&db, 1, "123456").await, Decimal::ZERO);
+        let state: (String, String) =
+            sqlx::query_as("SELECT status, reserved_qty FROM copy_intents WHERE id = ?")
+                .bind(intent)
+                .fetch_one(&*db)
+                .await
+                .unwrap();
+        assert_eq!(state, ("in_progress".to_owned(), decision.qty.to_string()));
+        let attempt: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT status, accounted_filled_qty, receipt_json FROM order_attempts WHERE id = ?",
+        )
+        .bind(attempt_id)
+        .fetch_one(&*db)
+        .await
+        .unwrap();
+        assert_eq!(attempt, ("accepted".to_owned(), "0".to_owned(), None));
     }
 
     #[tokio::test]

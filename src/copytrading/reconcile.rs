@@ -2824,24 +2824,18 @@ mod tests {
             .get(0);
         assert_eq!(lot_count, 1, "exactly one lot row, never a duplicate");
 
-        // "No unsafe resubmission": if the recovery walk (or its caller)
-        // runs a second time -- e.g. the orchestrator retries after another
-        // restart -- neither recovery nor finalize may double anything.
-        let second_outcome = recover_lost_submission_response(
-            &db,
-            &reader,
-            intent_id,
-            attempt_id,
-            trade_history_window().before(),
-        )
-        .await
-        .expect("re-running recovery on an already-recovered attempt must not error");
+        // The finalized attempt is terminal; replay only the confirmed
+        // receipt transaction, which must not apply a second lot delta.
+        let attempt_status: String = sqlx::query_scalar("SELECT status FROM order_attempts WHERE id = ?")
+            .bind(attempt_id)
+            .fetch_one(&*db)
+            .await
+            .unwrap();
+        assert_eq!(attempt_status, "finalized");
         assert_eq!(
-            second_outcome,
-            LostSubmissionRecoveryOutcome::Recovered {
-                order_id: OrderId("order-a".to_owned())
-            },
-            "recovery is idempotent: it reports the same already-recorded ID, not a fresh submission"
+            permitted_recovery_action(&attempt_status, true, 1),
+            RecoveryAction::ReconcileOrFinalize,
+            "a finalized attempt must never enter the submit-again arm"
         );
         crate::copytrading::execute::finalize_receipt(&db, intent_id, attempt_id, &receipt)
             .await
