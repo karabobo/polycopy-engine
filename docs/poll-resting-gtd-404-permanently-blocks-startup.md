@@ -171,11 +171,18 @@ held, until one of:
    manually resolves the case through whatever tooling fits that finding.
 
 **Do not resume the persistent service on the premise that `Part 2 +
-reconcile-uncertain` closes this out.** It does not, today. Whether to
-build (1) now, as part of this same fix, or to ship Part 1 alone and
-treat determining attempt 537's fate as an explicit, separately-tracked
-follow-up, is a real scope decision -- not something to default into
-either direction silently.
+reconcile-uncertain` closes this out.** It does not, today.
+
+**Decision (2026-09-23, account owner): ship Part 1 alone now; track
+building a GTD-maker-aware strict trade-history matcher as a separate,
+later follow-up, not part of this fix.** Consequence, explicit: after
+this deploys and the service is running again, intent 723 / attempt 537
+stays in `needs_reconcile` with its reservation held until that follow-up
+lands (or the account owner determines the order's true state through
+some other channel and it gets resolved manually). This is a deliberate,
+acknowledged tradeoff, not an oversight -- do not "helpfully" build (1)
+later without checking whether it's still wanted, and do not let this
+gap block deploying Part 1, which is what actually stops the crash loop.
 
 ## Verification
 
