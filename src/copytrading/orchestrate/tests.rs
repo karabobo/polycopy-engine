@@ -472,8 +472,13 @@ impl EnvelopeFactory for FakeVenue {
 
     fn market_spec_for_gtd<'a>(
         &'a self,
-        _condition_id: &'a str,
+        condition_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<GtdMarketSpec, String>> + Send + 'a>> {
+        // The fixture deliberately uses a hex-shaped condition id (`0xcond`)
+        // and a decimal token id (`123456`). This assertion makes every
+        // maker-only test a regression test for looking up GTD market data by
+        // condition id rather than outcome token id.
+        assert_eq!(condition_id, "0xcond", "GTD market lookup must use condition_id");
         Box::pin(async {
             Ok(GtdMarketSpec {
                 expires_at: Utc::now() + chrono::Duration::minutes(5),

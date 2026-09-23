@@ -377,14 +377,16 @@ where
 /// design choice).
 ///
 /// Same shape in both call sites (fresh intent path and `prepare_new_attempt`'s
-/// resume path): they pass the relevant `decision` and get back the prepared
-/// envelope (and the persisted attempt row). Reusing one helper rather than
+/// resume path): they pass the intent's `condition_id` and the relevant
+/// `decision`, then get back the prepared envelope (and the persisted attempt
+/// row). Reusing one helper rather than
 /// duplicating keeps the fail-closed guarantees in one place -- a future
 /// edit can't accidentally drop the best-ask fetch from one path and not
 /// the other. The caller owns the post-failure `reject_pre_submit_intent`
 /// call so the same intent-state guarantee applies on both code paths.
 async fn prepare_maker_only_envelope<F>(
     envelopes: &F,
+    condition_id: &str,
     decision: &SizedDecision,
     now: DateTime<Utc>,
 ) -> Result<MakerOnlyEnvelope, MakerOnlyError>
@@ -392,7 +394,7 @@ where
     F: EnvelopeFactory,
 {
     let market = envelopes
-        .market_spec_for_gtd(&decision.token_id)
+        .market_spec_for_gtd(condition_id)
         .await
         .map_err(MakerOnlyError::MarketSpec)?;
     if market.expires_at <= now {
@@ -508,7 +510,7 @@ where
     };
 
     let envelope = if decision.maker_only {
-        match prepare_maker_only_envelope(envelopes, &decision, now).await {
+        match prepare_maker_only_envelope(envelopes, &claimed.condition_id, &decision, now).await {
             Ok(maker) => {
                 let attempt_number = next_attempt_number(pool, intent_id).await?;
                 load_or_prepare_attempt(pool, intent_id, attempt_number, &maker.envelope)
@@ -1031,7 +1033,7 @@ where
         // condition or, worse, race the deadline by the few hundred
         // microseconds between resume and prepare. The fresh-path check
         // stands; this resume path inherits it.
-        match prepare_maker_only_envelope(envelopes, &decision, now).await {
+        match prepare_maker_only_envelope(envelopes, &claimed.condition_id, &decision, now).await {
             Ok(maker) => {
                 let attempt_number = next_attempt_number(pool, claimed.intent_id).await?;
                 load_or_prepare_attempt(
