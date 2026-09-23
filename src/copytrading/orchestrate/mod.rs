@@ -404,17 +404,14 @@ where
         .fetch_best_ask_for_maker_only(&decision.token_id)
         .await
         .map_err(MakerOnlyError::BestAsk)?;
-    // Account owner instruction (2026-09-23): use the exact best_ask,
-    // do NOT subtract a tick. This deviates from
-    // docs/leader2-strategy-redesign-handoff.md Change 4's
-    // ship-side empirical check; if post-deploy monitoring shows
-    // post-only rejections due to crossing, the next commit switches to
-    // best_ask - tick_size with the venue-side evidence documented.
-    let maker_price = if best_ask < decision.limit_price {
-        best_ask
-    } else {
-        decision.limit_price
-    };
+    // Per docs/maker-only-post-only-crosses-book-bug.md Fix section:
+    // venue evidence (5/5 attempts for intent 721) confirms a post-only BUY
+    // priced exactly at best_ask is rejected as "crosses book" unconditionally.
+    // Use std::cmp::min to guarantee the price is strictly below best_ask
+    // by at least one tick, in both the leader-price-better and market-better
+    // cases. Deviation from the 2026-09-23 literal instruction ("用 best ask
+    // 价格") is justified by direct venue evidence.
+    let maker_price = std::cmp::min(decision.limit_price, best_ask - market.tick_size);
     let mut priced_decision = decision.clone();
     priced_decision.limit_price = maker_price;
     let envelope = envelopes

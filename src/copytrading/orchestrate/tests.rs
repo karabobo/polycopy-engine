@@ -1227,57 +1227,42 @@ async fn a_maker_only_buy_skips_the_fak_path_on_the_fresh_intent_path() {
 
 #[tokio::test]
 async fn a_maker_only_buy_uses_min_of_leader_price_and_real_time_best_ask() {
-    // Pin the selection logic in three branches of `min(decision.limit_price, best_ask)`:
-    //   * best_ask < limit_price  -> GTD at best_ask (more favorable)
-    //   * best_ask > limit_price  -> GTD at limit_price (unchanged)
-    //   * best_ask == limit_price -> GTD at limit_price (unchanged)
+    // Pin the selection logic in three branches of
+    // `min(decision.limit_price, best_ask - tick_size)`:
+    //   * best_ask < limit_price  -> GTD at best_ask - tick_size (strictly below ask)
+    //   * best_ask > limit_price  -> GTD at limit_price (leader ceiling, unchanged)
+    //   * best_ask == limit_price -> GTD at best_ask - tick_size (the old else-branch
+    //                                  gap; closed by the subtraction, which is the whole
+    //                                  point of the fix in
+    //                                  docs/maker-only-post-only-crosses-book-bug.md)
     //
     // Each branch uses a separately seeded best_ask_override and
     // asserts the persisted envelope.price matches the expected
-    // selection. The leader_price is hard-coded into the seeded event
-    // via `seed_pending_buy` (which uses `0.55`), but execute.rs reads
-    // the policy's price_tolerance and applies it via
-    // `market_spec_for_gtd.tick_size` (0.01). To make the limit_price
-    // deterministic, the snapshot uses price_tolerance_bps=0 and
-    // min_price=0.01, max_price=0.99; the seeded event_price from
-    // `seed_pending_buy` is whatever `seed_pending_buy` sets (typically
-    // 0.55). The min(...) pick is computed from that ceiling.
+    // selection. The leader event_price is `0.55`
+    // (`seed_pending_buy_with_event_key`); with price_tolerance_bps=0 the
+    // decision.limit_price equals `round_price(0.55, 0.01, BUY) = 0.55`.
+    // The boundary tests below pin precise numeric values without
+    // depending on apply_tolerance internals.
     //
-    // Rather than chasing the exact ceiling (which depends on
-    // apply_tolerance), assert that the maker-only envelope's price is
-    // MIN(best_ask, persisted_decision.limit_price) by checking that
-    // the persisted envelope.price is either equal to best_ask (when
-    // best_ask < limit_price) or less than or equal to best_ask (when
-    // best_ask >= limit_price). The boundary test below pins the exact
-    // value when best_ask is below the ceiling.
+    // The formula is intentionally `best_ask - tick_size` rather than the
+    // pre-fix `best_ask`: venue evidence (5/5 attempts for intent 721)
+    // confirmed that a post-only BUY priced exactly at best_ask is rejected
+    // as "crosses book" unconditionally. The subtraction guarantees strict
+    // sub-ask pricing in all three branches simultaneously.
     let db = TestDb::new().await;
     seed_account_and_schedule(&db).await;
     seed_leader(&db, 1).await;
 
-    // Branches 2 and 3 first (best_ask >= limit_price -> envelope.price
-    // is unchanged from the leader-derived ceiling).
-    for (best_ask_label, best_ask, expect_max) in [
-        ("best_ask above limit", Decimal::new(60, 2), Decimal::new(60, 2)),
-        ("best_ask at limit (best_ask == limit_price)", Decimal::ZERO, Decimal::ZERO),
-    ] {
-        let intent_id = seed_pending_buy_with_event_key(
-            &db,
-            &format!("activity:maker-only:{best_ask_label}"),
-        )
-        .await;
+    // "best_ask > limit_price" branch: the leader ceiling wins unchanged.
+    {
+        let intent_id =
+            seed_pending_buy_with_event_key(&db, "activity:maker-only:best_ask-above-limit")
+                .await;
         set_maker_only_policy(&db, intent_id).await;
         let venue = FakeVenue::succeeding(Decimal::new(5, 0));
-        *venue.best_ask_override.lock().unwrap() = Some(Ok(best_ask));
-        // For the == case, we need best_ask == limit_price. We don't
-        // know the exact limit_price without inspecting apply_tolerance's
-        // output, so this branch is intentionally tested by the "below
-        // limit" branch instead (see boundary assertion below). Skip
-        // when best_ask is ZERO because that signals "== test, see
-        // boundary below".
-        if best_ask == Decimal::ZERO {
-            continue;
-        }
-
+        // 0.60 is strictly above the leader's limit_price of 0.55, so
+        // min(0.55, 0.60 - 0.01) = 0.55 (limit_price wins).
+        *venue.best_ask_override.lock().unwrap() = Some(Ok(Decimal::new(60, 2)));
         let _ = execute_one_intent(
             &db,
             &FixedBalance(Decimal::new(100, 0)),
@@ -1289,26 +1274,59 @@ async fn a_maker_only_buy_uses_min_of_leader_price_and_real_time_best_ask() {
         )
         .await
         .expect("execution must succeed");
-        // best_ask above limit means: the maker-only selection picked
-        // limit_price (the leader-derived ceiling). The structural
-        // "GTD + post_only" check below covers this branch.
-        let _ = expect_max;
+        // Structural GTD + post_only check covers this branch.
     }
 
-    // Boundary branch 1: best_ask strictly below the persisted ceiling.
-    // Assert the GTD envelope's price equals best_ask exactly. This is
-    // the only branch where the test can pin a precise numeric value
-    // without going through apply_tolerance.
+    // "best_ask == limit_price" branch: the subtraction closes the gap that
+    // the pre-fix `else` branch left open. With event_price=0.55 and
+    // tolerance=0, limit_price=0.55 exactly. Set best_ask to the same value
+    // and verify the result is 0.54 (best_ask - tick_size), not 0.55.
+    {
+        let intent_id =
+            seed_pending_buy_with_event_key(&db, "activity:maker-only:best_ask-equals-limit")
+                .await;
+        set_maker_only_policy(&db, intent_id).await;
+        let venue = FakeVenue::succeeding(Decimal::new(5, 0));
+        *venue.best_ask_override.lock().unwrap() = Some(Ok(Decimal::new(55, 2)));
+        let _ = execute_one_intent(
+            &db,
+            &FixedBalance(Decimal::new(100, 0)),
+            &venue,
+            &venue,
+            &EmptyHistory,
+            intent_id,
+            Utc::now(),
+        )
+        .await
+        .expect("execution must succeed");
+        let envelope_json: String = sqlx::query_scalar(
+            "SELECT envelope_json FROM order_attempts WHERE intent_id = ?",
+        )
+        .bind(intent_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("envelope json");
+        let envelope: serde_json::Value =
+            serde_json::from_str(&envelope_json).expect("envelope must be JSON");
+        let price: String = envelope
+            .get("price")
+            .and_then(|v| v.as_str())
+            .expect("envelope.price")
+            .to_owned();
+        assert_eq!(
+            price, "0.54",
+            "best_ask == limit_price must price at best_ask - tick_size (0.54), not 0.55",
+        );
+    }
+
+    // "best_ask < limit_price" branch: best_ask - tick_size wins.
+    // Assert the GTD envelope's price equals best_ask - tick_size (0.09).
+    // best_ask=0.10 is well below any plausible limit_price (0.55), and
+    // tick_size=0.01 is deterministic in the fixture, so the expected
+    // result is exactly 0.09.
     let intent_id = seed_pending_buy_with_event_key(&db, "activity:maker-only:below").await;
     set_maker_only_policy(&db, intent_id).await;
     let venue = FakeVenue::succeeding(Decimal::new(5, 0));
-    // Pick a best_ask strictly below any plausible leader-derived
-    // ceiling. The seeded event_price in seed_pending_buy_with_event_key
-    // flows through apply_tolerance (which is 0 here, so the ceiling
-    // equals the event_price). Using a leader event with a low price
-    // is simpler, but we don't have a hook for that -- so we set
-    // best_ask very low (0.10) which is below ANY ceiling the policy
-    // could compute.
     *venue.best_ask_override.lock().unwrap() = Some(Ok(Decimal::new(10, 2)));
     let _ = execute_one_intent(
         &db,
@@ -1356,8 +1374,8 @@ async fn a_maker_only_buy_uses_min_of_leader_price_and_real_time_best_ask() {
         "maker_only must persist post_only=true (post-only is the price-protection contract)",
     );
     assert_eq!(
-        price, "0.10",
-        "best_ask strictly below the ceiling must be selected (min(leader_price, best_ask))",
+        price, "0.09",
+        "best_ask strictly below limit_price must yield best_ask - tick_size",
     );
     assert!(
         envelope.get("expires_at").is_some(),
