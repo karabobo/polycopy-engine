@@ -37,17 +37,6 @@ execute = [
     "tokio/rt-multi-thread",
     "tokio/time",
 ]
-# Independent of both `ingest` (leader-activity ingestion) and `execute`
-# (the copy-order lifecycle): this only reads the account's own row, polls
-# Polymarket's read-only positions endpoint, and reads position_lots. No
-# signer, no order adapter, nothing from intl_clob anywhere in its import
-# graph -- see redemption.rs's module doc.
-redeem_detect = [
-    "db",
-    "dep:polymarket_client_sdk_v2",
-    "polymarket_client_sdk_v2/data",
-    "dep:rustls",
-]
 copy_run = [
     "execute",
     "ingest",
@@ -56,7 +45,7 @@ copy_run = [
 # solely for the same derive-only-authenticated balance read every other
 # operator tool already does (see persistent_control/ghost_verify) -- the
 # binary itself never imports orchestrate/reconcile/execute_intent, but
-# unlike redeem_detect/ingest this cannot be architecturally proven at the
+# unlike ingest this cannot be architecturally proven at the
 # feature-gate level, since `execute` is on regardless.
 dashboard = [
     "execute",
@@ -124,11 +113,6 @@ path = "src/bin/lock_probe.rs"
 name = "persistent_control"
 path = "src/bin/persistent_control.rs"
 required-features = ["execute"]
-
-[[bin]]
-name = "redeem_check"
-path = "src/bin/redeem_check.rs"
-required-features = ["redeem_detect"]
 
 [dependencies]
 # Version pinned to the same requirement polymarket_client_sdk_v2 itself

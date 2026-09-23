@@ -159,26 +159,23 @@ impl LogTailer {
 
 /// These must match the exact prefix constants each event's own emitting
 /// module defines (`WS_EVENT_PREFIX` in `ingest::activity_ws`,
-/// `OBSERVE_EVENT_PREFIX` in `ingest::latency_report`,
-/// `REDEMPTION_EVENT_PREFIX` in `redemption`, `CONFIG_APPLIED_PREFIX` in
-/// `setup`). Duplicated as plain strings, rather than importing those
+/// `OBSERVE_EVENT_PREFIX` in `ingest::latency_report`, `CONFIG_APPLIED_PREFIX`
+/// in `setup`). Duplicated as plain strings, rather than importing those
 /// constants, on purpose: the dashboard's whole point is to stay a
 /// lightweight passive viewer, and importing them would drag in `ingest`
-/// (the WebSocket/backfill stack) and `redeem_detect` as compile-time
-/// dependencies of a binary that only ever reads a text file.
+/// (the WebSocket/backfill stack) as a compile-time dependency of a binary
+/// that only ever reads a text file.
 /// `GHOST_RECORD_PREFIX` is the one exception: `dashboard` already
 /// requires `execute`, which already implies `intl_clob`, which already
 /// carries `crate::ghost_drift` -- importing it there costs nothing new.
 const WS_EVENT_PREFIX: &str = "WS_EVENT: ";
 const OBSERVE_EVENT_PREFIX: &str = "OBSERVE_EVENT: ";
-const REDEMPTION_EVENT_PREFIX: &str = "REDEMPTION_EVENT: ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLineKind {
     Ghost,
     Ws,
     Observe,
-    Redemption,
     ConfigApplied,
     Plain,
 }
@@ -190,8 +187,6 @@ pub fn classify_log_line(line: &str) -> LogLineKind {
         LogLineKind::Ws
     } else if line.starts_with(OBSERVE_EVENT_PREFIX) {
         LogLineKind::Observe
-    } else if line.starts_with(REDEMPTION_EVENT_PREFIX) {
-        LogLineKind::Redemption
     } else if line.starts_with(super::setup::CONFIG_APPLIED_PREFIX) {
         LogLineKind::ConfigApplied
     } else {
@@ -352,7 +347,6 @@ pub fn draw_ui(frame: &mut Frame, state: &AppState) {
                 LogLineKind::Ghost => Style::default().fg(Color::Cyan),
                 LogLineKind::Ws => Style::default().fg(Color::Blue),
                 LogLineKind::Observe => Style::default().fg(Color::Magenta),
-                LogLineKind::Redemption => Style::default().fg(Color::Green),
                 LogLineKind::ConfigApplied => Style::default().fg(Color::Yellow),
                 LogLineKind::Plain => Style::default(),
             };
@@ -459,10 +453,6 @@ mod tests {
         assert_eq!(classify_log_line("GHOST_RECORD: {}"), LogLineKind::Ghost);
         assert_eq!(classify_log_line("WS_EVENT: {}"), LogLineKind::Ws);
         assert_eq!(classify_log_line("OBSERVE_EVENT: {}"), LogLineKind::Observe);
-        assert_eq!(
-            classify_log_line("REDEMPTION_EVENT: {}"),
-            LogLineKind::Redemption
-        );
         assert_eq!(
             classify_log_line("CONFIG_APPLIED: {}"),
             LogLineKind::ConfigApplied

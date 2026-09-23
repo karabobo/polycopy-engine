@@ -13,7 +13,7 @@
 //! redirected output into, the same way `ingest_latency_report` and
 //! `ghost_drift_report` do.
 //!
-//! Unlike `redeem_check`/`ingest_observe`, this binary cannot be kept
+//! Unlike `ingest_observe`, this binary cannot be kept
 //! architecturally independent of the `execute` feature (the balance read
 //! lives under `execute`+`intl_clob`, same as every other operator tool
 //! that reads a balance), so "no order capability" here is a source-level

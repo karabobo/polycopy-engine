@@ -30,9 +30,6 @@ pub mod reconcile;
 #[cfg(feature = "ingest")]
 pub mod ingest;
 
-#[cfg(feature = "redeem_detect")]
-pub mod redemption;
-
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
 
@@ -97,9 +94,4 @@ pub use persistent::{
     resume_fuse as resume_persistent_fuse, rolling_reserved_total,
     PersistentError, PersistentRuntimeConfig, PersistentSubmitMarker, EXIT_BUDGET_STATE,
     EXIT_CONFIG, EXIT_FUSE_OPEN, EXIT_LOCK_COLLISION, EXIT_UNRESOLVED_RECOVERY,
-};
-
-#[cfg(feature = "redeem_detect")]
-pub use redemption::{
-    detect_redeemable_positions, RedeemablePosition, RedemptionError, REDEMPTION_EVENT_PREFIX,
 };

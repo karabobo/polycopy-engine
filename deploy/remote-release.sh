@@ -100,8 +100,7 @@ git archive --format=tar "$commit" | "${ssh_args[@]}" "tar -x -C '$release_dir'"
     test -x target/release/persistent_control
     test -x target/release/lock_probe
     test -x target/release/ingest_observe
-    test -x target/release/ingest_latency_report
-    test -x target/release/redeem_check"
+    test -x target/release/ingest_latency_report"
 
 # A symlink replacement is atomic on the same filesystem. No running process
 # is restarted here, so making a release current cannot itself change venue
