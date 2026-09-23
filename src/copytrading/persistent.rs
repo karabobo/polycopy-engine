@@ -1025,6 +1025,53 @@ pub async fn resolve_exhausted_maker_only_crossing(
         }
     }
 }
+/// Close only the original strict lookup failure linked to this exact attempt.
+/// Call inside the same IMMEDIATE transaction that finalizes its operator
+/// resolution; an inspection alone must never make the account resumable.
+async fn resolve_linked_strict_query_failure(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    account_id: i64,
+    intent_id: i64,
+    attempt_id: i64,
+    now: &str,
+    resolution: &str,
+) -> Result<(), PersistentError> {
+    let cases: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM reconciliation_cases WHERE account_id = ? AND intent_id = ? \
+         AND order_attempt_id = ? AND case_type = 'strict_query_failure' \
+         AND resolved_at IS NULL ORDER BY id",
+    )
+    .bind(account_id)
+    .bind(intent_id)
+    .bind(attempt_id)
+    .fetch_all(&mut **conn)
+    .await
+    .map_err(db_err)?;
+    if cases.len() > 1 {
+        return Err(PersistentError::UnresolvedRecovery);
+    }
+    if let Some(case_id) = cases.first() {
+        let updated = sqlx::query(
+            "UPDATE reconciliation_cases SET resolved_at = ?, resolution = ? \
+             WHERE id = ? AND account_id = ? AND intent_id = ? AND order_attempt_id = ? \
+             AND case_type = 'strict_query_failure' AND resolved_at IS NULL",
+        )
+        .bind(now)
+        .bind(resolution)
+        .bind(case_id)
+        .bind(account_id)
+        .bind(intent_id)
+        .bind(attempt_id)
+        .execute(&mut **conn)
+        .await
+        .map_err(db_err)?;
+        if updated.rows_affected() != 1 {
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+    }
+    Ok(())
+}
+
 pub async fn resolve_operator_confirmed_no_fill(
     pool: &SqlitePool,
     account_id: i64,
@@ -1130,6 +1177,10 @@ pub async fn resolve_operator_confirmed_no_fill(
         if case.rows_affected() != 1 {
             return Err(PersistentError::UnresolvedRecovery);
         }
+        resolve_linked_strict_query_failure(
+            &mut conn, account_id, intent_id, attempt_id, &now, &resolution,
+        )
+        .await?;
         Ok(*case_id)
     }
     .await;
@@ -1207,10 +1258,10 @@ pub async fn restore_reservation_and_finalize_recovered_fill(
             return Err(PersistentError::UnresolvedRecovery);
         }
 
-        let cases: Vec<i64> = sqlx::query_scalar(
-            "SELECT id FROM reconciliation_cases WHERE account_id = ? AND intent_id = ? \
+        let cases: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT id, case_type FROM reconciliation_cases WHERE account_id = ? AND intent_id = ? \
              AND order_attempt_id = ? AND resolved_at IS NULL \
-             AND case_type IN ('local_submission_failure', 'unknown_submission') \
+             AND case_type IN ('local_submission_failure', 'unknown_submission', 'strict_query_failure') \
              ORDER BY id",
         )
         .bind(account_id)
@@ -1219,9 +1270,14 @@ pub async fn restore_reservation_and_finalize_recovered_fill(
         .fetch_all(&mut *conn)
         .await
         .map_err(db_err)?;
-        let [case_id] = cases.as_slice() else {
+        let primary: Vec<i64> = cases.iter().filter(|(_, kind)| kind != "strict_query_failure")
+            .map(|(id, _)| *id).collect();
+        let strict: Vec<i64> = cases.iter().filter(|(_, kind)| kind == "strict_query_failure")
+            .map(|(id, _)| *id).collect();
+        if primary.len() > 1 || strict.len() > 1 || (primary.is_empty() && strict.is_empty()) {
             return Err(PersistentError::UnresolvedRecovery);
-        };
+        }
+        let case_id = primary.first().or_else(|| strict.first()).expect("checked nonempty");
 
         let restored = sqlx::query(
             "UPDATE persistent_budget_reservations \
@@ -1282,6 +1338,10 @@ pub async fn restore_reservation_and_finalize_recovered_fill(
             eprintln!("recovered-fill recovery failed: reconciliation case did not close");
             return Err(PersistentError::UnresolvedRecovery);
         }
+        resolve_linked_strict_query_failure(
+            &mut conn, account_id, intent_id, attempt_id, &now, &resolution,
+        )
+        .await?;
         Ok(*case_id)
     }
     .await;
@@ -2342,7 +2402,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operator_confirmed_no_fill_atomically_closes_the_deadlock_and_allows_resume() {
+    async fn operator_confirmed_no_fill_closes_linked_cases_but_not_unrelated_cases() {
         let db = TestDb::new().await;
         seed_base(&db).await;
         let config = cfg();
@@ -2379,9 +2439,27 @@ mod tests {
         .execute(&db.pool)
         .await
         .expect("case");
+        sqlx::query(
+            "INSERT INTO reconciliation_cases (account_id, token_id, intent_id, order_attempt_id, case_type, detail) \
+             VALUES (1, '123456', ?, ?, 'strict_query_failure', 'order lookup failed')",
+        )
+        .bind(intent_id)
+        .bind(attempt_id)
+        .execute(&db.pool)
+        .await
+        .expect("original strict query failure case");
+        sqlx::query(
+            "INSERT INTO reconciliation_cases (account_id, token_id, intent_id, order_attempt_id, case_type, detail) \
+             VALUES (1, '123456', ?, NULL, 'strict_query_failure', 'unrelated account-level problem')",
+        )
+        .bind(intent_id)
+        .execute(&db.pool)
+        .await
+        .expect("unrelated case remains blocked");
         pause_fuse(&db, 1, "operator pause", "test")
             .await
             .expect("pause");
+        assert_eq!(resume_fuse(&db, 1, "too early").await, Err(PersistentError::UnresolvedRecovery));
 
         let case_id = resolve_operator_confirmed_no_fill(
             &db,
@@ -2425,10 +2503,38 @@ mod tests {
         .await
         .expect("resolved case");
         assert!(resolution.contains("reviewed authenticated history"));
-
-        resume_fuse(&db, 1, "recovery evidence reviewed")
-            .await
-            .expect("the resolved attempt must no longer deadlock resume");
+        let open_cases: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ? AND resolved_at IS NULL",
+        )
+        .bind(intent_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("only unrelated case remains open");
+        assert_eq!(open_cases, 1);
+        let linked_resolutions: Vec<(String, String)> = sqlx::query_as(
+            "SELECT case_type, resolution FROM reconciliation_cases \
+             WHERE order_attempt_id = ? AND resolved_at IS NOT NULL ORDER BY case_type",
+        )
+        .bind(attempt_id)
+        .fetch_all(&db.pool)
+        .await
+        .expect("linked case resolutions");
+        assert_eq!(linked_resolutions.len(), 2);
+        assert_eq!(linked_resolutions[0].0, "strict_query_failure");
+        assert!(linked_resolutions.iter().all(|(_, resolution)| resolution.contains("operator confirmed no fill")));
+        assert_eq!(
+            resume_fuse(&db, 1, "recovery evidence reviewed").await,
+            Err(PersistentError::UnresolvedRecovery),
+            "unrelated account-level cases must still block resume"
+        );
+        let linked_open: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reconciliation_cases WHERE order_attempt_id = ? AND resolved_at IS NULL",
+        )
+        .bind(attempt_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("attempt cases");
+        assert_eq!(linked_open, 0);
     }
 
     #[tokio::test]
@@ -2587,6 +2693,15 @@ mod tests {
         )
         .await
         .expect("misclassified local failure");
+        sqlx::query(
+            "INSERT INTO reconciliation_cases (account_id, token_id, intent_id, order_attempt_id, case_type, detail) \
+             VALUES (1, '123456', ?, ?, 'strict_query_failure', 'later lookup failed')",
+        )
+        .bind(intent_id)
+        .bind(attempt_id)
+        .execute(&db.pool)
+        .await
+        .expect("additional strict query failure case");
 
         restore_reservation_and_finalize_recovered_fill(
             &db,
@@ -2643,9 +2758,57 @@ mod tests {
         .await
         .expect("cases");
         assert_eq!(open_cases, 0);
+        let closed_cases: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ? AND resolved_at IS NOT NULL",
+        )
+        .bind(intent_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("both cases closed");
+        assert_eq!(closed_cases, 2);
         assert_startup_clear(&db, 1)
             .await
             .expect("startup must be clear after accounting the fill");
+    }
+
+    #[tokio::test]
+    async fn gtd_fill_with_only_strict_query_failure_case_can_finalize() {
+        let db = TestDb::new().await;
+        seed_base(&db).await;
+        let now = Utc::now();
+        let (intent_id, attempt_id) = seed_attempt(
+            &db, "gtd-strict-query-only", "1", now + chrono::Duration::seconds(60),
+        ).await;
+        let mut envelope: PreparedOrderEnvelope = serde_json::from_str(
+            &sqlx::query_scalar::<_, String>("SELECT envelope_json FROM order_attempts WHERE id = ?")
+                .bind(attempt_id).fetch_one(&db.pool).await.unwrap(),
+        ).unwrap();
+        envelope.order_type = "GTD".to_owned();
+        envelope.post_only = true;
+        envelope.buy_shares_exact = true;
+        envelope.price = "0.50".to_owned();
+        sqlx::query("UPDATE order_attempts SET envelope_json = ? WHERE id = ?")
+            .bind(serde_json::to_string(&envelope).unwrap()).bind(attempt_id)
+            .execute(&db.pool).await.unwrap();
+        reserve_budget_and_mark_submitting(&db, &cfg(), intent_id, attempt_id, now)
+            .await.expect("reserve");
+        sqlx::query("UPDATE order_attempts SET status = 'uncertain' WHERE id = ?")
+            .bind(attempt_id).execute(&db.pool).await.unwrap();
+        sqlx::query("UPDATE copy_intents SET status = 'needs_reconcile' WHERE id = ?")
+            .bind(intent_id).execute(&db.pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO reconciliation_cases (account_id, token_id, intent_id, order_attempt_id, case_type) \
+             VALUES (1, '123456', ?, ?, 'strict_query_failure')",
+        )
+        .bind(intent_id).bind(attempt_id).execute(&db.pool).await.unwrap();
+        restore_reservation_and_finalize_recovered_fill(
+            &db, 1, attempt_id, Decimal::ONE, Decimal::new(50, 2),
+        ).await.expect("GTD fill must be accounted with only the original case");
+        let open: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ? AND resolved_at IS NULL",
+        ).bind(intent_id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(open, 0);
+        assert_startup_clear(&db, 1).await.expect("no stale strict-query case");
     }
 
     #[test]

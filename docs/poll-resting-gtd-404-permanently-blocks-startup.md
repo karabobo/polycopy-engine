@@ -275,3 +275,18 @@ schema, plus one proving the `MissingVenueOrderId` fail-closed path.
 `cargo test --all-features --locked` and
 `cargo clippy --all-targets --all-features --locked -- -D warnings` both
 clean with this change included.
+
+## Follow-up: close the original lookup-failure case when resolving the attempt
+
+A successful `reconcile-uncertain` inspection alone does not resolve an
+attempt. The original attempt-linked `strict_query_failure` case stays open
+while the operator reviews a `NotFound` result. When the operator explicitly
+confirms no fill, the `unknown_submission` case and the original
+`strict_query_failure` case now close in the same transaction as rejecting
+the attempt and releasing its reservation. If a fill is found, the
+original case (and any linked recovered-fill case) closes in the same
+transaction as lot accounting and finalization. A failed accounting step rolls all of that
+back. Cases belonging to another attempt or lacking this attempt ID are
+never closed by these paths; `resume` remains subject to the account-wide
+`assert_startup_clear` gate. This follow-up has not been deployed or run
+against production.
