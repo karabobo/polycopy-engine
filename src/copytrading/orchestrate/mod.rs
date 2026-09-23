@@ -46,6 +46,7 @@ pub struct NoFakSweepQuote {
 pub struct GtdMarketSpec {
     pub expires_at: DateTime<Utc>,
     pub tick_size: Decimal,
+    pub minimum_order_size: Decimal,
 }
 
 /// Bounded resting lifetime for the post-only GTD maker retry. Deliberately
@@ -82,9 +83,13 @@ pub fn derive_gtd_market_spec(
     if market.minimum_tick_size <= Decimal::ZERO {
         return Err("market end lookup returned invalid minimum_tick_size".to_owned());
     }
+    if market.minimum_order_size <= Decimal::ZERO {
+        return Err("market lookup returned invalid minimum_order_size".to_owned());
+    }
     Ok(GtdMarketSpec {
         expires_at: now + GTD_MAKER_EXPIRY,
         tick_size: market.minimum_tick_size,
+        minimum_order_size: market.minimum_order_size,
     })
 }
 
@@ -394,12 +399,23 @@ async fn prepare_maker_only_envelope<F>(
 where
     F: EnvelopeFactory,
 {
+    if decision.qty <= Decimal::ZERO || decision.qty.normalize().scale() > 2 {
+        return Err(MakerOnlyError::Prepare(
+            "maker-only GTD requires a positive share quantity with at most two decimals".to_owned(),
+        ));
+    }
     let market = envelopes
         .market_spec_for_gtd(condition_id)
         .await
         .map_err(MakerOnlyError::MarketSpec)?;
     if market.expires_at <= now {
         return Err(MakerOnlyError::Expired);
+    }
+    if decision.qty < market.minimum_order_size {
+        return Err(MakerOnlyError::Prepare(format!(
+            "maker-only GTD size {} is below market minimum {} shares",
+            decision.qty, market.minimum_order_size,
+        )));
     }
     let best_ask = envelopes
         .fetch_best_ask_for_maker_only(&decision.token_id)
@@ -412,9 +428,18 @@ where
     // by at least one tick, in both the leader-price-better and market-better
     // cases. Deviation from the 2026-09-23 literal instruction ("用 best ask
     // 价格") is justified by direct venue evidence.
-    let maker_price = std::cmp::min(decision.limit_price, best_ask - market.tick_size);
+    let ceiling = std::cmp::min(decision.limit_price, best_ask - market.tick_size);
+    let maker_price = floor_to_valid_maker_price(ceiling, market.tick_size, decision.qty)
+        .map_err(|error| MakerOnlyError::Prepare(error.to_string()))?;
+    let exact_cost = (decision.qty * maker_price).normalize();
+    if decision.buy_budget.is_none_or(|reserved| exact_cost > reserved) {
+        return Err(MakerOnlyError::Prepare(
+            "maker-only GTD cost exceeds persisted buy budget".to_owned(),
+        ));
+    }
     let mut priced_decision = decision.clone();
     priced_decision.limit_price = maker_price;
+    priced_decision.buy_budget = Some(exact_cost);
     let envelope = envelopes
         .prepare_post_only_gtd_buy(&priced_decision, market.expires_at)
         .await
@@ -959,6 +984,14 @@ where
     if market.expires_at <= now {
         cancel_expired_intent(pool, claimed.intent_id).await?;
         return Ok(OrchestrateOutcome::Expired);
+    }
+    if target_qty < market.minimum_order_size {
+        reject_pre_submit_intent(
+            pool,
+            claimed.intent_id,
+            &format!("post-only GTD size {target_qty} is below market minimum {} shares", market.minimum_order_size),
+        ).await?;
+        return Ok(OrchestrateOutcome::Rejected);
     }
     let maker_price = floor_to_valid_maker_price(
         retry_claimed.leader_price,

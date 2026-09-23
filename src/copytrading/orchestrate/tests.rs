@@ -484,6 +484,7 @@ impl EnvelopeFactory for FakeVenue {
             Ok(GtdMarketSpec {
                 expires_at: Utc::now() + chrono::Duration::minutes(5),
                 tick_size: Decimal::new(1, 2),
+                minimum_order_size: Decimal::new(5, 0),
             })
         })
     }
@@ -1317,6 +1318,95 @@ async fn a_fixed_share_buy_accounts_a_venue_overfill_instead_of_local_failure() 
 // and resume paths, the best-ask selection logic across the
 // `best_ask < / > / == limit_price` cases, and the fail-closed path
 // when the best-ask fetch errors.
+
+#[tokio::test]
+async fn ratio_maker_only_keeps_two_decimal_shares_and_never_exceeds_reservation() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+    set_maker_only_policy(&db, intent_id).await;
+    let raw: String = sqlx::query_scalar("SELECT config_snapshot_json FROM copy_intents WHERE id = ?")
+        .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    let mut policy: PolicySnapshot = serde_json::from_str(&raw).unwrap();
+    policy.size_ratio = Some("0.2".to_owned());
+    policy.max_order_shares = None;
+    sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
+        .bind(serde_json::to_string(&policy).unwrap()).bind(intent_id)
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE leader_events SET size = '38.547059', price = '0.53' WHERE id = (SELECT event_id FROM copy_intents WHERE id = ?)")
+        .bind(intent_id).execute(&db.pool).await.unwrap();
+    let venue = FakeVenue::succeeding(Decimal::ZERO);
+    *venue.best_ask_override.lock().unwrap() = Some(Ok(Decimal::new(60, 2)));
+    let outcome = execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+        &venue, &venue, &EmptyHistory, intent_id, Utc::now()).await.unwrap();
+    assert_eq!(outcome, OrchestrateOutcome::Resting);
+    let (planned, reserved): (String, String) = sqlx::query_as(
+        "SELECT planned_qty, planned_notional_usdc FROM copy_intents WHERE id = ?")
+        .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(planned, "7.70");
+    assert_eq!(reserved, "4.09"); // ceil(7.70 * 0.53) to cents
+    let envelope: String = sqlx::query_scalar(
+        "SELECT envelope_json FROM order_attempts WHERE intent_id = ?")
+        .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    let envelope: PreparedOrderEnvelope = serde_json::from_str(&envelope).unwrap();
+    let qty: Decimal = envelope.size.parse().unwrap();
+    let price: Decimal = envelope.price.parse().unwrap();
+    let budget: Decimal = envelope.buy_budget_usdc.unwrap().parse().unwrap();
+    assert!(qty.normalize().scale() <= 2);
+    assert_eq!(qty, Decimal::new(770, 2));
+    assert_eq!(budget, qty * price);
+    assert!(budget <= reserved.parse().unwrap());
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn maker_only_rejects_below_market_minimum_without_attempt() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+    set_maker_only_policy(&db, intent_id).await;
+    let raw: String = sqlx::query_scalar("SELECT config_snapshot_json FROM copy_intents WHERE id = ?")
+        .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    let mut policy: PolicySnapshot = serde_json::from_str(&raw).unwrap();
+    policy.max_order_shares = Some("4.99".to_owned());
+    sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
+        .bind(serde_json::to_string(&policy).unwrap()).bind(intent_id)
+        .execute(&db.pool).await.unwrap();
+    let venue = FakeVenue::succeeding(Decimal::ZERO);
+    let outcome = execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+        &venue, &venue, &EmptyHistory, intent_id, Utc::now()).await.unwrap();
+    assert_eq!(outcome, OrchestrateOutcome::Rejected);
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 0);
+    let reason: String = sqlx::query_scalar("SELECT rejection_reason FROM copy_intents WHERE id = ?")
+        .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    assert!(reason.contains("4.99") && reason.contains("5"), "{reason}");
+    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM order_attempts WHERE intent_id = ?")
+        .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(attempts, 0);
+}
+
+#[tokio::test]
+async fn maker_only_rejects_a_legacy_decision_whose_budget_cannot_cover_signed_cost() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+    set_maker_only_policy(&db, intent_id).await;
+    // A previously persisted decision may have an insufficient cent budget.
+    sqlx::query("UPDATE copy_intents SET status = 'in_progress', planned_qty = '7.70', planned_price = '0.53', planned_notional_usdc = '1.00', reserved_qty = '7.70' WHERE id = ?")
+        .bind(intent_id).execute(&db.pool).await.unwrap();
+    let venue = FakeVenue::succeeding(Decimal::ZERO);
+    *venue.best_ask_override.lock().unwrap() = Some(Ok(Decimal::new(60, 2)));
+    let outcome = execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+        &venue, &venue, &EmptyHistory, intent_id, Utc::now()).await.unwrap();
+    assert_eq!(outcome, OrchestrateOutcome::Rejected);
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 0);
+    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM order_attempts WHERE intent_id = ?")
+        .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(attempts, 0);
+}
 
 #[tokio::test]
 async fn a_maker_only_buy_skips_the_fak_path_on_the_fresh_intent_path() {

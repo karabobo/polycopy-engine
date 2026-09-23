@@ -487,6 +487,7 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
             } else {
                 None
             };
+            let mut pinned_shares = None;
             let buy_budget = match balancing_target {
                 Some(target_qty) if target_qty > Decimal::ZERO => {
                     let budget = round_usdc_down(target_qty * limit_price);
@@ -523,11 +524,22 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
                                 "size_ratio produced a non-positive target",
                             ));
                         }
-                        let budget = round_usdc_down(target_qty * limit_price);
+                        let exact_cost = target_qty * limit_price;
+                        // GTD signs shares, not a cent budget. Reserve the
+                        // ceiling of its worst-case cost; never derive shares
+                        // back from a truncated budget.
+                        let budget = if policy.maker_only {
+                            (exact_cost * Decimal::new(100, 0)).ceil() / Decimal::new(100, 0)
+                        } else {
+                            round_usdc_down(exact_cost)
+                        };
                         if budget > available_collateral {
                             return Ok(SizingOutcome::Rejected(
                                 "size_ratio buy budget exceeds available collateral",
                             ));
+                        }
+                        if policy.maker_only {
+                            pinned_shares = Some(target_qty);
                         }
                         budget
                     } else {
@@ -536,7 +548,15 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
                     let target_qty: Decimal = raw.parse().map_err(|_| {
                         ExecuteError::InvalidDecimal("leader_policy.max_order_shares")
                     })?;
-                    let budget = round_usdc_down(target_qty * limit_price);
+                    let exact_cost = target_qty * limit_price;
+                    let budget = if policy.maker_only {
+                        (exact_cost * Decimal::new(100, 0)).ceil() / Decimal::new(100, 0)
+                    } else {
+                        round_usdc_down(exact_cost)
+                    };
+                    if policy.maker_only {
+                        pinned_shares = Some(target_qty);
+                    }
                     // Fixed-share sizing must either retain its configured
                     // target or make no trade. Clamping it to available
                     // collateral would silently reintroduce the residual
@@ -560,7 +580,7 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
                     }
                 }
             };
-            let qty = market_buy_shares_for_budget(buy_budget, limit_price, tick_size);
+            let qty = pinned_shares.unwrap_or_else(|| market_buy_shares_for_budget(buy_budget, limit_price, tick_size));
             if qty <= Decimal::ZERO {
                 return Ok(SizingOutcome::NeedsReconcile(
                     "computed buy quantity is not positive",
@@ -794,16 +814,16 @@ fn apply_tolerance(
 }
 
 /// CLOB orders accept at most two decimal places of outcome-token shares.
-/// Always truncate a positive candidate instead of rounding it up: a BUY
-/// must never exceed its already-persisted notional cap, and a SELL must
-/// never exceed its confirmed available position.
+/// Always truncate a positive candidate instead of rounding it up: a SELL
+/// must never exceed its confirmed available position. Shares-pinned GTD
+/// BUYs reserve the cent ceiling of their cost separately.
 fn round_order_qty_down(qty: Decimal) -> Decimal {
     qty.round_dp_with_strategy(2, RoundingStrategy::ToZero)
 }
 
 /// The venue accepts at most cents on a market BUY's maker (USDC) side.
-/// Rounding toward zero guarantees a signed order cannot exceed collateral,
-/// policy, or the persisted rolling-budget reservation.
+/// Rounding toward zero protects budget-driven market BUYs. Shares-pinned
+/// GTD BUYs instead reserve the cent ceiling of their exact share cost.
 fn round_usdc_down(amount: Decimal) -> Decimal {
     amount.round_dp_with_strategy(2, RoundingStrategy::ToZero)
 }
@@ -2297,6 +2317,26 @@ mod tests {
             "size_ratio sizing must pin shares, not budget (the venue-side bug from docs/fixed-shares-overfill-and-price-floor.md)",
         );
         assert!(!decision.maker_only);
+    }
+
+    #[tokio::test]
+    async fn maker_ratio_reserves_ceiling_and_rejects_insufficient_collateral() {
+        let db = TestDb::new().await;
+        seed_account_and_schedule(&db).await;
+        seed_leader(&db, 1).await;
+        let intent = seed_pending_intent(&db, 1, "123456", "BUY", "38.547059", "0.53").await;
+        let raw: String = sqlx::query_scalar("SELECT config_snapshot_json FROM copy_intents WHERE id = ?")
+            .bind(intent).fetch_one(&*db).await.unwrap();
+        let mut policy: PolicySnapshot = serde_json::from_str(&raw).unwrap();
+        policy.size_ratio = Some("0.2".to_owned());
+        policy.maker_only = true;
+        sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
+            .bind(serde_json::to_string(&policy).unwrap()).bind(intent)
+            .execute(&*db).await.unwrap();
+        let claimed = claim_or_resume_intent(&db, intent).await.unwrap().unwrap();
+        let reader = FixedBalanceReader::new(Decimal::ZERO, Decimal::new(408, 2));
+        assert!(matches!(size_and_reserve(&db, &reader, &claimed).await.unwrap(),
+            SizingOutcome::Rejected("size_ratio buy budget exceeds available collateral")));
     }
 
     #[tokio::test]
