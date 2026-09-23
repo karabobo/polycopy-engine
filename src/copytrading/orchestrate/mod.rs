@@ -721,8 +721,10 @@ where
     // can also return canceled and fully matched orders; a 404 does not
     // establish zero fill. Move the attempt and tracking case together into
     // reconciliation rather than repeating the same lookup on every startup.
-    // The existing FAK/taker trade-history matcher CANNOT reconcile a GTD
-    // maker order; resolving this case needs a separate maker-side workflow.
+    // Resolving whether it actually filled is a separate step: an operator
+    // running `persistent_control reconcile-uncertain <attempt-id>`, which
+    // routes a GTD envelope to the maker-side trade-history matcher
+    // (`venue::trade_history_recovery::recover_gtd_maker_order_from_trades`).
     let state = match execution
         .order_for_receipt(&crate::venue::types::OrderId(
             attempt.envelope.expected_taker_order_id.clone(),
@@ -731,8 +733,9 @@ where
     {
         Ok(state) => state,
         Err(detail) => {
-            // Preserve the lookup error for the operator; neither this
-            // error nor a subsequent FAK-only lookup establishes a GTD fill.
+            // Preserve the lookup error for the operator; this error alone
+            // does not establish a GTD fill one way or the other -- that
+            // determination happens later via `reconcile-uncertain`.
             let failure_detail = format!(
                 "GTD live-order lookup failed and could not be retried here: {detail}"
             );

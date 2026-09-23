@@ -418,9 +418,12 @@ async fn main() {
             // `poll_resting_gtd` rejected via unhandled `Err` on every
             // startup before the orchestrator-side fix could run) to
             // `'uncertain'` so `walk_existing_attempt` no longer routes
-            // it through `poll_resting_gtd`. GTD maker reconciliation
-            // still needs a dedicated workflow; `reconcile-uncertain`
-            // is FAK/taker-only and must NOT be used for this attempt.
+            // it through `poll_resting_gtd`. Once here, `reconcile-uncertain`
+            // is the next step -- it now routes a GTD envelope to the
+            // maker-side trade-history matcher
+            // (`inspect_uncertain_attempt_for_operator` branches on
+            // `envelope.order_type`; see "the load-bearing gap" in the doc
+            // above, now closed).
             //
             // Strictly narrower than the orchestrator helper:
             //   * require `account_id` match (the existing convention
@@ -439,8 +442,8 @@ async fn main() {
             //     owns the next step).
             //
             // This command only blocks replay and records the unresolved
-            // attempt. It does not prove a fill or no-fill; do not resume
-            // until GTD maker trade history is reconciled separately.
+            // attempt. It does not itself prove a fill or no-fill; run
+            // `reconcile-uncertain <attempt-id>` next to determine that.
             "mark-attempt-gtd-uncertain" => {
                 let _lock = EngineLock::acquire_for_database(&db_path).map_err(|error| {
                     polycopy_engine::copytrading::PersistentError::Config(format!(
@@ -527,9 +530,8 @@ async fn main() {
                     "GTD attempt marked uncertain: account_id={account_id} \
                      attempt_id={attempt_id} intent_id={intent_id}; \
                      strict_query_failure case opened atomically. \
-                     GTD maker fills require separate reconciliation; \
-                     do not run the FAK-only reconcile-uncertain command \
-                     or resume the service yet."
+                     Run `persistent_control reconcile-uncertain {attempt_id}` next \
+                     to determine its true fill status before resuming the service."
                 );
             }
             _ => {

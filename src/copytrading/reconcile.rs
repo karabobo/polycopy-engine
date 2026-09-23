@@ -32,8 +32,8 @@ use crate::venue::intl_clob::StrictTradeHistoryReader;
 // moved to `venue::execution_contract` in P0-1.
 #[cfg(test)]
 use crate::venue::intl_clob::{
-    AccountTrade, AccountTradeRole, AccountTradeSide, AccountTradeStatus, OutcomeTokenId,
-    StrictTradeHistoryError,
+    AccountTrade, AccountTradeMakerFill, AccountTradeRole, AccountTradeSide, AccountTradeStatus,
+    OutcomeTokenId, StrictTradeHistoryError,
 };
 #[cfg(test)]
 use crate::venue::OrderReceipt;
@@ -63,7 +63,8 @@ pub use crate::venue::execution_contract::{
 // on, and `execute` implies `intl_clob`, so the re-export is always
 // available here).
 pub use crate::venue::trade_history_recovery::{
-    lookup_prepared_fak_in_trade_history, recover_fak_taker_order_from_trades, TradeHistoryLookup,
+    lookup_gtd_maker_fill_in_trade_history, lookup_prepared_fak_in_trade_history,
+    recover_fak_taker_order_from_trades, recover_gtd_maker_order_from_trades, TradeHistoryLookup,
     TradeHistoryRecoveryError, TradeHistoryWindow,
 };
 // Local scope + backward-compat re-export for the two venue primitives
@@ -259,6 +260,14 @@ pub async fn mark_attempt_rejected(
 struct PendingTradeHistoryRecovery {
     envelope: PreparedOrderEnvelope,
     window: TradeHistoryWindow,
+    /// The precomputed signed-order hash recorded on the attempt before
+    /// submission by `orchestrate::persist_expected_venue_order_id`.
+    /// `None` for a FAK attempt whose response was lost before this could be
+    /// written -- that is exactly the case
+    /// [`recover_fak_taker_order_from_trades`] exists to recover instead of
+    /// requiring. A GTD maker lookup has no such fallback: it requires this
+    /// value be present (see [`inspect_uncertain_attempt_for_operator`]).
+    venue_order_id: Option<String>,
 }
 
 async fn load_pending_trade_history_recovery(
@@ -267,8 +276,8 @@ async fn load_pending_trade_history_recovery(
     attempt_id: i64,
     queried_at: DateTime<Utc>,
 ) -> Result<PendingTradeHistoryRecovery, ReconcileError> {
-    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT envelope_json, status, submission_started_at \
+    let row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT envelope_json, status, submission_started_at, venue_order_id \
          FROM order_attempts WHERE id = ? AND intent_id = ?",
     )
     .bind(attempt_id)
@@ -277,7 +286,7 @@ async fn load_pending_trade_history_recovery(
     .await
     .map_err(db_err)?;
 
-    let Some((envelope_json, status, submission_started_at)) = row else {
+    let Some((envelope_json, status, submission_started_at, venue_order_id)) = row else {
         return Err(ReconcileError::AttemptNotFound);
     };
     if !matches!(status.as_str(), "submitting" | "uncertain") {
@@ -299,7 +308,11 @@ async fn load_pending_trade_history_recovery(
     )
     .map_err(|_| ReconcileError::InvalidSubmissionWindow)?;
 
-    Ok(PendingTradeHistoryRecovery { envelope, window })
+    Ok(PendingTradeHistoryRecovery {
+        envelope,
+        window,
+        venue_order_id,
+    })
 }
 
 /// Performs the fresh, authenticated, exact-envelope lookup required before
@@ -308,6 +321,19 @@ async fn load_pending_trade_history_recovery(
 ///
 /// The account predicate prevents an operator command configured for one
 /// account from inspecting or resolving another account's attempt.
+///
+/// Routes to one of two independent strict matchers by the attempt's own
+/// `envelope.order_type` (`docs/poll-resting-gtd-404-permanently-blocks-startup.md`,
+/// "the load-bearing gap"): a FAK envelope uses
+/// [`lookup_prepared_fak_in_trade_history`], matching taker-role trades
+/// against the offline-precomputed `expected_taker_order_id`. A GTD envelope
+/// uses [`lookup_gtd_maker_fill_in_trade_history`], matching maker-role
+/// trades against the attempt's persisted signed-order hash (`venue_order_id`) -- a GTD
+/// post-only order is never a taker fill by construction, so it cannot share
+/// the FAK path. A GTD attempt with no recorded `venue_order_id` (it was
+/// has no durable match key; absence alone does not prove non-acceptance)
+/// fails closed with [`ReconcileError::MissingVenueOrderId`] rather than
+/// guessing.
 pub async fn inspect_uncertain_attempt_for_operator<R>(
     pool: &SqlitePool,
     reader: &R,
@@ -332,10 +358,22 @@ where
     let pending =
         load_pending_trade_history_recovery(pool, intent_id, attempt_id, queried_at).await?;
 
-    match lookup_prepared_fak_in_trade_history(reader, &pending.envelope, pending.window)
-        .await
-        .map_err(|error| ReconcileError::StrictTradeHistoryLookup(error.to_string()))?
-    {
+    let lookup = if pending.envelope.order_type == "GTD" {
+        let maker_order_id = pending
+            .venue_order_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or(ReconcileError::MissingVenueOrderId)?;
+        lookup_gtd_maker_fill_in_trade_history(reader, &pending.envelope, maker_order_id, pending.window)
+            .await
+            .map_err(|error| ReconcileError::StrictTradeHistoryLookup(error.to_string()))?
+    } else {
+        lookup_prepared_fak_in_trade_history(reader, &pending.envelope, pending.window)
+            .await
+            .map_err(|error| ReconcileError::StrictTradeHistoryLookup(error.to_string()))?
+    };
+
+    match lookup {
         TradeHistoryLookup::Recovered {
             order_id,
             filled_qty,
@@ -403,8 +441,11 @@ async fn persist_recovered_order_id(
 ///
 /// The attempt update, intent block and tracking case commit atomically.
 /// Returns `false` without changing anything if the attempt is no longer
-/// accepted. GTD maker reconciliation is not supported by the FAK-only
-/// trade-history matcher; this transition does not prove a fill or no-fill.
+/// accepted. This transition alone does not prove a fill or no-fill -- it
+/// only unblocks the next step, which is an operator running
+/// `persistent_control reconcile-uncertain <attempt-id>` (routed by
+/// [`inspect_uncertain_attempt_for_operator`] to the GTD maker matcher for
+/// a GTD envelope) to determine the attempt's true fill status.
 pub async fn mark_attempt_gtd_lookup_failed(
     pool: &SqlitePool,
     intent_id: i64,
@@ -821,6 +862,7 @@ pub enum ReconcileError {
     InvalidSubmissionWindow,
     ConflictingRecoveredOrderId,
     StrictTradeHistoryLookup(String),
+    MissingVenueOrderId,
 }
 
 impl fmt::Display for ReconcileError {
@@ -857,6 +899,10 @@ impl fmt::Display for ReconcileError {
                     "strict trade-history lookup did not prove no-fill: {error}"
                 )
             }
+            Self::MissingVenueOrderId => write!(
+                formatter,
+                "attempt has no recorded venue order ID; a GTD maker lookup cannot proceed without one"
+            ),
         }
     }
 }
@@ -1000,6 +1046,60 @@ mod tests {
                 .expect("timestamp must be valid"),
             role,
             status: AccountTradeStatus::Matched,
+            maker_orders: Vec::new(),
+        }
+    }
+
+    fn gtd_envelope(salt: u64) -> PreparedOrderEnvelope {
+        let mut envelope = envelope(salt);
+        envelope.order_type = "GTD".to_owned();
+        envelope.post_only = true;
+        envelope.buy_shares_exact = true;
+        envelope
+    }
+
+    fn maker_fill(order_id: &str, matched_amount: Decimal, price: Decimal) -> AccountTradeMakerFill {
+        AccountTradeMakerFill {
+            order_id: order_id.to_owned(),
+            matched_amount,
+            price,
+            side: AccountTradeSide::Buy,
+        }
+    }
+
+    /// `side` is the maker order's direction; the trade's top-level side is
+    /// the opposite taker direction, as in the CLOB response.
+    /// A maker-role trade fixture: `taker_order_id`/`price`/`size` are the
+    /// counterparty taker's aggregate fields and are deliberately filled
+    /// with values a correct maker matcher must never read (`price` set to
+    /// an impossible `9` outside any valid (0,1) tick, `size` set far larger
+    /// than any single `maker_orders` entry) so a regression that
+    /// accidentally reads them is caught by a wrong-answer test failure
+    /// rather than silently reading a value that happens to be correct.
+    fn maker_role_trade(
+        trade_id: &str,
+        side: AccountTradeSide,
+        maker_orders: Vec<AccountTradeMakerFill>,
+        second: u32,
+    ) -> AccountTrade {
+        AccountTrade {
+            trade_id: trade_id.to_owned(),
+            taker_order_id: "counterparty-taker-order".to_owned(),
+            token_id: OutcomeTokenId::from_str("123456").expect("valid token ID"),
+            side: match side {
+                AccountTradeSide::Buy => AccountTradeSide::Sell,
+                AccountTradeSide::Sell => AccountTradeSide::Buy,
+                AccountTradeSide::Unknown => AccountTradeSide::Unknown,
+            },
+            price: Decimal::new(9, 0),
+            size: Decimal::new(999, 0),
+            match_time: Utc
+                .with_ymd_and_hms(2026, 9, 1, 12, 0, second)
+                .single()
+                .expect("timestamp must be valid"),
+            role: AccountTradeRole::Maker,
+            status: AccountTradeStatus::Matched,
+            maker_orders,
         }
     }
 
@@ -1397,6 +1497,328 @@ mod tests {
     // version is already covered in tests/receipt.rs). BUY's bound
     // semantics differ (matched_shares has no upper bound) but the
     // accepted_qty > requested_qty guard is symmetric.
+
+    #[test]
+    fn gtd_maker_buy_matches_opposite_taker_sell_but_not_same_direction() {
+        let mut valid = maker_role_trade(
+            "trade-a",
+            AccountTradeSide::Buy,
+            vec![maker_fill("maker-a", Decimal::new(2, 0), Decimal::new(49, 2))],
+            1,
+        );
+        let expected = TradeHistoryLookup::Recovered {
+            order_id: OrderId("maker-a".to_owned()),
+            filled_qty: Decimal::new(2, 0),
+            maker_notional_usdc: Decimal::new(98, 2),
+        };
+        assert_eq!(recover_gtd_maker_order_from_trades(&gtd_envelope(42), "maker-a", trade_history_window(), &[valid.clone()]), Ok(expected));
+        valid.side = AccountTradeSide::Buy;
+        assert_eq!(recover_gtd_maker_order_from_trades(&gtd_envelope(42), "maker-a", trade_history_window(), &[valid]), Ok(TradeHistoryLookup::NotFound));
+    }
+
+    #[test]
+    fn gtd_maker_sell_matches_opposite_taker_buy_and_rejects_wrong_maker_side() {
+        let mut sell = gtd_envelope(42);
+        sell.side = "SELL".to_owned();
+        let mut valid = maker_role_trade(
+            "trade-a",
+            AccountTradeSide::Sell,
+            vec![AccountTradeMakerFill {
+                side: AccountTradeSide::Sell,
+                ..maker_fill("maker-a", Decimal::new(2, 0), Decimal::new(51, 2))
+            }],
+            1,
+        );
+        assert_eq!(
+            recover_gtd_maker_order_from_trades(&sell, "maker-a", trade_history_window(), &[valid.clone()]),
+            Ok(TradeHistoryLookup::Recovered {
+                order_id: OrderId("maker-a".to_owned()),
+                filled_qty: Decimal::new(2, 0),
+                maker_notional_usdc: Decimal::new(102, 2),
+            })
+        );
+        valid.maker_orders[0].side = AccountTradeSide::Buy;
+        assert_eq!(recover_gtd_maker_order_from_trades(&sell, "maker-a", trade_history_window(), &[valid]), Ok(TradeHistoryLookup::NotFound));
+    }
+
+    // GTD/post-only maker-fill matcher
+    // (docs/poll-resting-gtd-404-permanently-blocks-startup.md, "the
+    // load-bearing gap"). Mirrors the FAK matcher's test structure above,
+    // but keyed on the attempt's persisted maker_order_id (never
+    // envelope.expected_taker_order_id) against AccountTradeRole::Maker
+    // trades' per-order maker_orders breakdown.
+
+    #[test]
+    fn recover_gtd_maker_sums_only_the_matching_order_ids_fills_across_trades_and_makers() {
+        let trades = vec![
+            // One sweep matches two resting maker orders at once: ours
+            // ("maker-a") and a counterparty's ("maker-other"). Only
+            // "maker-a"'s matched_amount/price may contribute.
+            maker_role_trade(
+                "trade-a",
+                AccountTradeSide::Buy,
+                vec![
+                    maker_fill("maker-a", Decimal::new(2, 0), Decimal::new(49, 2)),
+                    maker_fill("maker-other", Decimal::new(3, 0), Decimal::new(49, 2)),
+                ],
+                1,
+            ),
+            // A second, later trade tops up the same maker order.
+            maker_role_trade(
+                "trade-b",
+                AccountTradeSide::Buy,
+                vec![maker_fill(
+                    "maker-a",
+                    Decimal::new(3_288_460, 6),
+                    Decimal::new(48, 2),
+                )],
+                2,
+            ),
+        ];
+
+        let recovered = recover_gtd_maker_order_from_trades(
+            &gtd_envelope(42),
+            "maker-a",
+            trade_history_window(),
+            &trades,
+        )
+        .expect("a valid maker trade history must be matchable");
+
+        assert_eq!(
+            recovered,
+            TradeHistoryLookup::Recovered {
+                order_id: OrderId("maker-a".to_owned()),
+                filled_qty: Decimal::new(5_288_460, 6),
+                maker_notional_usdc: Decimal::new(25_584_608, 7),
+            }
+        );
+    }
+
+    #[test]
+    fn recover_gtd_maker_never_reads_the_trades_top_level_size_or_price() {
+        // The trade-level `size`/`price` on `maker_role_trade` fixtures are
+        // deliberately set to impossible sentinel values (see its doc
+        // comment). A correct matcher must derive filled_qty/notional
+        // purely from the matching `maker_orders` entry.
+        let trades = vec![maker_role_trade(
+            "trade-a",
+            AccountTradeSide::Buy,
+            vec![maker_fill("maker-a", Decimal::new(2, 0), Decimal::new(49, 2))],
+            1,
+        )];
+
+        let recovered = recover_gtd_maker_order_from_trades(
+            &gtd_envelope(42),
+            "maker-a",
+            trade_history_window(),
+            &trades,
+        )
+        .expect("a valid maker trade history must be matchable");
+
+        assert_eq!(
+            recovered,
+            TradeHistoryLookup::Recovered {
+                order_id: OrderId("maker-a".to_owned()),
+                filled_qty: Decimal::new(2, 0),
+                maker_notional_usdc: Decimal::new(98, 2),
+            }
+        );
+    }
+
+    #[test]
+    fn recover_gtd_maker_rejects_an_envelope_whose_order_type_is_not_gtd() {
+        assert_eq!(
+            recover_gtd_maker_order_from_trades(
+                &envelope(42), // order_type == "FAK"
+                "maker-a",
+                trade_history_window(),
+                &[]
+            ),
+            Err(TradeHistoryRecoveryError::UnsupportedOrderType)
+        );
+    }
+
+    #[test]
+    fn recover_gtd_maker_rejects_an_empty_or_blank_maker_order_id() {
+        for bad in ["", "   "] {
+            assert_eq!(
+                recover_gtd_maker_order_from_trades(
+                    &gtd_envelope(42),
+                    bad,
+                    trade_history_window(),
+                    &[]
+                ),
+                Err(TradeHistoryRecoveryError::MissingMakerOrderId),
+                "maker_order_id={bad:?} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn recover_gtd_maker_never_matches_a_taker_role_trade_even_with_the_right_order_id() {
+        // Defense in depth, symmetric with the FAK matcher's own
+        // maker-vs-taker exclusion: a trade where this account was the
+        // TAKER must never contribute, even if (implausibly) its
+        // `maker_orders` list happens to contain an entry with the exact
+        // target order id (e.g. a counterparty's order that collided in a
+        // test fixture -- in production, real order ids are unique
+        // deterministic hashes, but the matcher's role check must not
+        // depend on that).
+        let taker_role_trade_with_matching_maker_entry = AccountTrade {
+            trade_id: "trade-a".to_owned(),
+            taker_order_id: "some-taker-order".to_owned(),
+            token_id: OutcomeTokenId::from_str("123456").expect("valid token ID"),
+            side: AccountTradeSide::Buy,
+            price: Decimal::new(49, 2),
+            size: Decimal::new(2, 0),
+            match_time: Utc
+                .with_ymd_and_hms(2026, 9, 1, 12, 0, 1)
+                .single()
+                .expect("timestamp must be valid"),
+            role: AccountTradeRole::Taker,
+            status: AccountTradeStatus::Matched,
+            maker_orders: vec![maker_fill("maker-a", Decimal::new(2, 0), Decimal::new(49, 2))],
+        };
+
+        assert_eq!(
+            recover_gtd_maker_order_from_trades(
+                &gtd_envelope(42),
+                "maker-a",
+                trade_history_window(),
+                &[taker_role_trade_with_matching_maker_entry]
+            ),
+            Ok(TradeHistoryLookup::NotFound)
+        );
+    }
+
+    #[test]
+    fn recover_gtd_maker_ignores_an_unrelated_order_id_in_the_same_maker_orders_list() {
+        let trades = vec![maker_role_trade(
+            "trade-a",
+            AccountTradeSide::Buy,
+            vec![maker_fill(
+                "some-other-makers-order",
+                Decimal::new(5, 0),
+                Decimal::new(49, 2),
+            )],
+            1,
+        )];
+
+        assert_eq!(
+            recover_gtd_maker_order_from_trades(
+                &gtd_envelope(42),
+                "maker-a",
+                trade_history_window(),
+                &trades
+            ),
+            Ok(TradeHistoryLookup::NotFound)
+        );
+    }
+
+    #[test]
+    fn recover_gtd_maker_excludes_a_fill_priced_worse_than_the_post_only_limit() {
+        // A post-only BUY at 0.50 must never accept a fill priced above its
+        // own limit -- the matcher's is_limit_compatible check applies to
+        // each maker_orders entry's own price, not the trade's top-level
+        // (sentinel) price.
+        let trades = vec![maker_role_trade(
+            "trade-a",
+            AccountTradeSide::Buy,
+            vec![maker_fill("maker-a", Decimal::new(5, 0), Decimal::new(51, 2))],
+            1,
+        )];
+
+        assert_eq!(
+            recover_gtd_maker_order_from_trades(
+                &gtd_envelope(42),
+                "maker-a",
+                trade_history_window(),
+                &trades
+            ),
+            Ok(TradeHistoryLookup::NotFound)
+        );
+    }
+
+    #[test]
+    fn recover_gtd_maker_conflicting_duplicate_trade_ids_fail_closed() {
+        let first = maker_role_trade(
+            "trade-a",
+            AccountTradeSide::Buy,
+            vec![maker_fill("maker-a", Decimal::new(2, 0), Decimal::new(49, 2))],
+            1,
+        );
+        let second = maker_role_trade(
+            "trade-a",
+            AccountTradeSide::Buy,
+            vec![maker_fill("maker-a", Decimal::new(3, 0), Decimal::new(49, 2))],
+            1,
+        );
+
+        assert!(matches!(
+            recover_gtd_maker_order_from_trades(
+                &gtd_envelope(42),
+                "maker-a",
+                trade_history_window(),
+                &[first, second]
+            ),
+            Err(TradeHistoryRecoveryError::ConflictingDuplicateTrade { .. })
+        ));
+    }
+
+    #[test]
+    fn a_gtd_envelope_is_never_resolved_by_the_fak_taker_matcher_even_with_matching_history() {
+        // The regression the doc's "load-bearing gap" section asks for,
+        // direction one: feed the FAK matcher a GTD envelope plus a trade
+        // that would satisfy every other FAK check (taker role, matching
+        // taker_order_id, price, side, window) if order_type were ignored.
+        // It must still fail closed on the order_type guard alone.
+        let gtd = gtd_envelope(42);
+        let would_satisfy_fak_if_type_were_ignored = account_trade(
+            "trade-a",
+            &gtd.expected_taker_order_id,
+            AccountTradeSide::Buy,
+            Decimal::new(49, 2),
+            Decimal::new(2, 0),
+            AccountTradeRole::Taker,
+            1,
+        );
+        assert_eq!(
+            recover_fak_taker_order_from_trades(
+                &gtd,
+                trade_history_window(),
+                &[would_satisfy_fak_if_type_were_ignored]
+            ),
+            Err(TradeHistoryRecoveryError::UnsupportedOrderType)
+        );
+    }
+
+    #[test]
+    fn a_fak_envelope_is_never_resolved_by_the_gtd_maker_matcher_even_with_matching_history() {
+        // Direction two of the same regression: feed the GTD maker matcher
+        // a FAK envelope plus a maker-role trade whose maker_orders entry
+        // exactly matches an order id, satisfying every other check. It
+        // must still fail closed on the order_type guard alone.
+        let fak = envelope(42);
+        let trades = vec![maker_role_trade(
+            "trade-a",
+            AccountTradeSide::Buy,
+            vec![maker_fill(
+                &fak.expected_taker_order_id,
+                Decimal::new(2, 0),
+                Decimal::new(49, 2),
+            )],
+            1,
+        )];
+        assert_eq!(
+            recover_gtd_maker_order_from_trades(
+                &fak,
+                &fak.expected_taker_order_id,
+                trade_history_window(),
+                &trades
+            ),
+            Err(TradeHistoryRecoveryError::UnsupportedOrderType)
+        );
+    }
 
     #[tokio::test]
     async fn lost_response_recovery_records_only_the_exact_precomputed_order_id() {
@@ -2017,12 +2439,125 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_promoted_gtd_attempt_is_not_falsely_resolved_by_the_fak_only_history_matcher() {
+    async fn a_promoted_gtd_attempt_with_no_matching_history_reports_not_found_via_the_maker_matcher() {
+        // Closes "the load-bearing gap"
+        // (docs/poll-resting-gtd-404-permanently-blocks-startup.md): a GTD
+        // attempt promoted to 'uncertain' by mark_attempt_gtd_lookup_failed
+        // (the shape of intent 723 / attempt 537) must now route through
+        // the GTD maker matcher, not fail with UnsupportedOrderType. Empty
+        // trade history is a completed non-match (NotFound), the same
+        // fail-closed-but-not-erroring contract the FAK path already has.
         let db = TestDb::new().await;
         let intent_id = seed_intent(&db).await;
-        let mut gtd = envelope(42);
-        gtd.order_type = "GTD".to_owned();
-        gtd.post_only = true;
+        let gtd = gtd_envelope(42);
+        load_or_prepare_attempt(&db, intent_id, 1, &gtd).await.unwrap();
+        let attempt_id: i64 = sqlx::query_scalar("SELECT id FROM order_attempts WHERE intent_id = ?")
+            .bind(intent_id)
+            .fetch_one(&*db)
+            .await
+            .unwrap();
+        // Fixed timestamp (not real `Utc::now()`), matching the fixed dates
+        // the `account_trade`/`maker_role_trade` fixture helpers use, so
+        // the recovery window in this test lines up with fixture match
+        // times the same way `prepared_submitting_attempt` already does.
+        let started_at = trade_history_window().after();
+        // Persist the precomputed signed-order hash before acceptance, as
+        // `orchestrate::persist_expected_venue_order_id` does in production.
+        sqlx::query(
+            "UPDATE order_attempts SET status = 'accepted', submission_started_at = ?, \
+             venue_order_id = ? WHERE id = ?",
+        )
+        .bind(started_at.to_rfc3339())
+        .bind(&gtd.expected_taker_order_id)
+        .bind(attempt_id)
+        .execute(&*db)
+        .await
+        .unwrap();
+        assert!(mark_attempt_gtd_lookup_failed(&db, intent_id, attempt_id, "404")
+            .await
+            .unwrap());
+        let reader = FakeTradeHistoryReader {
+            reply: FakeTradeHistoryReply::Trades(vec![]),
+        };
+        let result = inspect_uncertain_attempt_for_operator(
+            &db,
+            &reader,
+            1,
+            attempt_id,
+            trade_history_window().before(),
+        )
+        .await
+        .expect("a GTD attempt must now be inspectable, not UnsupportedOrderType");
+        assert_eq!(result, OperatorUncertainLookup::NotFound);
+    }
+
+    #[tokio::test]
+    async fn a_promoted_gtd_attempt_with_a_matching_maker_fill_is_recovered() {
+        let db = TestDb::new().await;
+        let intent_id = seed_intent(&db).await;
+        let gtd = gtd_envelope(42);
+        load_or_prepare_attempt(&db, intent_id, 1, &gtd).await.unwrap();
+        let attempt_id: i64 = sqlx::query_scalar("SELECT id FROM order_attempts WHERE intent_id = ?")
+            .bind(intent_id)
+            .fetch_one(&*db)
+            .await
+            .unwrap();
+        let started_at = trade_history_window().after();
+        sqlx::query(
+            "UPDATE order_attempts SET status = 'accepted', submission_started_at = ?, \
+             venue_order_id = ? WHERE id = ?",
+        )
+        .bind(started_at.to_rfc3339())
+        .bind(&gtd.expected_taker_order_id)
+        .bind(attempt_id)
+        .execute(&*db)
+        .await
+        .unwrap();
+        assert!(mark_attempt_gtd_lookup_failed(&db, intent_id, attempt_id, "404")
+            .await
+            .unwrap());
+        let reader = FakeTradeHistoryReader {
+            reply: FakeTradeHistoryReply::Trades(vec![maker_role_trade(
+                "trade-a",
+                AccountTradeSide::Buy,
+                vec![maker_fill(
+                    &gtd.expected_taker_order_id,
+                    Decimal::new(2, 0),
+                    Decimal::new(49, 2),
+                )],
+                1,
+            )]),
+        };
+        let result = inspect_uncertain_attempt_for_operator(
+            &db,
+            &reader,
+            1,
+            attempt_id,
+            trade_history_window().before(),
+        )
+        .await
+        .expect("a matching maker fill must be recovered");
+        assert_eq!(
+            result,
+            OperatorUncertainLookup::Recovered {
+                order_id: OrderId(gtd.expected_taker_order_id.clone()),
+                filled_qty: Decimal::new(2, 0),
+                maker_notional_usdc: Decimal::new(98, 2),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_promoted_gtd_attempt_with_no_recorded_venue_order_id_fails_closed() {
+        // Defense in depth: a GTD attempt somehow promoted to 'uncertain'
+        // without ever having a venue_order_id recorded (should not happen
+        // via the real 'accepted' -> mark_attempt_gtd_lookup_failed path,
+        // since acceptance always persists it first, but the operator
+        // command must not guess or silently fall back to NotFound if it
+        // ever does) must refuse rather than report an unproven no-fill.
+        let db = TestDb::new().await;
+        let intent_id = seed_intent(&db).await;
+        let gtd = gtd_envelope(42);
         load_or_prepare_attempt(&db, intent_id, 1, &gtd).await.unwrap();
         let attempt_id: i64 = sqlx::query_scalar("SELECT id FROM order_attempts WHERE intent_id = ?")
             .bind(intent_id)
@@ -2030,12 +2565,15 @@ mod tests {
             .await
             .unwrap();
         let now = Utc::now();
-        sqlx::query("UPDATE order_attempts SET status = 'accepted', submission_started_at = ? WHERE id = ?")
-            .bind(now.to_rfc3339())
-            .bind(attempt_id)
-            .execute(&*db)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE order_attempts SET status = 'accepted', submission_started_at = ? \
+             WHERE id = ?",
+        )
+        .bind(now.to_rfc3339())
+        .bind(attempt_id)
+        .execute(&*db)
+        .await
+        .unwrap();
         assert!(mark_attempt_gtd_lookup_failed(&db, intent_id, attempt_id, "404")
             .await
             .unwrap());
@@ -2044,14 +2582,8 @@ mod tests {
         };
         let error = inspect_uncertain_attempt_for_operator(&db, &reader, 1, attempt_id, Utc::now())
             .await
-            .expect_err("FAK-only recovery cannot classify a GTD maker order as no-fill");
-        assert!(matches!(error, ReconcileError::StrictTradeHistoryLookup(detail) if detail.contains("only supports FAK")));
-        let status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
-            .bind(intent_id)
-            .fetch_one(&*db)
-            .await
-            .unwrap();
-        assert_eq!(status, "needs_reconcile");
+            .expect_err("a GTD attempt with no venue_order_id must fail closed, not resolve");
+        assert!(matches!(error, ReconcileError::MissingVenueOrderId));
     }
 
     #[tokio::test]

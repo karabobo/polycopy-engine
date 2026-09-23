@@ -209,3 +209,69 @@ gap block deploying Part 1, which is what actually stops the crash loop.
 - `cargo test --all-features --locked` and
   `cargo clippy --all-targets --all-features --locked -- -D warnings`
   clean, as with every prior change this session.
+
+## Resolution (2026-09-23): the load-bearing gap is closed
+
+Option 1 from the "load-bearing gap" section above -- extending the
+strict trade-history matcher to a maker-side fill -- has now been built,
+as the account owner's tracked-separately follow-up this doc always said
+it would need. What changed:
+
+- `venue::intl_clob::AccountTrade` now carries `maker_orders:
+  Vec<AccountTradeMakerFill>`, the venue's per-maker-order fill breakdown
+  for a trade (`order_id`/`matched_amount`/`price`), mapped straight from
+  the SDK's `TradeResponse.maker_orders`. This was previously dropped
+  entirely by the `From<TradeResponse>` conversion.
+- `venue::trade_history_recovery::recover_gtd_maker_order_from_trades`
+  (plus its network wrapper `lookup_gtd_maker_fill_in_trade_history`) is
+  the maker-side sibling of `recover_fak_taker_order_from_trades`. It
+  requires `order_type == "GTD"`, matches only
+  `AccountTradeRole::Maker` trades, and sums the `maker_orders` entries
+  whose own `order_id` equals a caller-supplied `maker_order_id` --
+  it does not derive that key from `envelope.expected_taker_order_id` inside
+  the matcher. The caller reads `order_attempts.venue_order_id`, populated
+  from the precomputed signed-order hash by `persist_expected_venue_order_id`
+  **before submission**, not from the POST response at `'accepted'` time.
+  Attempt 537 already has this persisted key. Each matching maker entry's
+  side must agree with the envelope, and the trade's taker side must be
+  opposite. The matcher never uses the trade's top-level `size`/`price`
+  (the taker's aggregate fill), only the matched maker entry's figures.
+- `copytrading::reconcile::inspect_uncertain_attempt_for_operator` --
+  the function behind `persistent_control reconcile-uncertain
+  <attempt-id>` -- now branches on the attempt's `envelope.order_type`
+  and routes a GTD envelope to the new matcher, reading
+  `order_attempts.venue_order_id` for the match key. A GTD attempt with
+  no recorded `venue_order_id` fails closed with the new
+  `ReconcileError::MissingVenueOrderId` rather than guessing.
+
+**Consequence: `persistent_control reconcile-uncertain 537` can now
+actually inspect trade history for attempt 537**, where before it failed
+immediately with `UnsupportedOrderType`. Running it against real
+production trade history -- and, if it recovers a fill,
+`reconcile-fill 537` to account for it -- is still a live operator action
+against this account's real funds and was **not** performed as part of
+this change; this doc's earlier instruction not to run the old
+FAK-only `reconcile-uncertain` for this attempt is retracted, but intent
+723 / attempt 537 itself remains `needs_reconcile` until an operator
+actually runs the command and reviews its result.
+
+Verification added for this change (`copytrading::reconcile` test
+module): direct unit coverage of `recover_gtd_maker_order_from_trades`
+mirroring the existing FAK matcher's branch-coverage pins (rejects a
+non-GTD envelope, rejects an empty/blank `maker_order_id`, ignores
+taker-role trades, ignores an unrelated order ID inside the same trade's
+`maker_orders` list, checks opposite taker/maker directions for both
+BUY and SELL, excludes a fill priced worse than the post-only
+limit, sums correctly across multiple trades/maker orders, fails closed
+on a conflicting duplicate trade ID, and never reads a trade's top-level
+`size`/`price`); the two-directional regression this doc's own
+"Verification" section above asked for (a GTD envelope is never resolved
+by the FAK matcher, and a FAK envelope is never resolved by the GTD
+matcher, even when fed trade history that would otherwise satisfy every
+other check); and an `inspect_uncertain_attempt_for_operator` integration
+test recovering a real promoted-`'uncertain'` GTD attempt's maker fill
+end-to-end through a fake `StrictTradeHistoryReader` and the real SQLite
+schema, plus one proving the `MissingVenueOrderId` fail-closed path.
+`cargo test --all-features --locked` and
+`cargo clippy --all-targets --all-features --locked -- -D warnings` both
+clean with this change included.

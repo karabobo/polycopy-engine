@@ -213,6 +213,7 @@ impl StrictTradeHistoryReader for RecoveredHistory {
             match_time: Utc::now() - chrono::Duration::seconds(1),
             role: crate::venue::intl_clob::AccountTradeRole::Taker,
             status: crate::venue::intl_clob::AccountTradeStatus::Matched,
+            maker_orders: Vec::new(),
         }])
     }
 }

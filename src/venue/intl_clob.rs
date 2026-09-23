@@ -192,6 +192,17 @@ impl StrictTradeHistoryReader for IntlClobReadAdapter {
 /// endpoint. It intentionally retains the venue's taker order ID: a filled
 /// FAK is only recoverable when a later, read-only query can identify exactly
 /// one such ID for the prepared envelope.
+///
+/// `maker_orders` is the trade's full per-maker fill breakdown, copied
+/// unchanged from the venue response's `maker_orders` array. It is populated
+/// regardless of this account's own `role` in the trade: when `role ==
+/// Taker`, every entry belongs to a counterparty; when `role == Maker`, this
+/// account's own resting order is *one* of the entries (a single trade can
+/// sweep several resting maker orders at once, possibly belonging to other
+/// accounts too), identified only by its own `order_id` -- never by
+/// position or count. Callers matching a maker fill must filter this list by
+/// the exact known `order_id`, the same fail-closed-by-exact-ID discipline
+/// `taker_order_id` already gets for the taker side.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AccountTrade {
     pub trade_id: String,
@@ -203,6 +214,20 @@ pub struct AccountTrade {
     pub match_time: DateTime<Utc>,
     pub role: AccountTradeRole,
     pub status: AccountTradeStatus,
+    pub maker_orders: Vec<AccountTradeMakerFill>,
+}
+
+/// One maker order's fill within a trade's `maker_orders` breakdown. Carries
+/// only the fields a strict recovery match needs: which order, how much of
+/// it matched, at what price, and on which side -- never the trade's aggregate
+/// `size`/`price` or taker-side `side`, which describe the taker's overall fill
+/// across every maker order in `maker_orders`, not this one order's.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccountTradeMakerFill {
+    pub order_id: String,
+    pub matched_amount: Decimal,
+    pub price: Decimal,
+    pub side: AccountTradeSide,
 }
 
 impl From<TradeResponse> for AccountTrade {
@@ -225,6 +250,20 @@ impl From<TradeResponse> for AccountTrade {
             TradeStatusType::Failed => AccountTradeStatus::Failed,
             TradeStatusType::Unknown(_) | _ => AccountTradeStatus::Unknown,
         };
+        let maker_orders = trade
+            .maker_orders
+            .into_iter()
+            .map(|maker_order| AccountTradeMakerFill {
+                order_id: maker_order.order_id,
+                matched_amount: maker_order.matched_amount,
+                price: maker_order.price,
+                side: match maker_order.side {
+                    SdkSide::Buy => AccountTradeSide::Buy,
+                    SdkSide::Sell => AccountTradeSide::Sell,
+                    SdkSide::Unknown | _ => AccountTradeSide::Unknown,
+                },
+            })
+            .collect();
 
         Self {
             trade_id: trade.id,
@@ -236,6 +275,7 @@ impl From<TradeResponse> for AccountTrade {
             match_time: trade.match_time,
             role,
             status,
+            maker_orders,
         }
     }
 }
@@ -609,6 +649,8 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].taker_order_id, "order-a");
         assert_eq!(recovered[0].size, Decimal::new(5_288_460, 6));
+        assert_eq!(recovered[0].side, AccountTradeSide::Buy);
+        assert_eq!(recovered[0].maker_orders[0].side, AccountTradeSide::Sell);
 
         let requests = server.join().expect("test server must complete");
         assert_eq!(requests.len(), 3);
