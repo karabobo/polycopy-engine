@@ -39,12 +39,84 @@ async fn main() {
                     .to_owned(),
             )
         })?;
-        let pool = open_and_migrate(&db_path)
-            .await
+        let pool = if command == "dump-trades" {
+            polycopy_engine::copytrading::open_read_only(&db_path).await
+        } else {
+            open_and_migrate(&db_path).await
+        }
             .map_err(|error| {
                 polycopy_engine::copytrading::PersistentError::Database(error.to_string())
             })?;
         match command.as_str() {
+            "dump-trades" => {
+                use std::str::FromStr;
+                use polycopy_engine::venue::intl_clob::OutcomeTokenId;
+                // This command must not acquire an execution lock or migrate the
+                // database: it is a strict read-only incident diagnostic.
+                let account_id = account_id_from_env()?;
+                let attempt_id: i64 = std::env::args().nth(2)
+                    .ok_or_else(|| polycopy_engine::copytrading::PersistentError::Config(
+                        "dump-trades requires an attempt id".to_owned(),
+                    ))?
+                    .parse()
+                    .map_err(|_| polycopy_engine::copytrading::PersistentError::Config(
+                        "invalid attempt id".to_owned(),
+                    ))?;
+                let row: Option<(String, String, String, String)> = sqlx::query_as(
+                    "SELECT ci.token_id, oa.envelope_json, oa.venue_order_id, oa.submission_started_at \
+                     FROM order_attempts oa JOIN copy_intents ci ON ci.id = oa.intent_id \
+                     WHERE oa.id = ? AND ci.account_id = ? AND oa.status IN ('uncertain', 'rejected')",
+                )
+                .bind(attempt_id)
+                .bind(account_id)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|error| polycopy_engine::copytrading::PersistentError::Database(error.to_string()))?;
+                let (token_raw, envelope_raw, order_id, started_at) = row.ok_or(
+                    polycopy_engine::copytrading::PersistentError::UnresolvedRecovery,
+                )?;
+                let envelope: polycopy_engine::copytrading::PreparedOrderEnvelope =
+                    serde_json::from_str(&envelope_raw).map_err(|_| {
+                        polycopy_engine::copytrading::PersistentError::UnresolvedRecovery
+                    })?;
+                if envelope.order_type != "GTD" || envelope.token_id != token_raw
+                    || order_id != envelope.expected_taker_order_id || order_id.is_empty() {
+                    return Err(polycopy_engine::copytrading::PersistentError::UnresolvedRecovery);
+                }
+                let token = OutcomeTokenId::from_str(&token_raw).map_err(|_| {
+                    polycopy_engine::copytrading::PersistentError::UnresolvedRecovery
+                })?;
+                let after = chrono::DateTime::parse_from_rfc3339(&started_at)
+                    .map_err(|_| polycopy_engine::copytrading::PersistentError::UnresolvedRecovery)?
+                    .with_timezone(&chrono::Utc) - chrono::Duration::seconds(1);
+                let before = chrono::DateTime::parse_from_rfc3339(&started_at)
+                    .map_err(|_| polycopy_engine::copytrading::PersistentError::UnresolvedRecovery)?
+                    .with_timezone(&chrono::Utc) + chrono::Duration::minutes(15);
+                let adapter = IntlClobCopyAdapter::from_env().await.map_err(|error| {
+                    polycopy_engine::copytrading::PersistentError::Config(format!(
+                        "authenticated trade-history setup failed: {error}"
+                    ))
+                })?;
+                for (label, trades) in [
+                    ("asset-filtered", adapter.read_adapter().trades_for_token_between(&token, after, before).await),
+                    ("unfiltered", adapter.read_adapter().trades_between_unfiltered(&token, after, before).await),
+                ] {
+                    let trades = trades.map_err(|error| polycopy_engine::copytrading::PersistentError::Config(
+                        format!("{label} strict trade-history query failed: {error}"),
+                    ))?;
+                    let total = trades.len();
+                    let relevant = trades.iter().filter(|trade| trade.maker_orders.iter().any(|fill| fill.order_id == order_id)).count();
+                    println!("{label}: trades={total} exact_order_id_trades={relevant} (empty is not proof of no fill)");
+                    for trade in trades.iter().filter(|trade| trade.maker_orders.iter().any(|fill| fill.order_id == order_id)) {
+                        println!("trade id={} asset_id={} side={:?} role={:?} status={:?} match_time={}",
+                            trade.trade_id, trade.token_id, trade.side, trade.role, trade.status, trade.match_time);
+                        for fill in &trade.maker_orders {
+                            println!("  maker order_id={} asset_id={} side={:?} price={} matched_amount={}",
+                                fill.order_id, fill.asset_id, fill.side, fill.price, fill.matched_amount);
+                        }
+                    }
+                }
+            }
             "init-config" => {
                 let _lock = EngineLock::acquire_for_database(&db_path).map_err(|error| {
                     polycopy_engine::copytrading::PersistentError::Config(format!(
@@ -231,6 +303,21 @@ async fn main() {
                 })?;
                 let account_id = account_id_from_env()?;
                 let (attempt_id, confirmation) = reconcile_uncertain_arguments()?;
+                if confirmation.is_some() {
+                    let order_type: Option<String> = sqlx::query_scalar(
+                        "SELECT json_extract(oa.envelope_json, '$.order_type') FROM order_attempts oa \
+                         JOIN copy_intents ci ON ci.id = oa.intent_id \
+                         WHERE oa.id = ? AND ci.account_id = ? AND oa.status = 'uncertain'",
+                    )
+                    .bind(attempt_id)
+                    .bind(account_id)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(|error| polycopy_engine::copytrading::PersistentError::Database(error.to_string()))?;
+                    if order_type.as_deref() == Some("GTD") {
+                        return Err(polycopy_engine::copytrading::PersistentError::UnresolvedRecovery);
+                    }
+                }
                 let adapter = IntlClobCopyAdapter::from_env().await.map_err(|error| {
                     polycopy_engine::copytrading::PersistentError::Config(format!(
                         "strict trade-history lookup could not authenticate: {error}"
@@ -286,7 +373,7 @@ async fn main() {
                         );
                         } else {
                             println!(
-                                "uncertain attempt inspected: account_id={account_id} attempt_id={attempt_id} exact prepared envelope was not found in fresh authenticated trade history; an unknown-submission reconciliation case was opened and the intent remains blocked. To record a human no-fill decision after reviewing this result, rerun: persistent_control reconcile-uncertain {attempt_id} --confirm-no-fill <reason>"
+                                "uncertain attempt inspected: account_id={account_id} attempt_id={attempt_id} no exact match in token-filtered CLOB history; this is NOT proof of no fill for a GTD maker order. An unknown-submission case was opened and the intent remains blocked. Review independent order-hash evidence before any human no-fill confirmation; do not resume on this result."
                             );
                         }
                     }

@@ -1101,6 +1101,7 @@ mod tests {
     fn maker_fill(order_id: &str, matched_amount: Decimal, price: Decimal) -> AccountTradeMakerFill {
         AccountTradeMakerFill {
             order_id: order_id.to_owned(),
+            asset_id: OutcomeTokenId::from_str("123456").expect("fixture token"),
             matched_amount,
             price,
             side: AccountTradeSide::Buy,
@@ -1154,6 +1155,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl StrictTradeHistoryReader for FakeTradeHistoryReader {
+        async fn trades_between_unfiltered(
+            &self, token: &OutcomeTokenId, after: DateTime<Utc>, before: DateTime<Utc>,
+        ) -> Result<Vec<AccountTrade>, StrictTradeHistoryError> {
+            self.trades_for_token_between(token, after, before).await
+        }
+
         async fn trades_for_token_between(
             &self,
             _token_id: &OutcomeTokenId,
@@ -1539,7 +1546,7 @@ mod tests {
     // accepted_qty > requested_qty guard is symmetric.
 
     #[test]
-    fn gtd_maker_buy_matches_opposite_taker_sell_but_not_same_direction() {
+    fn gtd_maker_buy_matches_by_maker_leg_even_when_taker_buys_complement() {
         let mut valid = maker_role_trade(
             "trade-a",
             AccountTradeSide::Buy,
@@ -1553,11 +1560,14 @@ mod tests {
         };
         assert_eq!(recover_gtd_maker_order_from_trades(&gtd_envelope(42), "maker-a", trade_history_window(), &[valid.clone()]), Ok(expected));
         valid.side = AccountTradeSide::Buy;
-        assert_eq!(recover_gtd_maker_order_from_trades(&gtd_envelope(42), "maker-a", trade_history_window(), &[valid]), Ok(TradeHistoryLookup::NotFound));
+        valid.token_id = OutcomeTokenId::from_str("654321").unwrap();
+        assert_eq!(recover_gtd_maker_order_from_trades(&gtd_envelope(42), "maker-a", trade_history_window(), &[valid]), Ok(TradeHistoryLookup::Recovered {
+            order_id: OrderId("maker-a".to_owned()), filled_qty: Decimal::new(2, 0), maker_notional_usdc: Decimal::new(98, 2),
+        }));
     }
 
     #[test]
-    fn gtd_maker_sell_matches_opposite_taker_buy_and_rejects_wrong_maker_side() {
+    fn gtd_maker_sell_rejects_wrong_maker_side() {
         let mut sell = gtd_envelope(42);
         sell.side = "SELL".to_owned();
         let mut valid = maker_role_trade(
@@ -1579,6 +1589,45 @@ mod tests {
         );
         valid.maker_orders[0].side = AccountTradeSide::Buy;
         assert_eq!(recover_gtd_maker_order_from_trades(&sell, "maker-a", trade_history_window(), &[valid]), Ok(TradeHistoryLookup::NotFound));
+    }
+
+    #[test]
+    fn real_shaped_cross_asset_gtd_maker_fill_recovers_both_legs_with_atomic_price_artifact() {
+        let mut envelope = gtd_envelope(42);
+        envelope.price = "0.15".to_owned();
+        envelope.token_id = "539001".to_owned();
+        let complementary = OutcomeTokenId::from_str("539002").unwrap();
+        let own = OutcomeTokenId::from_str(&envelope.token_id).unwrap();
+        let make_trade = |id: &str, amount: Decimal, price: Decimal| {
+            let mut trade = maker_role_trade(id, AccountTradeSide::Buy,
+                vec![maker_fill("0x0000000000000000000000000000000000000000000000000000000000000539", amount, price)], 29);
+            trade.token_id = complementary.clone();
+            trade.side = AccountTradeSide::Buy;
+            trade.match_time = Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 5).single().unwrap();
+            trade.maker_orders[0].asset_id = own.clone();
+            trade
+        };
+        let trades = [
+            make_trade("leg-1", Decimal::new(2_370_000, 6), Decimal::new(15, 2)),
+            make_trade("leg-2", Decimal::new(10_623_526, 6), Decimal::from_str("0.1500000094130706").unwrap()),
+        ];
+        let expected = TradeHistoryLookup::Recovered {
+            order_id: OrderId("0x0000000000000000000000000000000000000000000000000000000000000539".to_owned()),
+            filled_qty: Decimal::new(12_993_526, 6),
+            maker_notional_usdc: Decimal::new(1_949_029, 6),
+        };
+        assert_eq!(recover_gtd_maker_order_from_trades(&envelope,
+            "0x0000000000000000000000000000000000000000000000000000000000000539",
+            trade_history_window(), &trades), Ok(expected));
+    }
+
+    #[test]
+    fn gtd_exact_order_hash_on_wrong_maker_asset_is_not_a_fill() {
+        let mut trade = maker_role_trade("wrong-asset", AccountTradeSide::Buy,
+            vec![maker_fill("maker-a", Decimal::new(2, 0), Decimal::new(49, 2))], 1);
+        trade.maker_orders[0].asset_id = OutcomeTokenId::from_str("654321").unwrap();
+        assert_eq!(recover_gtd_maker_order_from_trades(&gtd_envelope(42), "maker-a",
+            trade_history_window(), &[trade]), Ok(TradeHistoryLookup::NotFound));
     }
 
     // GTD/post-only maker-fill matcher
@@ -1629,7 +1678,7 @@ mod tests {
             TradeHistoryLookup::Recovered {
                 order_id: OrderId("maker-a".to_owned()),
                 filled_qty: Decimal::new(5_288_460, 6),
-                maker_notional_usdc: Decimal::new(25_584_608, 7),
+                maker_notional_usdc: Decimal::new(2_558_461, 6),
             }
         );
     }

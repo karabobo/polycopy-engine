@@ -122,6 +122,17 @@ pub trait StrictTradeHistoryReader: Send + Sync {
         after: DateTime<Utc>,
         before: DateTime<Utc>,
     ) -> Result<Vec<AccountTrade>, StrictTradeHistoryError>;
+
+    /// GTD maker fills may be reported under the complementary taker asset.
+    /// A reader without proven unfiltered pagination must fail closed.
+    async fn trades_between_unfiltered(
+        &self,
+        _token_id_for_error: &OutcomeTokenId,
+        _after: DateTime<Utc>,
+        _before: DateTime<Utc>,
+    ) -> Result<Vec<AccountTrade>, StrictTradeHistoryError> {
+        Err(StrictTradeHistoryError::InvalidWindow)
+    }
 }
 
 /// Read-only adapter for an already authenticated official CLOB SDK client.
@@ -174,10 +185,42 @@ impl IntlClobReadAdapter {
 
         Ok(trades.into_iter().map(AccountTrade::from).collect())
     }
+
+    /// Operator-only diagnosis: the same authenticated paginated stream,
+    /// without an asset filter. Do not interpret an empty result as no fill.
+    pub async fn trades_between_unfiltered(
+        &self,
+        token_id_for_error: &OutcomeTokenId,
+        after: DateTime<Utc>,
+        before: DateTime<Utc>,
+    ) -> Result<Vec<AccountTrade>, StrictTradeHistoryError> {
+        if after > before {
+            return Err(StrictTradeHistoryError::InvalidWindow);
+        }
+        let request = TradesRequest::builder()
+            .after(after.timestamp())
+            .before(before.timestamp())
+            .build();
+        let trades: Vec<TradeResponse> = self.client
+            .stream_data(|client, cursor| client.trades(&request, cursor))
+            .try_collect()
+            .await
+            .map_err(|source| StrictTradeHistoryError::Query {
+                token_id: token_id_for_error.clone(),
+                source,
+            })?;
+        Ok(trades.into_iter().map(AccountTrade::from).collect())
+    }
 }
 
 #[async_trait]
 impl StrictTradeHistoryReader for IntlClobReadAdapter {
+    async fn trades_between_unfiltered(
+        &self, token: &OutcomeTokenId, after: DateTime<Utc>, before: DateTime<Utc>,
+    ) -> Result<Vec<AccountTrade>, StrictTradeHistoryError> {
+        Self::trades_between_unfiltered(self, token, after, before).await
+    }
+
     async fn trades_for_token_between(
         &self,
         token_id: &OutcomeTokenId,
@@ -225,6 +268,7 @@ pub struct AccountTrade {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AccountTradeMakerFill {
     pub order_id: String,
+    pub asset_id: OutcomeTokenId,
     pub matched_amount: Decimal,
     pub price: Decimal,
     pub side: AccountTradeSide,
@@ -255,6 +299,7 @@ impl From<TradeResponse> for AccountTrade {
             .into_iter()
             .map(|maker_order| AccountTradeMakerFill {
                 order_id: maker_order.order_id,
+                asset_id: OutcomeTokenId(maker_order.asset_id),
                 matched_amount: maker_order.matched_amount,
                 price: maker_order.price,
                 side: match maker_order.side {

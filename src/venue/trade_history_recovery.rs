@@ -266,16 +266,8 @@ pub fn recover_fak_taker_order_from_trades(
     }
 }
 
-fn opposite_side(side: AccountTradeSide) -> AccountTradeSide {
-    match side {
-        AccountTradeSide::Buy => AccountTradeSide::Sell,
-        AccountTradeSide::Sell => AccountTradeSide::Buy,
-        AccountTradeSide::Unknown => AccountTradeSide::Unknown,
-    }
-}
-
-/// Queries the authenticated account's complete trade history page stream for
-/// this envelope's token and applies [`recover_gtd_maker_order_from_trades`].
+/// Queries the authenticated account's complete unfiltered trade history
+/// page stream and applies [`recover_gtd_maker_order_from_trades`].
 /// This method makes GET requests only; it has no signing, submission,
 /// cancellation, allowance, or retry behavior.
 pub async fn lookup_gtd_maker_fill_in_trade_history<R>(
@@ -289,8 +281,10 @@ where
 {
     let token_id = OutcomeTokenId::from_str(&envelope.token_id)
         .map_err(|_| TradeHistoryRecoveryError::InvalidTokenId)?;
+    // Real maker fills for two GTDs appeared only under the complementary
+    // taker asset; an asset_id filter suppressed both exact-order matches.
     let trades = reader
-        .trades_for_token_between(&token_id, window.after(), window.before())
+        .trades_between_unfiltered(&token_id, window.after(), window.before())
         .await
         .map_err(TradeHistoryRecoveryError::Query)?;
 
@@ -313,10 +307,9 @@ where
 /// which describe the taker's aggregate fill across every maker order in
 /// that sweep, not this one order's. Any missing maker order ID, unknown
 /// status/side/role, out-of-window trade, limit-incompatible fill,
-/// duplicate conflict, or zero result is fail-closed. The top-level trade
-/// side describes the taker and must be opposite the matched maker order's
-/// side, which must agree with the envelope. This mirrors
-/// [`recover_fak_taker_order_from_trades`].
+/// duplicate conflict, or zero result is fail-closed. The trade's top-level
+/// asset and side can refer to the complementary taker asset: match the maker
+/// leg's asset and side, never the top-level fields.
 pub fn recover_gtd_maker_order_from_trades(
     envelope: &PreparedOrderEnvelope,
     maker_order_id: &str,
@@ -363,8 +356,7 @@ pub fn recover_gtd_maker_order_from_trades(
             continue;
         }
 
-        if trade.token_id.to_string() != envelope.token_id
-            || trade.role != AccountTradeRole::Maker
+        if trade.role != AccountTradeRole::Maker
             || !matches!(
                 trade.status,
                 AccountTradeStatus::Matched
@@ -378,15 +370,21 @@ pub fn recover_gtd_maker_order_from_trades(
 
         for fill in &trade.maker_orders {
             if fill.order_id != maker_order_id
+                || fill.asset_id.to_string() != envelope.token_id
                 || fill.side != side
-                || trade.side != opposite_side(side)
                 || fill.matched_amount <= Decimal::ZERO
             {
                 continue;
             }
+            // The venue reports executed USDC (6 dp) divided by shares
+            // (6 dp) as a high-precision effective price. A 1-atomic-unit
+            // rounding artifact must not hide an exact-hash maker fill.
+            let executed_usdc = (fill.price * fill.matched_amount)
+                .round_dp_with_strategy(6, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
+            let limit_usdc = fill.matched_amount * limit_price;
             let is_limit_compatible = match side {
-                AccountTradeSide::Buy => fill.price <= limit_price,
-                AccountTradeSide::Sell => fill.price >= limit_price,
+                AccountTradeSide::Buy => executed_usdc <= limit_usdc + Decimal::new(1, 6),
+                AccountTradeSide::Sell => executed_usdc + Decimal::new(1, 6) >= limit_usdc,
                 AccountTradeSide::Unknown => false,
             };
             if !is_limit_compatible {
@@ -394,7 +392,7 @@ pub fn recover_gtd_maker_order_from_trades(
             }
 
             filled_qty += fill.matched_amount;
-            maker_notional_usdc += fill.matched_amount * fill.price;
+            maker_notional_usdc += executed_usdc;
         }
     }
 

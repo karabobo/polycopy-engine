@@ -115,6 +115,22 @@ impl OrderReceipt {
         )
     }
 
+    /// A recovered GTD maker order has expired; unfilled shares are not
+    /// executable, but remain part of its auditable terminal receipt.
+    pub fn from_expired_gtd_shares(
+        requested_shares: Decimal,
+        filled_shares: Decimal,
+    ) -> Result<Self, ReceiptError> {
+        validate_no_fill_on_zero_request("filled_qty", requested_shares, filled_shares)?;
+        validate_not_greater_than_requested("filled_qty", filled_shares, requested_shares)?;
+        Self::new(
+            requested_shares,
+            requested_shares,
+            filled_shares,
+            requested_shares - filled_shares,
+        )
+    }
+
     pub fn requested_qty(&self) -> Decimal {
         self.requested_qty
     }

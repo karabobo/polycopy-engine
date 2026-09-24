@@ -1086,8 +1086,8 @@ pub async fn resolve_operator_confirmed_no_fill(
         .map_err(db_err)?;
 
     let result: Result<i64, PersistentError> = async {
-        let row: Option<(i64, String, String)> = sqlx::query_as(
-            "SELECT ci.id, ci.status, oa.status FROM order_attempts oa \
+        let row: Option<(i64, String, String, String)> = sqlx::query_as(
+            "SELECT ci.id, ci.status, oa.status, json_extract(oa.envelope_json, '$.order_type') FROM order_attempts oa \
              JOIN copy_intents ci ON ci.id = oa.intent_id \
              WHERE oa.id = ? AND ci.account_id = ?",
         )
@@ -1096,9 +1096,15 @@ pub async fn resolve_operator_confirmed_no_fill(
         .fetch_optional(&mut *conn)
         .await
         .map_err(db_err)?;
-        let Some((intent_id, intent_status, attempt_status)) = row else {
+        let Some((intent_id, intent_status, attempt_status, order_type)) = row else {
             return Err(PersistentError::UnresolvedRecovery);
         };
+        // Token-filtered CLOB history has missed real maker fills. Until an
+        // independent exact-order-hash proof exists, no GTD no-fill decision
+        // can release its reservation or erase the chance of a confirmed lot.
+        if order_type == "GTD" {
+            return Err(PersistentError::UnresolvedRecovery);
+        }
         if intent_status != "needs_reconcile" || attempt_status != "uncertain" {
             return Err(PersistentError::UnresolvedRecovery);
         }
@@ -1244,15 +1250,18 @@ pub async fn restore_reservation_and_finalize_recovered_fill(
                 eprintln!("recovered-fill recovery failed: persisted envelope is invalid: {error}");
                 PersistentError::UnresolvedRecovery
             })?;
-        let receipt = crate::venue::intl_clob_exec::receipt_from_submitted_envelope(
-            &envelope,
-            filled_qty,
-            filled_qty,
-        )
-        .map_err(|error| {
-            eprintln!("recovered-fill recovery failed: recovered receipt is invalid: {error}");
-            PersistentError::UnresolvedRecovery
-        })?;
+        let receipt = if envelope.order_type == "GTD" {
+            let requested = envelope.size.parse().map_err(|_| PersistentError::UnresolvedRecovery)?;
+            crate::venue::OrderReceipt::from_expired_gtd_shares(requested, filled_qty)
+                .map_err(|_| PersistentError::UnresolvedRecovery)?
+        } else {
+            crate::venue::intl_clob_exec::receipt_from_submitted_envelope(
+                &envelope, filled_qty, filled_qty,
+            ).map_err(|error| {
+                eprintln!("recovered-fill recovery failed: recovered receipt is invalid: {error}");
+                PersistentError::UnresolvedRecovery
+            })?
+        };
         if receipt.filled_qty() != filled_qty {
             eprintln!("recovered-fill recovery failed: recovered receipt fill disagrees with strict history");
             return Err(PersistentError::UnresolvedRecovery);
@@ -1306,11 +1315,12 @@ pub async fn restore_reservation_and_finalize_recovered_fill(
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         let attempt = sqlx::query(
             "UPDATE order_attempts SET status = 'finalized', filled_qty = ?, \
-             accepted_qty = ?, remaining_qty = '0', failure_detail = NULL, \
+             accepted_qty = ?, remaining_qty = ?, failure_detail = NULL, \
              updated_at = ? WHERE id = ? AND status = 'uncertain'",
         )
         .bind(receipt.filled_qty().to_string())
         .bind(receipt.accepted_qty().to_string())
+        .bind(receipt.remaining_qty().to_string())
         .bind(&now)
         .bind(attempt_id)
         .execute(&mut *conn)
@@ -2769,6 +2779,103 @@ mod tests {
         assert_startup_clear(&db, 1)
             .await
             .expect("startup must be clear after accounting the fill");
+    }
+
+    #[tokio::test]
+    async fn gtd_no_fill_confirmation_cannot_release_an_unverified_maker_order() {
+        let db = TestDb::new().await;
+        seed_base(&db).await;
+        let now = Utc::now();
+        let (intent_id, attempt_id) = seed_attempt(
+            &db, "gtd-no-fill-unsafe", "2", now + chrono::Duration::seconds(60),
+        ).await;
+        let mut envelope: PreparedOrderEnvelope = serde_json::from_str(
+            &sqlx::query_scalar::<_, String>("SELECT envelope_json FROM order_attempts WHERE id = ?")
+                .bind(attempt_id).fetch_one(&*db).await.unwrap(),
+        ).unwrap();
+        envelope.order_type = "GTD".to_owned();
+        sqlx::query("UPDATE order_attempts SET envelope_json = ?, status = 'uncertain' WHERE id = ?")
+            .bind(serde_json::to_string(&envelope).unwrap()).bind(attempt_id)
+            .execute(&*db).await.unwrap();
+        sqlx::query("UPDATE copy_intents SET status = 'needs_reconcile' WHERE id = ?")
+            .bind(intent_id).execute(&*db).await.unwrap();
+        sqlx::query("INSERT INTO reconciliation_cases (account_id, token_id, intent_id, order_attempt_id, case_type) VALUES (1, '123456', ?, ?, 'unknown_submission')")
+            .bind(intent_id).bind(attempt_id).execute(&*db).await.unwrap();
+        assert_eq!(resolve_operator_confirmed_no_fill(&db, 1, attempt_id, "token query empty").await,
+            Err(PersistentError::UnresolvedRecovery));
+        let status: String = sqlx::query_scalar("SELECT status FROM order_attempts WHERE id = ?")
+            .bind(attempt_id).fetch_one(&*db).await.unwrap();
+        assert_eq!(status, "uncertain");
+        let open: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ? AND resolved_at IS NULL")
+            .bind(intent_id).fetch_one(&*db).await.unwrap();
+        assert_eq!(open, 1);
+    }
+
+    #[tokio::test]
+    async fn partial_gtd_recovery_books_only_confirmed_shares_and_closes_both_cases_once() {
+        let db = TestDb::new().await;
+        seed_base(&db).await;
+        let now = Utc::now();
+        let (intent_id, attempt_id) = seed_attempt(
+            &db, "gtd-539-partial", "13", now + chrono::Duration::seconds(60),
+        ).await;
+        let mut envelope: PreparedOrderEnvelope = serde_json::from_str(
+            &sqlx::query_scalar::<_, String>("SELECT envelope_json FROM order_attempts WHERE id = ?")
+                .bind(attempt_id).fetch_one(&db.pool).await.unwrap(),
+        ).unwrap();
+        envelope.order_type = "GTD".to_owned();
+        envelope.post_only = true;
+        envelope.buy_shares_exact = true;
+        envelope.price = "0.15".to_owned();
+        sqlx::query("UPDATE copy_intents SET planned_notional_usdc = '2' WHERE id = ?")
+            .bind(intent_id).execute(&db.pool).await.unwrap();
+        sqlx::query("UPDATE order_attempts SET envelope_json = ? WHERE id = ?")
+            .bind(serde_json::to_string(&envelope).unwrap()).bind(attempt_id)
+            .execute(&db.pool).await.unwrap();
+        let config = PersistentRuntimeConfig::from_values(1, true, "1", "5", "50", 86_400, 1, 60).unwrap();
+        reserve_budget_and_mark_submitting(&db, &config, intent_id, attempt_id, now)
+            .await.expect("reserve");
+        sqlx::query("UPDATE order_attempts SET status = 'uncertain' WHERE id = ?")
+            .bind(attempt_id).execute(&db.pool).await.unwrap();
+        sqlx::query("UPDATE copy_intents SET status = 'needs_reconcile' WHERE id = ?")
+            .bind(intent_id).execute(&db.pool).await.unwrap();
+        for case_type in ["strict_query_failure", "unknown_submission"] {
+            sqlx::query("INSERT INTO reconciliation_cases (account_id, token_id, intent_id, order_attempt_id, case_type) VALUES (1, '123456', ?, ?, ?)")
+                .bind(intent_id).bind(attempt_id).bind(case_type)
+                .execute(&db.pool).await.unwrap();
+        }
+        let qty = Decimal::new(12_993_526, 6);
+        let principal = Decimal::new(1_949_029, 6);
+        restore_reservation_and_finalize_recovered_fill(&db, 1, attempt_id, qty, principal)
+            .await.expect("partial GTD receipt");
+        let (attempt_status, filled, remaining, accounted): (String, String, String, String) =
+            sqlx::query_as("SELECT status, filled_qty, remaining_qty, accounted_filled_qty FROM order_attempts WHERE id = ?")
+                .bind(attempt_id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(attempt_status, "finalized");
+        assert_eq!(filled.parse::<Decimal>().unwrap(), qty);
+        assert_eq!(accounted.parse::<Decimal>().unwrap(), qty);
+        assert_eq!(remaining.parse::<Decimal>().unwrap(), Decimal::new(6_474, 6));
+        let (status, reserved): (String, String) = sqlx::query_as(
+            "SELECT status, reserved_qty FROM copy_intents WHERE id = ?",
+        ).bind(intent_id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(status, "partially_filled");
+        assert_eq!(reserved, "0");
+        let (budget, state): (String, String) = sqlx::query_as(
+            "SELECT amount_usdc, state FROM persistent_budget_reservations WHERE order_attempt_id = ?",
+        ).bind(attempt_id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(budget.parse::<Decimal>().unwrap(), principal);
+        assert_eq!(state, "reserved");
+        let lot: String = sqlx::query_scalar("SELECT qty FROM position_lots WHERE account_id = 1 AND leader_id = 1 AND token_id = '123456'")
+            .fetch_one(&db.pool).await.unwrap();
+        assert_eq!(lot.parse::<Decimal>().unwrap(), qty);
+        let open: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ? AND resolved_at IS NULL")
+            .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(open, 0);
+        assert_eq!(restore_reservation_and_finalize_recovered_fill(&db, 1, attempt_id, qty, principal).await,
+            Err(PersistentError::UnresolvedRecovery));
+        let lot_after: String = sqlx::query_scalar("SELECT qty FROM position_lots WHERE account_id = 1 AND leader_id = 1 AND token_id = '123456'")
+            .fetch_one(&db.pool).await.unwrap();
+        assert_eq!(lot_after, lot);
     }
 
     #[tokio::test]
