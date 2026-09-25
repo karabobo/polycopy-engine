@@ -87,6 +87,7 @@ pub use persistent::{
     pause_fuse as pause_persistent_fuse, reconfigure_config as reconfigure_persistent_config,
     release_definitive_rejection, release_pre_boundary_failure, reserve_budget_and_mark_submitting,
     resolve_no_virtual_lot_sell_case, resolve_operator_confirmed_no_fill,
+    resolve_chain_proven_gtd_no_fill,
     resolve_pre_submit_balance_case,
     resolve_exhausted_fak_no_match,
     resolve_exhausted_maker_only_crossing,

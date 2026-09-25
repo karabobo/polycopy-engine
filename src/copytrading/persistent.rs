@@ -1072,6 +1072,78 @@ async fn resolve_linked_strict_query_failure(
     Ok(())
 }
 
+/// Finalize an independently proven GTD zero-fill in the same atomic ledger
+/// transition used for operator no-fill. Evidence is checked again against the
+/// persisted attempt inside the IMMEDIATE transaction; no caller can pass an
+/// arbitrary hash, intent or evidence timestamp to close another attempt.
+pub async fn resolve_chain_proven_gtd_no_fill(
+    pool: &SqlitePool,
+    account_id: i64,
+    attempt_id: i64,
+    expected_submission: &str,
+    expected_expiry: &str,
+    evidence: &crate::venue::gtd_chain_evidence::ZeroProof,
+) -> Result<i64, PersistentError> {
+    let evidence_detail = non_empty(evidence.detail(), "chain_evidence")?;
+    let mut conn = pool.acquire().await.map_err(db_err)?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await.map_err(db_err)?;
+    let result: Result<i64, PersistentError> = async {
+        type GtdNoFillRow = (i64,String,String,String,String,String,String,String);
+        let row: Option<GtdNoFillRow> = sqlx::query_as(
+            "SELECT ci.id, ci.status, oa.status, oa.envelope_json, oa.venue_order_id, \
+             oa.submission_started_at, ci.token_id, a.funder_address \
+             FROM order_attempts oa JOIN copy_intents ci ON ci.id = oa.intent_id \
+             JOIN accounts a ON a.id = ci.account_id WHERE oa.id = ? AND ci.account_id = ?")
+            .bind(attempt_id).bind(account_id).fetch_optional(&mut *conn).await.map_err(db_err)?;
+        let (intent_id,intent_status,attempt_status,envelope_json,hash,submission,token,funder) =
+            row.ok_or(PersistentError::UnresolvedRecovery)?;
+        let envelope: crate::copytrading::PreparedOrderEnvelope = serde_json::from_str(&envelope_json)
+            .map_err(|_|PersistentError::UnresolvedRecovery)?;
+        if intent_status != "needs_reconcile" || attempt_status != "uncertain"
+            || envelope.order_type != "GTD" || envelope.token_id != token
+            || hash != evidence.order_hash() || !funder.eq_ignore_ascii_case(evidence.maker())
+            || token != evidence.token() || envelope.expected_taker_order_id != hash
+            || submission != expected_submission || envelope.expires_at.as_deref() != Some(expected_expiry) {
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+        let cases: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM reconciliation_cases WHERE account_id = ? AND intent_id = ? \
+             AND order_attempt_id = ? AND case_type = 'unknown_submission' AND resolved_at IS NULL ORDER BY id")
+            .bind(account_id).bind(intent_id).bind(attempt_id)
+            .fetch_all(&mut *conn).await.map_err(db_err)?;
+        let [case_id] = cases.as_slice() else {
+            return Err(PersistentError::Config(
+                "GTD 链上关单需要恰好一个未关闭的 unknown_submission case；若仅有 strict_query_failure，请先运行 reconcile-uncertain <attempt-id> 创建该 case，然后重新执行链上证据命令".to_owned(),
+            ));
+        };
+        let resolution = format!("chain-proven GTD no fill; authenticated CLOB exact hash absent; {evidence_detail}");
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis,true);
+        let attempt = sqlx::query("UPDATE order_attempts SET status='rejected', failure_detail=?, updated_at=? \
+            WHERE id=? AND status='uncertain' AND accounted_filled_qty='0'")
+            .bind(&resolution).bind(&now).bind(attempt_id).execute(&mut *conn).await.map_err(db_err)?;
+        let intent = sqlx::query("UPDATE copy_intents SET status='rejected', rejection_reason=?, reserved_qty='0', updated_at=? \
+            WHERE id=? AND status='needs_reconcile'")
+            .bind(&resolution).bind(&now).bind(intent_id).execute(&mut *conn).await.map_err(db_err)?;
+        let reservation = sqlx::query("UPDATE persistent_budget_reservations SET state='released_operator_no_fill', \
+            release_reason=?, released_at=? WHERE account_id=? AND order_attempt_id=? AND state='reserved'")
+            .bind(&resolution).bind(&now).bind(account_id).bind(attempt_id)
+            .execute(&mut *conn).await.map_err(db_err)?;
+        let case = sqlx::query("UPDATE reconciliation_cases SET resolved_at=?, resolution=? \
+            WHERE id=? AND account_id=? AND intent_id=? AND order_attempt_id=? AND resolved_at IS NULL")
+            .bind(&now).bind(&resolution).bind(case_id).bind(account_id).bind(intent_id).bind(attempt_id)
+            .execute(&mut *conn).await.map_err(db_err)?;
+        if [attempt.rows_affected(),intent.rows_affected(),reservation.rows_affected(),case.rows_affected()] != [1,1,1,1] {
+            return Err(PersistentError::UnresolvedRecovery);
+        }
+        resolve_linked_strict_query_failure(&mut conn,account_id,intent_id,attempt_id,&now,&resolution).await?;
+        Ok(*case_id)
+    }.await;
+    match result {
+        Ok(case_id) => {sqlx::query("COMMIT").execute(&mut *conn).await.map_err(db_err)?;Ok(case_id)}
+        Err(error) => {let _=sqlx::query("ROLLBACK").execute(&mut *conn).await;Err(error)}
+    }
+}
+
 pub async fn resolve_operator_confirmed_no_fill(
     pool: &SqlitePool,
     account_id: i64,
@@ -2409,6 +2481,77 @@ mod tests {
             resume_fuse(&db, 1, "resume").await,
             Err(PersistentError::UnresolvedRecovery)
         );
+    }
+
+    #[tokio::test]
+    async fn chain_proven_gtd_no_fill_rolls_back_when_late_reservation_write_fails() {
+        let db=TestDb::new().await;
+        seed_base(&db).await;
+        let now=Utc::now();
+        let (intent_id,attempt_id)=seed_attempt(&db,"chain-rollback","1",now+chrono::Duration::minutes(1)).await;
+        reserve_budget_and_mark_submitting(&db,&cfg(),intent_id,attempt_id,now).await.unwrap();
+        let submitted: String=sqlx::query_scalar("SELECT submission_started_at FROM order_attempts WHERE id=?")
+            .bind(attempt_id).fetch_one(&db.pool).await.unwrap();
+        let expiry=(now-chrono::Duration::hours(1)).to_rfc3339();
+        let hash=format!("0x{}","a".repeat(64));
+        let raw:String=sqlx::query_scalar("SELECT envelope_json FROM order_attempts WHERE id=?")
+            .bind(attempt_id).fetch_one(&db.pool).await.unwrap();
+        let mut envelope:PreparedOrderEnvelope=serde_json::from_str(&raw).unwrap();
+        envelope.order_type="GTD".into();envelope.post_only=true;
+        envelope.expires_at=Some(expiry.clone());envelope.expected_taker_order_id=hash.clone();
+        sqlx::query("UPDATE order_attempts SET status='uncertain', envelope_json=?,venue_order_id=? WHERE id=?")
+            .bind(serde_json::to_string(&envelope).unwrap()).bind(&hash).bind(attempt_id)
+            .execute(&db.pool).await.unwrap();
+        sqlx::query("UPDATE copy_intents SET status='needs_reconcile' WHERE id=?")
+            .bind(intent_id).execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO reconciliation_cases (account_id,token_id,intent_id,order_attempt_id,case_type) \
+            VALUES (1,'123456',?,?,'unknown_submission')")
+            .bind(intent_id).bind(attempt_id).execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO reconciliation_cases (account_id,token_id,intent_id,order_attempt_id,case_type) \
+            VALUES (1,'123456',?,?,'strict_query_failure')")
+            .bind(intent_id).bind(attempt_id).execute(&db.pool).await.unwrap();
+        let proof=crate::venue::gtd_chain_evidence::ZeroProof::fixture(&hash,
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","123456");
+        // Simulate the reservation disappearing between read-only evidence and
+        // the guarded write. Earlier updates MUST roll back together.
+        sqlx::query("DELETE FROM persistent_budget_reservations WHERE order_attempt_id=?")
+            .bind(attempt_id).execute(&db.pool).await.unwrap();
+        assert_eq!(resolve_chain_proven_gtd_no_fill(&db,1,attempt_id,&submitted,&expiry,&proof).await,
+            Err(PersistentError::UnresolvedRecovery));
+        let statuses:(String,String)=sqlx::query_as("SELECT oa.status,ci.status FROM order_attempts oa \
+            JOIN copy_intents ci ON ci.id=oa.intent_id WHERE oa.id=?")
+            .bind(attempt_id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(statuses,("uncertain".into(),"needs_reconcile".into()));
+        let unresolved:i64=sqlx::query_scalar("SELECT COUNT(*) FROM reconciliation_cases WHERE order_attempt_id=? AND resolved_at IS NULL")
+            .bind(attempt_id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(unresolved,2);
+
+        // Inject a SQLite failure after the attempt, intent and reservation
+        // updates, at the case update. The IMMEDIATE transaction must undo all
+        // three earlier writes, not merely leave the case open.
+        sqlx::query("INSERT INTO persistent_budget_reservations (account_id, leader_id, order_attempt_id, amount_usdc, reserved_at, state) VALUES (1, 1, ?, '1', ?, 'reserved')")
+            .bind(attempt_id).bind(&submitted).execute(&db.pool).await.unwrap();
+        sqlx::query("CREATE TRIGGER fail_chain_case_update BEFORE UPDATE ON reconciliation_cases BEGIN SELECT RAISE(ABORT, 'injected case failure'); END")
+            .execute(&db.pool).await.unwrap();
+        assert!(matches!(resolve_chain_proven_gtd_no_fill(&db,1,attempt_id,&submitted,&expiry,&proof).await,
+            Err(PersistentError::Database(_))));
+        let statuses:(String,String)=sqlx::query_as("SELECT oa.status,ci.status FROM order_attempts oa JOIN copy_intents ci ON ci.id=oa.intent_id WHERE oa.id=?")
+            .bind(attempt_id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(statuses,("uncertain".into(),"needs_reconcile".into()));
+        let reserved:String=sqlx::query_scalar("SELECT state FROM persistent_budget_reservations WHERE order_attempt_id=?")
+            .bind(attempt_id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(reserved,"reserved");
+        sqlx::query("DROP TRIGGER fail_chain_case_update").execute(&db.pool).await.unwrap();
+        let case_id=resolve_chain_proven_gtd_no_fill(&db,1,attempt_id,&submitted,&expiry,&proof).await.unwrap();
+        let resolved:i64=sqlx::query_scalar("SELECT COUNT(*) FROM reconciliation_cases WHERE order_attempt_id=? AND resolved_at IS NOT NULL")
+            .bind(attempt_id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(resolved,2);
+        assert!(case_id>0);
+        let state:String=sqlx::query_scalar("SELECT state FROM persistent_budget_reservations WHERE order_attempt_id=?")
+            .bind(attempt_id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(state,"released_operator_no_fill");
+        assert_eq!(resolve_chain_proven_gtd_no_fill(&db,1,attempt_id,&submitted,&expiry,&proof).await,
+            Err(PersistentError::UnresolvedRecovery));
     }
 
     #[tokio::test]

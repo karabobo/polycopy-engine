@@ -21,6 +21,12 @@ pub mod execution_contract;
 #[cfg(feature = "intl_clob")]
 pub mod trade_history_recovery;
 
+#[cfg(feature = "execute")]
+pub mod gtd_chain_evidence;
+
+#[cfg(feature = "execute")]
+pub mod gtd_signed_identity;
+
 #[cfg(feature = "intl_clob")]
 pub mod intl_clob;
 

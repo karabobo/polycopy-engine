@@ -12,6 +12,7 @@ intl_clob = [
     "dep:async-trait",
     "dep:futures-util",
     "dep:polymarket_client_sdk_v2",
+    "dep:reqwest",
     "polymarket_client_sdk_v2/clob",
     "dep:tokio",
 ]
@@ -140,6 +141,7 @@ polymarket_client_sdk_v2 = { path = "vendor/polymarket_client_sdk_v2_source", de
 # itself as a separate top-level dependency.
 ratatui = { version = "0.30", default-features = false, features = ["std", "crossterm"], optional = true }
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] , optional = true }
 # Only needed to call CryptoProvider::install_default() once at startup:
 # rustls 0.23+ no longer picks a default crypto backend on its own, and
 # without this every TLS connect (including tokio-tungstenite's) blocks/panics.

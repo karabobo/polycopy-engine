@@ -3352,6 +3352,7 @@ dependencies = [
  "futures-util",
  "polymarket_client_sdk_v2",
  "ratatui",
+ "reqwest",
  "rust_decimal",
  "rustls",
  "serde",

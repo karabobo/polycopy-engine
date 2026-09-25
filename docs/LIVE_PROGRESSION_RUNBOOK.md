@@ -212,7 +212,22 @@ decision, with a specific reason:
 /opt/polycopy-engine/current/target/release/persistent_control reconcile-uncertain <attempt-id> --confirm-no-fill "reviewed authenticated history at <UTC timestamp>"
 ```
 
-The confirmation reruns the strict lookup and then atomically requires the
+`--confirm-no-fill` is **not available for GTD**. For a GTD that remains
+uncertain after expiry, use `reconcile-gtd-chain-no-fill <attempt-id>` only
+after its signed expiry plus **30 minutes**. Configure
+`POLYCOPY_GTD_CHAIN_RPCS` with at least two distinct HTTPS Polygon RPC URLs
+(separated by commas; keep credential-bearing URLs out of shell history and
+logs). This Rust command derives the scan range from the persisted submission
+and expiry timestamps, scans both V2 contracts in 100-block pages, requires
+independent nodes to agree, checks non-hash `OrderFilled` controls, rechecks
+unfiltered authenticated CLOB history, and closes the linked cases and releases
+the reservation in one guarded transaction. A query failure or evidence
+mismatch does **not** authorize no-fill. A `strict_query_failure`-only attempt
+must first run `reconcile-uncertain <attempt-id>` to create the required linked
+`unknown_submission` case. The command does not clear the fuse or restart the
+service. Review its result and other open cases before a separate `resume`.
+
+For non-GTD attempts, the confirmation reruns the strict lookup and then atomically requires the
 same attempt to still be `uncertain`, its intent to still be
 `needs_reconcile`, one linked open `unknown_submission` case, and one reserved
 persistent budget row. It records the reason on the attempt, intent, case, and

@@ -1,8 +1,12 @@
 //! Operator control for persistent copy execution.
 //!
 //! This tool writes only local persistent configuration/fuse state.  Its
-//! `reconcile-uncertain` command additionally performs a strict read-only
-//! trade-history lookup; it has no order-submission path.
+//! `reconcile-uncertain` and `reconcile-gtd-chain-no-fill` perform strict
+//! read-only evidence lookups; neither has an order-submission path.
+
+#[cfg(feature = "execute")]
+#[path = "persistent_control/gtd_chain_no_fill.rs"]
+mod gtd_chain_no_fill;
 
 #[cfg(feature = "execute")]
 #[tokio::main(flavor = "current_thread")]
@@ -35,7 +39,7 @@ async fn main() {
         })?;
         let command = std::env::args().nth(1).ok_or_else(|| {
             polycopy_engine::copytrading::PersistentError::Config(
-                "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|resolve-exhausted-fak-no-match <intent-id>|resolve-exhausted-maker-only-crossing <intent-id>|resolve-no-virtual-lot-sell <intent-id>|reconcile-uncertain <attempt-id> [--confirm-no-fill <reason>]|reconcile-fill <attempt-id>|reconcile-preflight|mark-attempt-gtd-uncertain <attempt-id>"
+                "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|resolve-exhausted-fak-no-match <intent-id>|resolve-exhausted-maker-only-crossing <intent-id>|resolve-no-virtual-lot-sell <intent-id>|reconcile-uncertain <attempt-id> [--confirm-no-fill <reason>]|reconcile-gtd-chain-no-fill <attempt-id>|reconcile-fill <attempt-id>|reconcile-preflight|mark-attempt-gtd-uncertain <attempt-id>"
                     .to_owned(),
             )
         })?;
@@ -294,6 +298,20 @@ async fn main() {
                 println!(
                     "no-virtual-lot sell case resolved locally: account_id={account_id} intent_id={intent_id} case_id={case_id}"
                 );
+            }
+            "reconcile-gtd-chain-no-fill" => {
+                let _lock = EngineLock::acquire_for_database(&db_path).map_err(|error| {
+                    polycopy_engine::copytrading::PersistentError::Config(format!(
+                        "cannot reconcile while an engine owns the database: {error}"
+                    ))
+                })?;
+                let account_id=account_id_from_env()?;
+                let args=std::env::args().skip(2).collect::<Vec<_>>();
+                if args.len()!=1 {return Err(polycopy_engine::copytrading::PersistentError::Config(
+                    "usage: persistent_control reconcile-gtd-chain-no-fill <attempt-id>".to_owned()));}
+                let attempt_id=args[0].parse::<i64>().map_err(|_|polycopy_engine::copytrading::PersistentError::Config(
+                    "invalid attempt id".to_owned()))?;
+                gtd_chain_no_fill::run(&pool,account_id,attempt_id).await?;
             }
             "reconcile-uncertain" => {
                 let _lock = EngineLock::acquire_for_database(&db_path).map_err(|error| {
@@ -625,7 +643,7 @@ async fn main() {
             }
             _ => {
                 return Err(polycopy_engine::copytrading::PersistentError::Config(
-                    "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|resolve-exhausted-fak-no-match <intent-id>|resolve-exhausted-maker-only-crossing <intent-id>|resolve-no-virtual-lot-sell <intent-id>|reconcile-uncertain <attempt-id> [--confirm-no-fill <reason>]|reconcile-fill <attempt-id>|reconcile-preflight|mark-attempt-gtd-uncertain <attempt-id>"
+                    "usage: persistent_control init-config|reconfigure|status|pause|resume [reason]|cancel-overdue-pre-submit <intent-id>|release-definitive-rejection <attempt-id>|resolve-exhausted-fak-no-match <intent-id>|resolve-exhausted-maker-only-crossing <intent-id>|resolve-no-virtual-lot-sell <intent-id>|reconcile-uncertain <attempt-id> [--confirm-no-fill <reason>]|reconcile-gtd-chain-no-fill <attempt-id>|reconcile-fill <attempt-id>|reconcile-preflight|mark-attempt-gtd-uncertain <attempt-id>"
                         .to_owned(),
                 ));
             }
