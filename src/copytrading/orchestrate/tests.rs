@@ -1355,8 +1355,110 @@ async fn ratio_maker_only_keeps_two_decimal_shares_and_never_exceeds_reservation
     let budget: Decimal = envelope.buy_budget_usdc.unwrap().parse().unwrap();
     assert!(qty.normalize().scale() <= 2);
     assert_eq!(qty, Decimal::new(770, 2));
+    assert_eq!(price, Decimal::new(53, 2), "maker price must not be lowered for cent alignment");
     assert_eq!(budget, qty * price);
     assert!(budget <= reserved.parse().unwrap());
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn maker_only_fractional_shares_keep_min_limit_or_ask_minus_tick_grid() {
+    for (shares, limit, ask) in [
+        ("6.37", "0.27", "0.95"),
+        ("7.70", "0.53", "0.60"),
+        ("6.32", "0.64", "0.61"),
+        ("6.63", "0.61", "0.62"),
+        ("5.01", "0.42", "0.40"),
+    ] {
+        let db = TestDb::new().await;
+        seed_account_and_schedule(&db).await;
+        seed_leader(&db, 1).await;
+        let intent_id = seed_pending_buy(&db).await;
+        set_maker_only_policy(&db, intent_id).await;
+        let raw: String = sqlx::query_scalar("SELECT config_snapshot_json FROM copy_intents WHERE id = ?")
+            .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+        let mut policy: PolicySnapshot = serde_json::from_str(&raw).unwrap();
+        policy.max_order_shares = Some(shares.to_owned());
+        sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
+            .bind(serde_json::to_string(&policy).unwrap()).bind(intent_id)
+            .execute(&db.pool).await.unwrap();
+        sqlx::query("UPDATE leader_events SET price = ? WHERE id = (SELECT event_id FROM copy_intents WHERE id = ?)")
+            .bind(limit).bind(intent_id).execute(&db.pool).await.unwrap();
+        let venue = FakeVenue::succeeding(Decimal::ZERO);
+        *venue.best_ask_override.lock().unwrap() = Some(Ok(ask.parse().unwrap()));
+        let outcome = execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+            &venue, &venue, &EmptyHistory, intent_id, Utc::now()).await.unwrap();
+        assert_eq!(outcome, OrchestrateOutcome::Resting);
+        let raw: String = sqlx::query_scalar("SELECT envelope_json FROM order_attempts WHERE intent_id = ?")
+            .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+        let envelope: PreparedOrderEnvelope = serde_json::from_str(&raw).unwrap();
+        let expected = std::cmp::min(
+            limit.parse::<Decimal>().unwrap(),
+            ask.parse::<Decimal>().unwrap() - Decimal::new(1, 2),
+        );
+        assert_eq!(envelope.price.parse::<Decimal>().unwrap(), expected, "{shares} @ {limit}, ask {ask}");
+        assert_eq!(envelope.size.parse::<Decimal>().unwrap(), shares.parse::<Decimal>().unwrap());
+        assert!(envelope.post_only);
+        assert_eq!(venue.submit_count.load(Ordering::SeqCst), 1);
+        let reserved: String = sqlx::query_scalar("SELECT planned_notional_usdc FROM copy_intents WHERE id = ?")
+            .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+        assert!(envelope.buy_budget_usdc.unwrap().parse::<Decimal>().unwrap() <= reserved.parse().unwrap());
+    }
+}
+
+#[tokio::test]
+async fn maker_only_seven_point_seven_shares_at_53_cents_respects_ask_tick() {
+    for (ask, expected) in [("0.54", "0.53"), ("0.53", "0.52")] {
+        let db = TestDb::new().await;
+        seed_account_and_schedule(&db).await;
+        seed_leader(&db, 1).await;
+        let intent_id = seed_pending_buy(&db).await;
+        set_maker_only_policy(&db, intent_id).await;
+        let raw: String = sqlx::query_scalar("SELECT config_snapshot_json FROM copy_intents WHERE id = ?")
+            .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+        let mut policy: PolicySnapshot = serde_json::from_str(&raw).unwrap();
+        policy.max_order_shares = Some("7.70".to_owned());
+        sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
+            .bind(serde_json::to_string(&policy).unwrap()).bind(intent_id)
+            .execute(&db.pool).await.unwrap();
+        sqlx::query("UPDATE leader_events SET price = '0.53' WHERE id = (SELECT event_id FROM copy_intents WHERE id = ?)")
+            .bind(intent_id).execute(&db.pool).await.unwrap();
+        let venue = FakeVenue::succeeding(Decimal::ZERO);
+        *venue.best_ask_override.lock().unwrap() = Some(Ok(ask.parse().unwrap()));
+        assert_eq!(execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+            &venue, &venue, &EmptyHistory, intent_id, Utc::now()).await.unwrap(),
+            OrchestrateOutcome::Resting);
+        let raw: String = sqlx::query_scalar("SELECT envelope_json FROM order_attempts WHERE intent_id = ?")
+            .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+        let envelope: PreparedOrderEnvelope = serde_json::from_str(&raw).unwrap();
+        assert_eq!(envelope.size.parse::<Decimal>().unwrap(), Decimal::new(770, 2));
+        assert_eq!(envelope.price.parse::<Decimal>().unwrap(), expected.parse::<Decimal>().unwrap());
+        assert!(envelope.post_only);
+        assert_eq!(venue.submit_count.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn definitive_gtd_amount_rejection_does_not_retry_or_open_fuse() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+    set_maker_only_policy(&db, intent_id).await;
+    let venue = FakeVenue::succeeding(Decimal::ZERO);
+    *venue.submit_result.lock().unwrap() = Err(SubmitError::Rejected(
+        "invalid maker amount decimal precision".to_owned(),
+    ));
+    assert_eq!(execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+        &venue, &venue, &EmptyHistory, intent_id, Utc::now()).await.unwrap(),
+        OrchestrateOutcome::Rejected);
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 1);
+    let status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+        .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(status, "rejected");
+    assert_eq!(execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+        &venue, &venue, &EmptyHistory, intent_id, Utc::now()).await.unwrap(),
+        OrchestrateOutcome::NotClaimed);
     assert_eq!(venue.submit_count.load(Ordering::SeqCst), 1);
 }
 

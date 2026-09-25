@@ -429,8 +429,15 @@ where
     // cases. Deviation from the 2026-09-23 literal instruction ("用 best ask
     // 价格") is justified by direct venue evidence.
     let ceiling = std::cmp::min(decision.limit_price, best_ask - market.tick_size);
-    let maker_price = floor_to_valid_maker_price(ceiling, market.tick_size, decision.qty)
-        .map_err(|error| MakerOnlyError::Prepare(error.to_string()))?;
+    // The GTD limit builder accepts a two-decimal share size and a maker
+    // amount with tick decimals + two places. Do not force the cost down to
+    // whole cents by walking the price away from the leader's limit.
+    let maker_price = (ceiling / market.tick_size).floor() * market.tick_size;
+    if maker_price <= Decimal::ZERO || maker_price >= Decimal::ONE {
+        return Err(MakerOnlyError::Prepare(
+            "no positive tick-aligned maker price below the best ask".to_owned(),
+        ));
+    }
     let exact_cost = (decision.qty * maker_price).normalize();
     if decision.buy_budget.is_none_or(|reserved| exact_cost > reserved) {
         return Err(MakerOnlyError::Prepare(
@@ -1239,6 +1246,14 @@ where
             mark_attempt_rejected(pool, intent_id, attempt.id, &detail).await?;
             release_pre_boundary_failure(pool, attempt.id, "venue definitively rejected order")
                 .await?;
+            // A precision/amount rejection of a post-only GTD is not a
+            // moving-book condition. Retrying the same invalid quantity with
+            // another signature can exhaust the account-wide retry budget.
+            // The venue definitively refused this attempt; close its intent
+            // before a runner tick can prepare another one.
+            if attempt.envelope.order_type == "GTD" && is_gtd_amount_rejection(&detail) {
+                reject_pre_submit_intent(pool, intent_id, &detail).await?;
+            }
             // An explicit no-FAK response is a definitive zero-fill result.
             // The caller may perform exactly one fresh-book retry with a new
             // envelope; all other definitive rejections remain ordinary
@@ -1336,6 +1351,15 @@ async fn ensure_gtd_order_id_before_submit(
     tx.commit().await.map_err(|error| {
         OrchestrateError::Execute(ExecuteError::Database(error.to_string()))
     })
+}
+
+fn is_gtd_amount_rejection(detail: &str) -> bool {
+    let message = detail.to_ascii_lowercase();
+    (message.contains("amount") || message.contains("size"))
+        && (message.contains("precision")
+            || message.contains("decimal")
+            || message.contains("minimum")
+            || message.contains("invalid"))
 }
 
 async fn query_first<E, H>(
