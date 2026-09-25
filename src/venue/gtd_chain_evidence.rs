@@ -85,7 +85,9 @@ impl Rpc {
             let unique = endpoints.iter().collect::<std::collections::HashSet<_>>();
             unique.len() != endpoints.len()
         } { return Err(invalid("at least two distinct HTTPS RPC endpoints required")); }
-        let client = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()
+        let client = reqwest::Client::builder()
+            .user_agent("polycopy-gtd-chain-evidence/1.0")
+            .timeout(Duration::from_secs(20)).build()
             .map_err(|_| invalid("RPC client setup failed"))?;
         Ok(Self { transport: Arc::new(HttpTransport(client)), endpoints })
     }
@@ -107,8 +109,13 @@ impl Rpc {
     pub async fn first_block_at(&self, timestamp: u64) -> Result<u64,String> {
         let url=&self.endpoints[0];
         let mut left=1;
-        let mut right=hex_number(&self.call(url,"eth_blockNumber",json!([])).await?)?;
-        if self.block(url,right).await?.1 < timestamp {return Err(invalid("chain head precedes settlement"));}
+        let head=hex_number(&self.call(url,"eth_blockNumber",json!([])).await?)?;
+        let mut right=head.checked_sub(FINALITY)
+            .filter(|height| *height >= 1)
+            .ok_or_else(|| invalid("尚未达到最终确认: 链高度不足"))?;
+        if self.block(url,right).await?.1 < timestamp {
+            return Err(invalid("尚未达到最终确认: 最新已确认区块早于目标时间"));
+        }
         while left<right {
             let mid=left+(right-left)/2;
             if self.block(url,mid).await?.1 < timestamp {left=mid+1;} else {right=mid;}

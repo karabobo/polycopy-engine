@@ -15,6 +15,9 @@ impl RpcTransport for FakeRpc {
             "eth_blockNumber"=>json!("0x100"),
             "eth_getBlockByNumber"=>{
                 let n=u64::from_str_radix(params[0].as_str().unwrap().trim_start_matches("0x"),16).unwrap();
+                if self.failure==Some("null-head") && n==256 {
+                    return Ok(json!({"jsonrpc":"2.0","id":1,"result":null}));
+                }
                 let digest=if self.failure==Some("disagree") && url=="https://rpc-b" {"b"} else {"a"};
                 json!({"number":format!("0x{n:x}"),"hash":format!("0x{}",digest.repeat(64)),"timestamp":format!("0x{:x}",n*10)})
             }
@@ -64,6 +67,20 @@ async fn every_ambiguous_rpc_result_refuses_zero() {
         assert!(result.is_err(),"{failure} became zero evidence");
     }
 }
+#[tokio::test]
+async fn binary_search_uses_finalized_upper_bound_when_latest_block_is_null() {
+    let (rpc,fake)=setup(Some("null-head"));
+    assert_eq!(rpc.first_block_at(110).await.unwrap(),11);
+    let calls=fake.calls.lock().unwrap();
+    assert!(!calls.iter().any(|(_,method,params)|method=="eth_getBlockByNumber" && params[0]=="0x100"));
+}
+
+#[tokio::test]
+async fn binary_search_rejects_target_after_latest_finalized_block() {
+    let (rpc,_)=setup(None);
+    assert!(rpc.first_block_at(1281).await.unwrap_err().contains("尚未达到最终确认"));
+}
+
 #[tokio::test]
 async fn insufficient_finality_refuses_zero_before_log_queries() {
     let (rpc,fake)=setup(None);
