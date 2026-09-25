@@ -2895,9 +2895,15 @@ async fn live_gtd_lookup_failure_only_retries_without_fuse_or_resubmission() {
         OrchestrateOutcome::Resting);
     let failing = FakeVenue::order_lookup_failure("venue returned 404: order not found");
     for _ in 0..2 {
-        assert_eq!(execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
-            &failing, &failing, &EmptyHistory, intent_id, Utc::now()).await.unwrap(),
-            OrchestrateOutcome::Resting);
+        let outcome = execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+            &failing, &failing, &EmptyHistory, intent_id, Utc::now()).await.unwrap();
+        match outcome {
+            OrchestrateOutcome::GtdLookupRetry { detail, remaining } => {
+                assert!(detail.contains("404: order not found"));
+                assert!(remaining > chrono::Duration::zero());
+            }
+            other => panic!("expected a logged GTD lookup retry, got {other:?}"),
+        }
     }
     assert_eq!(failing.submit_count.load(Ordering::SeqCst), 0);
     let status: String = sqlx::query_scalar("SELECT status FROM order_attempts WHERE intent_id = ?")
@@ -2906,6 +2912,94 @@ async fn live_gtd_lookup_failure_only_retries_without_fuse_or_resubmission() {
     let cases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ? AND resolved_at IS NULL")
         .bind(intent_id).fetch_one(&db.pool).await.unwrap();
     assert_eq!(cases, 0);
+}
+
+#[tokio::test]
+async fn gtd_lookup_failure_then_terminal_fill_books_only_confirmed_shares() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+    set_maker_only_policy(&db, intent_id).await;
+    let venue = FakeVenue::succeeding(Decimal::ZERO);
+    assert_eq!(execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+        &venue, &venue, &EmptyHistory, intent_id, Utc::now()).await.unwrap(),
+        OrchestrateOutcome::Resting);
+    let failing = FakeVenue::order_lookup_failure("transient 404");
+    assert!(matches!(execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+        &failing, &failing, &EmptyHistory, intent_id, Utc::now()).await.unwrap(),
+        OrchestrateOutcome::GtdLookupRetry { .. }));
+    let filled = FakeVenue::succeeding(Decimal::ZERO);
+    filled.with_size_matched(Decimal::new(237, 2));
+    assert_eq!(execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+        &filled, &filled, &EmptyHistory, intent_id, Utc::now()).await.unwrap(),
+        OrchestrateOutcome::Filled { filled_qty: Decimal::new(237, 2) });
+    let accounted: String = sqlx::query_scalar("SELECT accounted_filled_qty FROM order_attempts WHERE intent_id = ?")
+        .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(accounted.parse::<Decimal>().unwrap(), Decimal::new(237, 2));
+    let lot: String = sqlx::query_scalar("SELECT qty FROM position_lots WHERE account_id = 1 AND leader_id = 1 AND token_id = '123456'")
+        .fetch_one(&db.pool).await.unwrap();
+    assert_eq!(lot.parse::<Decimal>().unwrap(), Decimal::new(237, 2));
+    assert_eq!(failing.submit_count.load(Ordering::SeqCst), 0);
+    assert_eq!(filled.submit_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn gtd_lookup_failure_at_exact_expiry_plus_margin_escalates() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+    set_maker_only_policy(&db, intent_id).await;
+    let venue = FakeVenue::succeeding(Decimal::ZERO);
+    assert_eq!(execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+        &venue, &venue, &EmptyHistory, intent_id, Utc::now()).await.unwrap(),
+        OrchestrateOutcome::Resting);
+    let now = Utc::now();
+    let expiry = now - chrono::Duration::minutes(5);
+    let raw: String = sqlx::query_scalar("SELECT envelope_json FROM order_attempts WHERE intent_id = ?")
+        .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    let mut envelope: PreparedOrderEnvelope = serde_json::from_str(&raw).unwrap();
+    envelope.expires_at = Some(expiry.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true));
+    sqlx::query("UPDATE order_attempts SET envelope_json = ? WHERE intent_id = ?")
+        .bind(serde_json::to_string(&envelope).unwrap()).bind(intent_id)
+        .execute(&db.pool).await.unwrap();
+    let failing = FakeVenue::order_lookup_failure("venue returned 404");
+    assert_eq!(execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+        &failing, &failing, &EmptyHistory, intent_id, now).await.unwrap(),
+        OrchestrateOutcome::Uncertain);
+    let status: String = sqlx::query_scalar("SELECT status FROM order_attempts WHERE intent_id = ?")
+        .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(status, "uncertain");
+}
+
+#[tokio::test]
+async fn gtd_lookup_failure_with_missing_or_malformed_expiry_escalates() {
+    for expiry in [None, Some("not-a-timestamp".to_owned())] {
+        let db = TestDb::new().await;
+        seed_account_and_schedule(&db).await;
+        seed_leader(&db, 1).await;
+        let intent_id = seed_pending_buy(&db).await;
+        set_maker_only_policy(&db, intent_id).await;
+        let venue = FakeVenue::succeeding(Decimal::ZERO);
+        assert_eq!(execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+            &venue, &venue, &EmptyHistory, intent_id, Utc::now()).await.unwrap(),
+            OrchestrateOutcome::Resting);
+        let raw: String = sqlx::query_scalar("SELECT envelope_json FROM order_attempts WHERE intent_id = ?")
+            .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+        let mut envelope: PreparedOrderEnvelope = serde_json::from_str(&raw).unwrap();
+        envelope.expires_at = expiry;
+        sqlx::query("UPDATE order_attempts SET envelope_json = ? WHERE intent_id = ?")
+            .bind(serde_json::to_string(&envelope).unwrap()).bind(intent_id)
+            .execute(&db.pool).await.unwrap();
+        let failing = FakeVenue::order_lookup_failure("no expiry; lookup failed");
+        assert_eq!(execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+            &failing, &failing, &EmptyHistory, intent_id, Utc::now()).await.unwrap(),
+            OrchestrateOutcome::Uncertain);
+        let status: String = sqlx::query_scalar("SELECT status FROM order_attempts WHERE intent_id = ?")
+            .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(status, "uncertain");
+    }
 }
 
 #[tokio::test]

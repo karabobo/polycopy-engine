@@ -158,6 +158,12 @@ mod live {
                     Ok(OrchestrateOutcome::Resting) => {
                         eprintln!("intent {intent_id}: post-only GTD remains on book");
                     }
+                    Ok(OrchestrateOutcome::GtdLookupRetry { detail, remaining }) => {
+                        eprintln!(
+                            "intent {intent_id}: GTD order lookup failed: {detail}; retrying read, expiry plus settlement margin in {} seconds; no resubmission",
+                            remaining.num_seconds()
+                        );
+                    }
                     Ok(OrchestrateOutcome::Rejected) => {
                         eprintln!("intent {intent_id}: rejected");
                     }

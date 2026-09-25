@@ -251,6 +251,9 @@ pub enum OrchestrateOutcome {
     /// A post-only GTD order is accepted by the venue and remains open. Its
     /// reservation stays active; the next runner tick polls the exact order.
     Resting,
+    /// The live-order read failed while the GTD is within its expiry margin.
+    /// No order state or reservation changed; retry the read on the next tick.
+    GtdLookupRetry { detail: String, remaining: chrono::Duration },
     Uncertain,
     NeedsReconcile(&'static str),
     Expired,
@@ -765,13 +768,18 @@ where
             let expiry = attempt.envelope.expires_at.as_deref()
                 .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
                 .map(|value| value.with_timezone(&Utc));
-            // Missing or malformed expiry cannot prove the order is old;
-            // preserve the state rather than guess that it is safe to escalate.
-            if expiry.is_none_or(|end| now < end + chrono::Duration::minutes(5)) {
-                return Ok(OrchestrateOutcome::Resting);
+            if let Some(deadline) = expiry.and_then(|end| end.checked_add_signed(chrono::Duration::minutes(5))) {
+                if now < deadline {
+                    return Ok(OrchestrateOutcome::GtdLookupRetry {
+                        detail,
+                        remaining: deadline - now,
+                    });
+                }
             }
+            // Missing/malformed expiry cannot establish a safe retry bound.
+            // Escalate without guessing; the attempt stays blocked for review.
             let failure_detail = format!(
-                "GTD live-order lookup failed after expiry and settlement margin: {detail}"
+                "GTD live-order lookup failed after expiry margin or without a valid expires_at: {detail}"
             );
             let transitioned = mark_attempt_gtd_lookup_failed(
                 pool,
