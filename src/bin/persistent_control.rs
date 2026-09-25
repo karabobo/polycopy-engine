@@ -315,7 +315,9 @@ async fn main() {
                     .await
                     .map_err(|error| polycopy_engine::copytrading::PersistentError::Database(error.to_string()))?;
                     if order_type.as_deref() == Some("GTD") {
-                        return Err(polycopy_engine::copytrading::PersistentError::UnresolvedRecovery);
+                        return Err(polycopy_engine::copytrading::PersistentError::Config(
+                            "GTD 不支持人工确认无成交,请使用链上证据命令".to_owned(),
+                        ));
                     }
                 }
                 let adapter = IntlClobCopyAdapter::from_env().await.map_err(|error| {

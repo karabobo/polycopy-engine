@@ -2883,6 +2883,32 @@ async fn an_attempt_in_an_unrecognized_status_opens_a_blocked_recovery_case() {
 }
 
 #[tokio::test]
+async fn live_gtd_lookup_failure_only_retries_without_fuse_or_resubmission() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+    set_maker_only_policy(&db, intent_id).await;
+    let venue = FakeVenue::succeeding(Decimal::new(5, 0));
+    assert_eq!(execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+        &venue, &venue, &EmptyHistory, intent_id, Utc::now()).await.unwrap(),
+        OrchestrateOutcome::Resting);
+    let failing = FakeVenue::order_lookup_failure("venue returned 404: order not found");
+    for _ in 0..2 {
+        assert_eq!(execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+            &failing, &failing, &EmptyHistory, intent_id, Utc::now()).await.unwrap(),
+            OrchestrateOutcome::Resting);
+    }
+    assert_eq!(failing.submit_count.load(Ordering::SeqCst), 0);
+    let status: String = sqlx::query_scalar("SELECT status FROM order_attempts WHERE intent_id = ?")
+        .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(status, "accepted");
+    let cases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ? AND resolved_at IS NULL")
+        .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(cases, 0);
+}
+
+#[tokio::test]
 async fn a_gtd_poll_lookup_failure_promotes_the_attempt_to_uncertain_instead_of_crashing() {
     // Regression test for the live incident captured in
     // `docs/poll-resting-gtd-404-permanently-blocks-startup.md`:
@@ -2975,6 +3001,16 @@ async fn a_gtd_poll_lookup_failure_promotes_the_attempt_to_uncertain_instead_of_
         accepted_precondition_submission.is_some(),
         "precondition: `submission_started_at` must be set after a successful submit (the `'uncertain'` recovery matrix path requires it)",
     );
+
+    // This legacy escalation test exercises a GTD whose expiry and
+    // settlement margin have already elapsed. Live GTDs retry instead.
+    let raw: String = sqlx::query_scalar("SELECT envelope_json FROM order_attempts WHERE intent_id = ?")
+        .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    let mut old_envelope: PreparedOrderEnvelope = serde_json::from_str(&raw).unwrap();
+    old_envelope.expires_at = Some((Utc::now() - chrono::Duration::minutes(10)).to_rfc3339());
+    sqlx::query("UPDATE order_attempts SET envelope_json = ? WHERE intent_id = ?")
+        .bind(serde_json::to_string(&old_envelope).unwrap()).bind(intent_id)
+        .execute(&db.pool).await.unwrap();
 
     // Second pass: a fresh venue whose `order_for_receipt` always
     // returns Err -- modelling both a transient 5xx and the canonical

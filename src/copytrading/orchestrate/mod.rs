@@ -653,7 +653,7 @@ where
     M: SubmitAttemptMarker,
 {
     if attempt.envelope.order_type == "GTD" && attempt.status == "accepted" {
-        return poll_resting_gtd(pool, execution, claimed.intent_id, attempt).await;
+        return poll_resting_gtd(pool, execution, claimed.intent_id, attempt, now).await;
     }
     let window_count = attempts_in_window(pool, claimed.intent_id).await?;
     match permitted_recovery_action(&attempt.status, true, window_count) {
@@ -744,19 +744,16 @@ async fn poll_resting_gtd<E>(
     execution: &E,
     intent_id: i64,
     attempt: AttemptRow,
+    now: DateTime<Utc>,
 ) -> Result<OrchestrateOutcome, OrchestrateError>
 where
     E: CopyExecution,
 {
-    // A failed GTD lookup leaves venue truth unknown, whether the error is
-    // a transient 5xx or a 404. The venue documents that /data/order/{id}
-    // can also return canceled and fully matched orders; a 404 does not
-    // establish zero fill. Move the attempt and tracking case together into
-    // reconciliation rather than repeating the same lookup on every startup.
-    // Resolving whether it actually filled is a separate step: an operator
-    // running `persistent_control reconcile-uncertain <attempt-id>`, which
-    // routes a GTD envelope to the maker-side trade-history matcher
-    // (`venue::trade_history_recovery::recover_gtd_maker_order_from_trades`).
+    // A failed order lookup during the signed GTD lifetime proves neither
+    // a fill nor a zero fill. Keep the accepted attempt and its reservation;
+    // subsequent ticks may retry the read, but must never resubmit the order.
+    // Only after expiry plus settlement margin may a persistent lookup error
+    // escalate to operator reconciliation.
     let state = match execution
         .order_for_receipt(&crate::venue::types::OrderId(
             attempt.envelope.expected_taker_order_id.clone(),
@@ -765,11 +762,16 @@ where
     {
         Ok(state) => state,
         Err(detail) => {
-            // Preserve the lookup error for the operator; this error alone
-            // does not establish a GTD fill one way or the other -- that
-            // determination happens later via `reconcile-uncertain`.
+            let expiry = attempt.envelope.expires_at.as_deref()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc));
+            // Missing or malformed expiry cannot prove the order is old;
+            // preserve the state rather than guess that it is safe to escalate.
+            if expiry.is_none_or(|end| now < end + chrono::Duration::minutes(5)) {
+                return Ok(OrchestrateOutcome::Resting);
+            }
             let failure_detail = format!(
-                "GTD live-order lookup failed and could not be retried here: {detail}"
+                "GTD live-order lookup failed after expiry and settlement margin: {detail}"
             );
             let transitioned = mark_attempt_gtd_lookup_failed(
                 pool,
