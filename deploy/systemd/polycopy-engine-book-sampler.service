@@ -1,0 +1,26 @@
+[Unit]
+Description=polycopy public order-book observer (no trading credentials)
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/var/lib/polycopy-engine/polycopy.sqlite
+ConditionPathExists=/opt/polycopy-engine/current/target/release/book_sampler
+
+[Service]
+Type=exec
+User=polycopy-engine
+Group=polycopy-engine
+UMask=0077
+WorkingDirectory=/opt/polycopy-engine/current
+ExecStart=/opt/polycopy-engine/current/target/release/book_sampler /var/lib/polycopy-engine/polycopy.sqlite /var/lib/polycopy-book-sampler/samples.sqlite
+StateDirectory=polycopy-book-sampler
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectHome=yes
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/polycopy-engine
+ReadWritePaths=/var/lib/polycopy-book-sampler
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Static and not installed/enabled by deploy scripts. Start only by operator choice.

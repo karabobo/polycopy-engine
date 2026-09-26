@@ -1,0 +1,9 @@
+# Order-book observations (diagnostic only)
+
+Migration `0020_intent_book_snapshots.sql` adds maker-only decision snapshots to the execution ledger. The existing order-book GET supplies both the price used by the unchanged maker-price rule (`min(limit, best_ask − tick)`, rounded down to tick) and diagnostic depth. Snapshot insert failures only log an error; they do not affect submission, reservation, reconciliation, or the account fuse.
+
+Prices and sizes are exact decimal strings. `ask_size_leader_0/2/4/6/10` sum displayed ask sizes at prices **at or below** the leader trade price plus 0/2/4/6/10 cents; `ask_size_at_best` sums all levels at the lowest ask. `fetched_at` is the response receipt time, not the venue book timestamp. These observations cannot establish executable fill guarantees.
+
+`book_sampler` is an independent process. It reads the main SQLite database via `open_read_only`, uses an unauthenticated public CLOB order-book GET, and writes to its own SQLite file (`book_samples`). It does not acquire `EngineLock` or load trading credentials. For each newly observed realtime leader event (whether or not planning accepts it), it schedules 0, 0.5, 1, 2, 5, 15, 60 and 200 seconds from `observed_at`. A missed slot or failed HTTP request produces an error row, never a fabricated on-time sample; subsequent slots continue. After restart, rows already saved are not fetched again. The sampler only scans the most recent 205 seconds of source events: it cannot reconstruct historical books after an outage.
+
+Build with `--features execute --bin book_sampler`. The optional static unit `deploy/systemd/polycopy-engine-book-sampler.service` is **not installed or enabled** by production install scripts; an operator must install/start it separately and provide access to its separate output directory. Neither binary nor unit changes execution configuration. Do not point its output path at the main ledger.

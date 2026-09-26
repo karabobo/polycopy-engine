@@ -515,7 +515,8 @@ impl EnvelopeFactory for FakeVenue {
     fn fetch_best_ask_for_maker_only<'a>(
         &'a self,
         _token_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Decimal, String>> + Send + 'a>> {
+        leader_price: Decimal,
+    ) -> Pin<Box<dyn Future<Output = Result<BookObservation, String>> + Send + 'a>> {
         // Override: `Some(Err(detail))` -> fail-closed. `Some(Ok(p))` -> fixed
         // best ask for this call (tests assert min(decision.limit_price, p)).
         // `None` -> audit baseline 0.40, which is more favorable than the
@@ -523,8 +524,10 @@ impl EnvelopeFactory for FakeVenue {
         let result = self.best_ask_override.lock().expect("best_ask_override lock").clone();
         Box::pin(async move {
             match result {
-                Some(value) => value,
-                None => Ok(Decimal::new(40, 2)),
+                Some(value) => value.and_then(|price| observe_book(
+                    [], [(price, Decimal::ONE)], leader_price, Utc::now(),
+                )),
+                None => observe_book([], [(Decimal::new(40, 2), Decimal::ONE)], leader_price, Utc::now()),
             }
         })
     }
@@ -1723,6 +1726,56 @@ async fn maker_only_rejects_a_legacy_decision_whose_budget_cannot_cover_signed_c
     let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM order_attempts WHERE intent_id = ?")
         .bind(intent_id).fetch_one(&db.pool).await.unwrap();
     assert_eq!(attempts, 0);
+}
+
+#[tokio::test]
+async fn maker_snapshot_records_decision_fields_and_failure_is_nonblocking() {
+    for fail_write in [false, true] {
+        let db = TestDb::new().await;
+        seed_account_and_schedule(&db).await;
+        seed_leader(&db, 1).await;
+        let intent_id = seed_pending_buy(&db).await;
+        set_maker_only_policy(&db, intent_id).await;
+        if fail_write {
+            sqlx::query("CREATE TRIGGER snapshot_failure BEFORE INSERT ON intent_book_snapshots BEGIN SELECT RAISE(FAIL, 'injected snapshot failure'); END")
+                .execute(&db.pool).await.unwrap();
+        }
+        let venue = FakeVenue::succeeding(Decimal::new(5, 0));
+        let outcome = execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+            &venue, &venue, &EmptyHistory, intent_id, Utc::now()).await.unwrap();
+        assert_eq!(outcome, OrchestrateOutcome::Resting);
+        let (intent_status, attempt_status, price): (String, String, String) = sqlx::query_as(
+            "SELECT ci.status, oa.status, json_extract(oa.envelope_json, '$.price') \
+             FROM copy_intents ci JOIN order_attempts oa ON oa.intent_id = ci.id WHERE ci.id = ?")
+            .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!((intent_status.as_str(), attempt_status.as_str(), price.as_str()), ("in_progress", "accepted", "0.39"));
+        assert_eq!(venue.submit_count.load(Ordering::SeqCst), 1);
+        let cases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ?")
+            .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(cases, 0);
+        let rows: Vec<(String, String, String, String, String, String, String)> = sqlx::query_as(
+            "SELECT best_ask, ask_size_at_best, ask_size_leader_0, \
+             leader_price, limit_price, maker_price, fetched_at \
+             FROM intent_book_snapshots WHERE intent_id = ?")
+            .bind(intent_id).fetch_all(&db.pool).await.unwrap();
+        assert_eq!(rows.len(), usize::from(!fail_write));
+        if let Some((ask, size, depth_0, leader, limit, maker, time)) = rows.first() {
+            assert_eq!(ask, "0.40");
+            assert_eq!(size, "1");
+            assert_eq!(depth_0, "1");
+            let remaining_depths: (String, String, String, String) = sqlx::query_as(
+                "SELECT ask_size_leader_2, ask_size_leader_4, ask_size_leader_6, ask_size_leader_10 \
+                 FROM intent_book_snapshots WHERE intent_id = ?")
+                .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+            for depth in [remaining_depths.0, remaining_depths.1, remaining_depths.2, remaining_depths.3] {
+                assert_eq!(depth, "1");
+            }
+            assert_eq!(leader, "0.55");
+            assert_eq!(limit, "0.55");
+            assert_eq!(maker, "0.39");
+            assert!(DateTime::parse_from_rfc3339(time).is_ok());
+        }
+    }
 }
 
 #[tokio::test]

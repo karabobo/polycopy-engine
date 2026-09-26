@@ -9,6 +9,10 @@
 
 pub mod control_tower;
 pub mod db;
+#[cfg(feature = "execute")]
+pub mod book_observation;
+#[cfg(feature = "execute")]
+pub mod book_sampler;
 pub mod plan;
 pub mod setup;
 

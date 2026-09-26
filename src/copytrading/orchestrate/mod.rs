@@ -3,6 +3,7 @@
 //! the venue.
 
 use chrono::{DateTime, Utc};
+use crate::copytrading::book_observation::{observe_book, BookObservation};
 use std::{future::Future, pin::Pin};
 
 use rust_decimal::Decimal;
@@ -198,7 +199,8 @@ pub trait EnvelopeFactory {
     fn fetch_best_ask_for_maker_only<'a>(
         &'a self,
         _token_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Decimal, String>> + Send + 'a>> {
+        _leader_price: Decimal,
+    ) -> Pin<Box<dyn Future<Output = Result<BookObservation, String>> + Send + 'a>> {
         Box::pin(async {
             Err("best-ask lookup for maker-only execution is unavailable".to_owned())
         })
@@ -461,6 +463,7 @@ async fn prepare_maker_only_envelope<F>(
     envelopes: &F,
     condition_id: &str,
     decision: &SizedDecision,
+    leader_price: Decimal,
     now: DateTime<Utc>,
 ) -> Result<MakerOnlyEnvelope, MakerOnlyError>
 where
@@ -484,10 +487,11 @@ where
             decision.qty, market.minimum_order_size,
         )));
     }
-    let best_ask = envelopes
-        .fetch_best_ask_for_maker_only(&decision.token_id)
+    let book = envelopes
+        .fetch_best_ask_for_maker_only(&decision.token_id, leader_price)
         .await
         .map_err(MakerOnlyError::BestAsk)?;
+    let best_ask = book.best_ask.ok_or_else(|| MakerOnlyError::BestAsk("order book has no asks".to_owned()))?;
     // Per docs/maker-only-post-only-crosses-book-bug.md Fix section:
     // venue evidence (5/5 attempts for intent 721) confirms a post-only BUY
     // priced exactly at best_ask is rejected as "crosses book" unconditionally.
@@ -520,8 +524,42 @@ where
         .map_err(MakerOnlyError::Prepare)?;
     Ok(MakerOnlyEnvelope {
         envelope,
+        book,
+        leader_price,
+        limit_price: decision.limit_price,
+        maker_price,
         market_expires_at: market.expires_at,
     })
+}
+
+async fn record_maker_book_best_effort(pool: &SqlitePool, intent_id: i64, maker: &MakerOnlyEnvelope) {
+    let book = &maker.book;
+    let Some(best_ask) = book.best_ask else { return };
+    let result = sqlx::query(
+        "INSERT INTO intent_book_snapshots (intent_id, fetched_at, best_bid, best_ask, ask_size_at_best, \
+         ask_size_leader_0, ask_size_leader_2, ask_size_leader_4, ask_size_leader_6, ask_size_leader_10, \
+         leader_price, limit_price, maker_price) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(intent_id)
+    .bind(book.fetched_at.to_rfc3339())
+    .bind(book.best_bid.map(|price| price.to_string()))
+    .bind(best_ask.to_string())
+    .bind(book.ask_size_at_best.to_string())
+    .bind(book.ask_size_within_leader[0].to_string())
+    .bind(book.ask_size_within_leader[1].to_string())
+    .bind(book.ask_size_within_leader[2].to_string())
+    .bind(book.ask_size_within_leader[3].to_string())
+    .bind(book.ask_size_within_leader[4].to_string())
+    .bind(maker.leader_price.to_string())
+    .bind(maker.limit_price.to_string())
+    .bind(maker.maker_price.to_string());
+    // Observation must not hold a time-sensitive order decision behind a
+    // busy database. Cancelling this optional insert never cancels execution.
+    match tokio::time::timeout(std::time::Duration::from_millis(50), result.execute(pool)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => eprintln!("maker book snapshot intent {intent_id} not recorded: {error}"),
+        Err(_) => eprintln!("maker book snapshot intent {intent_id} timed out; proceeding without it"),
+    }
 }
 
 /// The successful output of `prepare_maker_only_envelope`. Carries the
@@ -530,6 +568,10 @@ where
 /// same value from a second market lookup).
 struct MakerOnlyEnvelope {
     envelope: PreparedOrderEnvelope,
+    book: BookObservation,
+    leader_price: Decimal,
+    limit_price: Decimal,
+    maker_price: Decimal,
     #[allow(dead_code)]
     market_expires_at: DateTime<Utc>,
 }
@@ -607,8 +649,9 @@ where
     };
 
     let envelope = if decision.maker_only {
-        match prepare_maker_only_envelope(envelopes, &claimed.condition_id, &decision, now).await {
+        match prepare_maker_only_envelope(envelopes, &claimed.condition_id, &decision, claimed.leader_price, now).await {
             Ok(maker) => {
+                record_maker_book_best_effort(pool, intent_id, &maker).await;
                 let attempt_number = next_attempt_number(pool, intent_id).await?;
                 load_or_prepare_attempt(pool, intent_id, attempt_number, &maker.envelope)
                     .await?;
@@ -1181,8 +1224,9 @@ where
         // condition or, worse, race the deadline by the few hundred
         // microseconds between resume and prepare. The fresh-path check
         // stands; this resume path inherits it.
-        match prepare_maker_only_envelope(envelopes, &claimed.condition_id, &decision, now).await {
+        match prepare_maker_only_envelope(envelopes, &claimed.condition_id, &decision, claimed.leader_price, now).await {
             Ok(maker) => {
+                record_maker_book_best_effort(pool, claimed.intent_id, &maker).await;
                 let attempt_number = next_attempt_number(pool, claimed.intent_id).await?;
                 load_or_prepare_attempt(
                     pool,
@@ -1764,7 +1808,8 @@ impl EnvelopeFactory for crate::venue::intl_clob_exec::IntlClobCopyAdapter {
     fn fetch_best_ask_for_maker_only<'a>(
         &'a self,
         token_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Decimal, String>> + Send + 'a>> {
+        leader_price: Decimal,
+    ) -> Pin<Box<dyn Future<Output = Result<BookObservation, String>> + Send + 'a>> {
         let client = self.client().clone();
         let token_id = token_id.to_owned();
         Box::pin(async move {
@@ -1778,11 +1823,12 @@ impl EnvelopeFactory for crate::venue::intl_clob_exec::IntlClobCopyAdapter {
                 .order_book(&request)
                 .await
                 .map_err(|error| format!("fresh order-book read failed: {error}"))?;
-            match best_ask_price(book.asks.into_iter().map(|level| (level.price, level.size))) {
-                Ok(Some(price)) => Ok(price),
-                Ok(None) => Err("order book has no asks".to_owned()),
-                Err(detail) => Err(detail),
-            }
+            observe_book(
+                book.bids.into_iter().map(|level| (level.price, level.size)),
+                book.asks.into_iter().map(|level| (level.price, level.size)),
+                leader_price,
+                Utc::now(),
+            )
         })
     }
 }

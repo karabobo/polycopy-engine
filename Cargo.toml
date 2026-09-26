@@ -62,6 +62,11 @@ dashboard = [
 # the cfg gate on that binary's main (copy_run's main is gated `execute`
 # but it also imports copytrading::ingest, hence the full copy_run set).
 [[bin]]
+name = "book_sampler"
+path = "src/bin/book_sampler.rs"
+required-features = ["execute"]
+
+[[bin]]
 name = "canary_probe"
 path = "src/bin/canary_probe.rs"
 required-features = ["intl_clob"]
