@@ -262,6 +262,14 @@ pub enum OrchestrateOutcome {
     NotClaimed,
 }
 
+/// Retryable GTD lookup failures leave new work eligible; unknown venue truth
+/// requiring reconciliation stops the tick before any further submission.
+pub fn gtd_poll_requires_fuse(outcome: &OrchestrateOutcome) -> bool {
+    matches!(outcome, OrchestrateOutcome::Uncertain
+        | OrchestrateOutcome::NeedsReconcile(_)
+        | OrchestrateOutcome::Blocked(_))
+}
+
 #[derive(Debug)]
 pub enum OrchestrateError {
     Execute(ExecuteError),
@@ -305,6 +313,34 @@ impl From<crate::copytrading::persistent::PersistentError> for OrchestrateError 
     }
 }
 
+/// Divide read-only accepted GTD polling from work that may submit. Polls
+/// bypass the runnable-work reconciliation filter so a locked GTD fails
+/// closed instead of disappearing while new work proceeds.
+pub async fn list_runnable_intents_by_phase(
+    pool: &SqlitePool,
+    account_id: i64,
+) -> Result<(Vec<i64>, Vec<i64>), OrchestrateError> {
+    let polls: Vec<i64> = sqlx::query_scalar(
+        "SELECT ci.id FROM copy_intents ci JOIN order_attempts oa ON oa.intent_id = ci.id \
+         WHERE ci.account_id = ? AND ci.status = 'in_progress' \
+           AND oa.status = 'accepted' \
+           AND json_extract(oa.envelope_json, '$.order_type') = 'GTD' \
+           AND oa.attempt_number = (SELECT MAX(latest.attempt_number) FROM order_attempts latest \
+                                    WHERE latest.intent_id = ci.id) \
+         ORDER BY ci.id",
+    )
+    .bind(account_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| OrchestrateError::Execute(ExecuteError::Database(error.to_string())))?;
+    let work = list_runnable_intents(pool, account_id)
+        .await?
+        .into_iter()
+        .filter(|id| !polls.contains(id))
+        .collect();
+    Ok((polls, work))
+}
+
 pub async fn list_runnable_intents(
     pool: &SqlitePool,
     account_id: i64,
@@ -336,6 +372,34 @@ pub async fn list_runnable_intents(
     .fetch_all(pool)
     .await
     .map_err(|error| OrchestrateError::Execute(ExecuteError::Database(error.to_string())))
+}
+
+/// Poll only an existing accepted GTD: a stale selection cannot enter the
+/// claim/prepare/submit walker and place a second order.
+pub async fn poll_accepted_gtd_intent<E: CopyExecution>(
+    pool: &SqlitePool,
+    execution: &E,
+    intent_id: i64,
+    now: DateTime<Utc>,
+) -> Result<OrchestrateOutcome, OrchestrateError> {
+    if token_has_open_reconciliation_lock(pool, intent_id).await? {
+        return Ok(OrchestrateOutcome::Blocked("account/token needs reconciliation"));
+    }
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+        .bind(intent_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| OrchestrateError::Execute(ExecuteError::Database(error.to_string())))?;
+    if status.as_deref() != Some("in_progress") {
+        return Ok(OrchestrateOutcome::NotClaimed);
+    }
+    let Some(attempt) = load_latest_attempt(pool, intent_id).await? else {
+        return Ok(OrchestrateOutcome::NotClaimed);
+    };
+    if attempt.status != "accepted" || attempt.envelope.order_type != "GTD" {
+        return Ok(OrchestrateOutcome::NotClaimed);
+    }
+    poll_resting_gtd(pool, execution, intent_id, attempt, now).await
 }
 
 #[derive(Clone)]

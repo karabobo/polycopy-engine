@@ -11,7 +11,8 @@ mod live {
     use polycopy_engine::copytrading::ingest::{spawn_supervised_ingest, AddressResolver};
     use polycopy_engine::{
         copytrading::{
-            execute_one_intent, list_runnable_intents, live_execute_enabled,
+            execute_one_intent, gtd_poll_requires_fuse, list_runnable_intents_by_phase,
+            live_execute_enabled, pause_persistent_fuse, poll_accepted_gtd_intent,
             plan::{plan_next_batch, verify_schedule_compatible_with_pending_work},
         },
         venue::intl_clob_exec::IntlClobCopyAdapter,
@@ -139,7 +140,7 @@ mod live {
             }
 
             plan_next_batch(&pool, account_id).await?;
-            let intent_ids = runnable_intents_for_allowed_leaders(
+            let (poll_ids, intent_ids) = runnable_intents_for_allowed_leaders(
                 &pool,
                 account_id,
                 &limits.allowed_leader_ids,
@@ -148,6 +149,23 @@ mod live {
             )
             .await?;
 
+            for intent_id in poll_ids {
+                let outcome = poll_accepted_gtd_intent(&pool, &adapter, intent_id, Utc::now()).await;
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        pause_persistent_fuse(&pool, account_id, &error.to_string(), "copy_run")
+                            .await?;
+                        return Err(error.into());
+                    }
+                };
+                eprintln!("intent {intent_id}: {outcome:?}");
+                if gtd_poll_requires_fuse(&outcome) {
+                    let reason = format!("GTD poll intent {intent_id} requires reconciliation: {outcome:?}");
+                    pause_persistent_fuse(&pool, account_id, &reason, "copy_run").await?;
+                    return Err(reason.into());
+                }
+            }
             for intent_id in intent_ids {
                 match execute_one_intent(
                     &pool,
@@ -269,9 +287,16 @@ mod live {
         allowed_leader_ids: &BTreeSet<i64>,
         max_order_notional: Decimal,
         remaining_attempts: u64,
-    ) -> Result<Vec<i64>, Box<dyn Error>> {
+    ) -> Result<(Vec<i64>, Vec<i64>), Box<dyn Error>> {
+        let mut polls = Vec::new();
         let mut ids = Vec::new();
-        for intent_id in list_runnable_intents(pool, account_id).await? {
+        let (poll_ids, work_ids) = list_runnable_intents_by_phase(pool, account_id).await?;
+        for (is_poll, intent_id) in poll_ids.into_iter().map(|id| (true, id))
+            .chain(work_ids.into_iter().map(|id| (false, id)))
+        {
+            if !is_poll && (ids.len() as u64) >= remaining_attempts {
+                break;
+            }
             let (leader_id, snapshot_json): (i64, String) = sqlx::query_as(
                 "SELECT leader_id, config_snapshot_json FROM copy_intents WHERE id = ?",
             )
@@ -292,13 +317,14 @@ mod live {
                     )
                     .into());
                 }
-                ids.push(intent_id);
-                if ids.len() as u64 >= remaining_attempts {
-                    break;
+                if is_poll {
+                    polls.push(intent_id);
+                } else {
+                    ids.push(intent_id);
                 }
             }
         }
-        Ok(ids)
+        Ok((polls, ids))
     }
 
     #[cfg(test)]

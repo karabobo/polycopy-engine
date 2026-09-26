@@ -1172,6 +1172,221 @@ async fn runnable_intents_are_prioritized_by_earliest_deadline_not_token_name() 
 }
 
 #[tokio::test]
+async fn resting_gtd_does_not_starve_next_same_token_intent() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let old = seed_pending_buy_with_event_key(&db, "activity:old:gtd").await;
+    set_maker_only_policy(&db, old).await;
+    let venue = FakeVenue::succeeding(Decimal::new(5, 0));
+    assert_eq!(
+        execute_one_intent(
+            &db,
+            &FixedBalance(Decimal::new(100, 0)),
+            &venue,
+            &venue,
+            &EmptyHistory,
+            old,
+            Utc::now()
+        )
+        .await
+        .unwrap(),
+        OrchestrateOutcome::Resting
+    );
+    let fresh = seed_pending_buy_with_event_key(&db, "activity:fresh:buy").await;
+    sqlx::query("UPDATE copy_intents SET decision_deadline_at = ? WHERE id = ?")
+        .bind((Utc::now() + chrono::Duration::seconds(30)).to_rfc3339())
+        .bind(fresh).execute(&db.pool).await.unwrap();
+    // This fixture represents a leader whose repeat-direction policy already
+    // admitted the new signal; the runner must not bypass planning's gate.
+    let (polls, work) = list_runnable_intents_by_phase(&db, 1).await.unwrap();
+    assert_eq!(polls, vec![old]);
+    assert_eq!(work, vec![fresh]);
+    venue.set_order_status("LIVE");
+    for id in polls {
+        assert_eq!(poll_accepted_gtd_intent(&db, &venue, id, Utc::now()).await.unwrap(),
+            OrchestrateOutcome::Resting);
+    }
+    let outcome = execute_one_intent(
+        &db,
+        &FixedBalance(Decimal::new(100, 0)),
+        &venue,
+        &venue,
+        &EmptyHistory,
+        work[0],
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, OrchestrateOutcome::Filled { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 2);
+    let status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+        .bind(fresh)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_ne!(status, "cancelled");
+}
+
+#[tokio::test]
+async fn reconciliation_locked_gtd_still_enters_poll_phase_and_blocks_new_work() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let old = seed_pending_buy_with_event_key(&db, "activity:locked:gtd").await;
+    set_maker_only_policy(&db, old).await;
+    let venue = FakeVenue::succeeding(Decimal::new(5, 0));
+    assert_eq!(execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+        &venue, &venue, &EmptyHistory, old, Utc::now()).await.unwrap(), OrchestrateOutcome::Resting);
+    let fresh = seed_pending_buy_with_event_key(&db, "activity:locked:new").await;
+    sqlx::query("INSERT INTO reconciliation_cases (account_id, token_id, intent_id, case_type, detail) VALUES (1, '123456', ?, 'unknown_submission', 'manual lock')")
+        .bind(fresh).execute(&db.pool).await.unwrap();
+    let (polls, work) = list_runnable_intents_by_phase(&db, 1).await.unwrap();
+    assert_eq!(polls, vec![old]);
+    assert!(work.is_empty());
+    let outcome = poll_accepted_gtd_intent(&db, &venue, polls[0], Utc::now()).await.unwrap();
+    assert!(matches!(outcome, OrchestrateOutcome::Blocked(_)));
+    assert!(gtd_poll_requires_fuse(&outcome));
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 1);
+    let fresh_status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+        .bind(fresh).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(fresh_status, "pending");
+}
+
+#[test]
+fn unsafe_gtd_poll_outcomes_stop_the_tick_but_retry_does_not() {
+    assert!(!gtd_poll_requires_fuse(&OrchestrateOutcome::GtdLookupRetry {
+        detail: "temporary 404".into(), remaining: chrono::Duration::seconds(30),
+    }));
+    assert!(gtd_poll_requires_fuse(&OrchestrateOutcome::Uncertain));
+    assert!(gtd_poll_requires_fuse(&OrchestrateOutcome::NeedsReconcile("unknown")));
+    assert!(gtd_poll_requires_fuse(&OrchestrateOutcome::Blocked("locked")));
+}
+
+#[tokio::test]
+async fn all_accepted_gtds_are_polled_before_one_new_intent() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let venue = FakeVenue::succeeding(Decimal::new(5, 0));
+    let mut old_ids = Vec::new();
+    for key in ["activity:gtd:first", "activity:gtd:second"] {
+        let id = seed_pending_buy_with_event_key(&db, key).await;
+        set_maker_only_policy(&db, id).await;
+        assert_eq!(execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+            &venue, &venue, &EmptyHistory, id, Utc::now()).await.unwrap(), OrchestrateOutcome::Resting);
+        old_ids.push(id);
+    }
+    let fresh = seed_pending_buy_with_event_key(&db, "activity:gtd:third").await;
+    let (polls, work) = list_runnable_intents_by_phase(&db, 1).await.unwrap();
+    assert_eq!(polls, old_ids);
+    assert_eq!(work, vec![fresh]);
+    venue.set_order_status("LIVE");
+    for id in polls {
+        assert_eq!(poll_accepted_gtd_intent(&db, &venue, id, Utc::now()).await.unwrap(),
+            OrchestrateOutcome::Resting);
+    }
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 2);
+    assert!(execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+        &venue, &venue, &EmptyHistory, work[0], Utc::now()).await.is_ok());
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn gtd_lookup_retry_does_not_change_accepted_attempt() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let old = seed_pending_buy(&db).await;
+    set_maker_only_policy(&db, old).await;
+    let venue = FakeVenue::succeeding(Decimal::new(5, 0));
+    assert_eq!(
+        execute_one_intent(
+            &db,
+            &FixedBalance(Decimal::new(100, 0)),
+            &venue,
+            &venue,
+            &EmptyHistory,
+            old,
+            Utc::now()
+        )
+        .await
+        .unwrap(),
+        OrchestrateOutcome::Resting
+    );
+    let fresh = seed_pending_buy_with_event_key(&db, "activity:retry:fresh").await;
+    let failed_lookup = FakeVenue::order_lookup_failure("temporary 404");
+    let (polls, work) = list_runnable_intents_by_phase(&db, 1).await.unwrap();
+    assert_eq!(polls, vec![old]);
+    assert_eq!(work, vec![fresh]);
+    let retry = poll_accepted_gtd_intent(&db, &failed_lookup, polls[0], Utc::now()).await.unwrap();
+    assert!(matches!(retry, OrchestrateOutcome::GtdLookupRetry { .. }));
+    assert!(!gtd_poll_requires_fuse(&retry));
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM order_attempts WHERE intent_id = ?")
+            .bind(old)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "accepted");
+    let open_cases: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reconciliation_cases WHERE intent_id = ? AND resolved_at IS NULL",
+    )
+    .bind(old)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(open_cases, 0, "retry must not create a reconciliation lock");
+    assert!(execute_one_intent(
+        &db,
+        &FixedBalance(Decimal::new(100, 0)),
+        &failed_lookup,
+        &failed_lookup,
+        &EmptyHistory,
+        work[0],
+        Utc::now()
+    )
+    .await
+    .is_ok());
+    assert_eq!(failed_lookup.submit_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn expired_gtd_lookup_failure_stops_before_new_intent() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let old = seed_pending_buy_with_event_key(&db, "activity:failure:gtd").await;
+    set_maker_only_policy(&db, old).await;
+    let venue = FakeVenue::succeeding(Decimal::new(5, 0));
+    assert_eq!(execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+        &venue, &venue, &EmptyHistory, old, Utc::now()).await.unwrap(), OrchestrateOutcome::Resting);
+    sqlx::query("UPDATE order_attempts SET envelope_json = json_set(envelope_json, '$.expires_at', ?) WHERE intent_id = ?")
+        .bind((Utc::now() - chrono::Duration::minutes(6)).to_rfc3339())
+        .bind(old).execute(&db.pool).await.unwrap();
+    let fresh = seed_pending_buy_with_event_key(&db, "activity:failure:fresh").await;
+    let failed_lookup = FakeVenue::order_lookup_failure("404");
+    let (polls, work) = list_runnable_intents_by_phase(&db, 1).await.unwrap();
+    assert_eq!(polls, vec![old]);
+    assert_eq!(work, vec![fresh]);
+    let outcome = poll_accepted_gtd_intent(&db, &failed_lookup, polls[0], Utc::now()).await.unwrap();
+    assert_eq!(outcome, OrchestrateOutcome::Uncertain);
+    assert!(gtd_poll_requires_fuse(&outcome));
+    // Mirror the runner's fail-closed branch: fuse before touching new work.
+    crate::copytrading::persistent::pause_fuse(&db, 1, "GTD poll uncertain", "test runner")
+        .await
+        .unwrap();
+    assert!(crate::copytrading::persistent::ensure_fuse_clear(&db, 1).await.is_err());
+    let status: String = sqlx::query_scalar("SELECT status FROM copy_intents WHERE id = ?")
+        .bind(fresh).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(status, "pending");
+    assert_eq!(failed_lookup.submit_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn recovered_order_id_with_non_terminal_order_state_opens_reconciliation() {
     let db = TestDb::new().await;
     seed_account_and_schedule(&db).await;

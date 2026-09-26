@@ -12,8 +12,8 @@ mod live {
     use polycopy_engine::{
         copytrading::{
             assert_persistent_startup_clear, ensure_fuse_clear, execute_one_intent_with_marker,
-            ingest::{spawn_supervised_ingest, AddressResolver},
-            list_runnable_intents, pause_persistent_fuse,
+            gtd_poll_requires_fuse, ingest::{spawn_supervised_ingest, AddressResolver},
+            list_runnable_intents_by_phase, poll_accepted_gtd_intent, pause_persistent_fuse,
             verify_schedule_compatible_with_pending_work, OrchestrateError, OrchestrateOutcome,
             PersistentError, PersistentRuntimeConfig, PersistentSubmitMarker, EXIT_CONFIG,
             EXIT_LOCK_COLLISION,
@@ -115,7 +115,7 @@ mod live {
                 }
                 return Err(RunnerError::Other(error.to_string()));
             }
-            let intent_ids = match retry_local_busy("list_runnable_intents", || {
+            let (poll_ids, work_ids) = match retry_local_busy("list_runnable_intents", || {
                 runnable_intents_for_allowed_leaders(
                     &pool,
                     config.account_id,
@@ -139,18 +139,22 @@ mod live {
             // rather than once per intent. Rebuilt on the next tick so the
             // figure never outlives the batch it was taken for.
             let collateral = TickCollateralCache::new(adapter.read_adapter());
-            for intent_id in intent_ids {
-                let outcome = execute_one_intent_with_marker(
-                    &pool,
-                    &collateral,
-                    &adapter,
-                    &adapter,
-                    adapter.read_adapter(),
-                    &marker,
-                    intent_id,
-                    Utc::now(),
-                )
-                .await;
+            for (is_poll, intent_id) in poll_ids.into_iter().map(|id| (true, id))
+                .chain(work_ids.into_iter().map(|id| (false, id)))
+            {
+                let outcome = if is_poll {
+                    poll_accepted_gtd_intent(&pool, &adapter, intent_id, Utc::now()).await
+                } else {
+                    execute_one_intent_with_marker(
+                        &pool, &collateral, &adapter, &adapter, adapter.read_adapter(),
+                        &marker, intent_id, Utc::now(),
+                    ).await
+                };
+                if is_poll && outcome.as_ref().is_ok_and(gtd_poll_requires_fuse) {
+                    let reason = format!("GTD poll intent {intent_id} requires reconciliation: {outcome:?}");
+                    open_runtime_fuse(&pool, config.account_id, &reason).await?;
+                    return Err(RunnerError::Persistent(PersistentError::FuseOpen));
+                }
                 match outcome {
                     Ok(OrchestrateOutcome::Filled { filled_qty }) => {
                         eprintln!("intent {intent_id}: filled_qty={filled_qty}");
@@ -179,10 +183,14 @@ mod live {
                         open_runtime_fuse(&pool, config.account_id, "uncertain submission").await?;
                         return Err(RunnerError::Persistent(PersistentError::FuseOpen));
                     }
-                    Err(OrchestrateError::Persistent(PersistentError::DecisionExpired)) => {
+                    Err(OrchestrateError::Persistent(PersistentError::DecisionExpired)) if !is_poll => {
                         eprintln!("intent {intent_id}: expired before submission");
                     }
                     Err(OrchestrateError::Persistent(error)) => {
+                        if is_poll {
+                            open_runtime_fuse(&pool, config.account_id, &error.to_string()).await?;
+                            return Err(RunnerError::Persistent(PersistentError::FuseOpen));
+                        }
                         // A budget refusal is a limit doing its job: the
                         // ledger is consistent and nothing needs an operator,
                         // so it stops this run without also latching the fuse
@@ -270,12 +278,18 @@ mod live {
         account_id: i64,
         allowed_leader_ids: &BTreeSet<i64>,
         max_order_notional: Decimal,
-    ) -> Result<Vec<i64>, PersistentError> {
-        let mut ids = Vec::new();
-        for intent_id in list_runnable_intents(pool, account_id)
+    ) -> Result<(Vec<i64>, Vec<i64>), PersistentError> {
+        let mut polls = Vec::new();
+        let mut work = Vec::new();
+        let (poll_ids, work_ids) = list_runnable_intents_by_phase(pool, account_id)
             .await
-            .map_err(|error| PersistentError::Database(error.to_string()))?
+            .map_err(|error| PersistentError::Database(error.to_string()))?;
+        for (is_poll, intent_id) in poll_ids.into_iter().map(|id| (true, id))
+            .chain(work_ids.into_iter().map(|id| (false, id)))
         {
+            if !is_poll && !work.is_empty() {
+                break;
+            }
             let (leader_id, snapshot_json): (i64, String) = sqlx::query_as(
                 "SELECT leader_id, config_snapshot_json FROM copy_intents WHERE id = ?",
             )
@@ -294,11 +308,14 @@ mod live {
                 if snapshot_max > max_order_notional {
                     return Err(PersistentError::ConfigMismatch);
                 }
-                ids.push(intent_id);
-                break;
+                if is_poll {
+                    polls.push(intent_id);
+                } else {
+                    work.push(intent_id);
+                }
             }
         }
-        Ok(ids)
+        Ok((polls, work))
     }
 
     #[derive(Debug)]

@@ -75,8 +75,9 @@ pub use reconcile::{
 
 #[cfg(feature = "execute")]
 pub use orchestrate::{
-    execute_one_intent, execute_one_intent_with_marker, list_runnable_intents,
-    live_execute_enabled, EnvelopeFactory, OrchestrateError, OrchestrateOutcome,
+    execute_one_intent, execute_one_intent_with_marker, gtd_poll_requires_fuse,
+    list_runnable_intents, list_runnable_intents_by_phase, live_execute_enabled,
+    poll_accepted_gtd_intent, EnvelopeFactory, OrchestrateError, OrchestrateOutcome,
     StandardSubmitAttemptMarker, SubmitAttemptMarker,
 };
 
