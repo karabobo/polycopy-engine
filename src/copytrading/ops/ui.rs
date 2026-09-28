@@ -40,6 +40,55 @@ pub struct Pending {
     pub warnings: Vec<String>,
 }
 
+/// Where the config-change flow is; decides which keys are live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowStage {
+    /// Edited file parsed and dry-run done: y apply / e edit again / n abandon.
+    Preview,
+    /// The edit could not be validated: e edit again / n abandon.
+    Invalid,
+    /// Steps are running; no keys.
+    Applying,
+    /// Applied; the trading service is stopped: y start it / n leave stopped.
+    AskStart,
+    /// A step failed after the service was stopped: r roll back / n leave it.
+    Failed,
+    /// Finished; any key closes.
+    Finished,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Flow {
+    pub stage: FlowStage,
+    pub title: String,
+    pub lines: Vec<(Level, String)>,
+}
+
+impl Flow {
+    pub fn new(stage: FlowStage, title: impl Into<String>) -> Self {
+        Self {
+            stage,
+            title: title.into(),
+            lines: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, level: Level, text: impl Into<String>) {
+        self.lines.push((level, text.into()));
+    }
+
+    pub fn prompt(&self) -> &'static str {
+        match self.stage {
+            FlowStage::Preview => "y 应用这些改动    e 继续编辑    n 放弃(不做任何改动)",
+            FlowStage::Invalid => "e 重新编辑    n 放弃",
+            FlowStage::Applying => "正在执行,请稍候…",
+            FlowStage::AskStart => "y 现在启动交易服务    n 暂不启动",
+            FlowStage::Failed => "r 回滚到修改前的配置    n 先不处理(交易服务保持停止)",
+            FlowStage::Finished => "按任意键关闭",
+        }
+    }
+}
+
 pub struct AppState {
     pub page: Page,
     pub services: Vec<ServiceView>,
@@ -58,6 +107,7 @@ pub struct AppState {
     /// How many lines above the newest the view is scrolled.
     pub log_scroll: usize,
     pub pending: Option<Pending>,
+    pub flow: Option<Flow>,
     pub message: Option<(Level, String)>,
     pub errors: Vec<String>,
     pub clock: String,
@@ -90,6 +140,7 @@ impl AppState {
             log_paused: false,
             log_scroll: 0,
             pending: None,
+            flow: None,
             message: None,
             errors: Vec::new(),
             clock: String::new(),
@@ -197,10 +248,11 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         .split(area);
 
     draw_header(frame, state, rows[0]);
-    match state.page {
-        Page::Overview => draw_overview(frame, state, rows[1]),
-        Page::Logs => draw_logs(frame, state, rows[1]),
-        Page::Config => draw_config(frame, state, rows[1]),
+    match (&state.flow, state.page) {
+        (Some(flow), _) => draw_flow(frame, flow, rows[1]),
+        (None, Page::Overview) => draw_overview(frame, state, rows[1]),
+        (None, Page::Logs) => draw_logs(frame, state, rows[1]),
+        (None, Page::Config) => draw_config(frame, state, rows[1]),
     }
     draw_help(frame, state, rows[2]);
     draw_message(frame, state, rows[3]);
@@ -238,13 +290,15 @@ fn draw_header(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_help(frame: &mut Frame, state: &AppState, area: Rect) {
-    let text = if state.pending.is_some() {
+    let text = if let Some(flow) = &state.flow {
+        flow.prompt()
+    } else if state.pending.is_some() {
         "y 确认执行    n / Esc 取消"
     } else {
         match state.page {
             Page::Overview => "↑↓ 选择服务   s 启动   t 停止   r 重启   1/2/3 切换页面   q 退出",
             Page::Logs => "←→ 切换服务   i 只看重要   空格 暂停/继续   ↑↓ PgUp PgDn 翻看   End 最新   q 退出",
-            Page::Config => "↑↓ 选择 leader   1/2/3 切换页面   q 退出",
+            Page::Config => "↑↓ 选择 leader   e 修改配置   1/2/3 切换页面   q 退出",
         }
     };
     frame.render_widget(
@@ -661,6 +715,34 @@ fn draw_config(frame: &mut Frame, state: &AppState, area: Rect) {
     );
 }
 
+fn draw_flow(frame: &mut Frame, flow: &Flow, area: Rect) {
+    let mut lines: Vec<Line> = flow
+        .lines
+        .iter()
+        .map(|(level, text)| {
+            let style = match level {
+                Level::Ok => Style::default(),
+                other => level_style(*other),
+            };
+            Line::from(Span::styled(text.clone(), style))
+        })
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        flow.prompt(),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    // Keep the newest lines (and the prompt) visible on a short terminal.
+    let height = area.height.saturating_sub(2) as usize;
+    let skip = lines.len().saturating_sub(height);
+    frame.render_widget(
+        Paragraph::new(lines.into_iter().skip(skip).collect::<Vec<_>>())
+            .wrap(Wrap { trim: false })
+            .block(boxed(&flow.title)),
+        area,
+    );
+}
+
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
@@ -859,6 +941,25 @@ mod tests {
         );
         let rendered = render(&state);
         assert!(has(&rendered, "日志·交易服务·翻看中"), "{rendered}");
+    }
+
+    #[test]
+    fn change_flow_takes_over_the_body_and_shows_its_prompt() {
+        let mut state = state();
+        state.page = Page::Config;
+        let mut flow = Flow::new(FlowStage::Preview, "修改配置 · 预览");
+        flow.push(Level::Ok, "试运行通过。改动如下:");
+        flow.push(Level::Ok, "  • leader2-ratio-maker:跟单比例 20% → 30%");
+        flow.push(Level::Error, "  • old:启用 → 停用");
+        state.flow = Some(flow);
+        let rendered = render(&state);
+        for text in ["修改配置·预览", "跟单比例20%→30%", "启用→停用", "y应用这些改动", "e继续编辑"] {
+            assert!(has(&rendered, text), "missing {text}: {rendered}");
+        }
+        assert!(!has(&rendered, "详细参数"), "config page should be hidden behind the flow");
+        for stage in [FlowStage::Invalid, FlowStage::Applying, FlowStage::AskStart, FlowStage::Failed, FlowStage::Finished] {
+            assert!(!Flow::new(stage, "x").prompt().is_empty());
+        }
     }
 
     #[test]

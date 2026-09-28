@@ -12,7 +12,8 @@
 ## 进度
 - **第一阶段已完成(未提交)**:总览(服务状态、启动/停止/重启带二次确认与后果提示、保险丝、未结 case、配置检查汇总、磁盘、最近 24 小时统计)、日志(journald 实时、切换服务、只看重要、暂停、翻看)、配置详情(每个 leader 全部参数的中文名/当前值/说明/是否生效、账户与运行参数、与 `copy_persistent` 启动校验完全一致的一致性检查)。24 个单元测试;`--all-features` 全量 422 个库测试通过,严格 clippy 通过。
 - **发布前提**:配置页"单笔上限"的说明描述的是方案 B(Codex 的 89117c7,比例单超限时压缩份数)上线后的行为,面板必须与它一起或在它之后发布。
-- 第二阶段(修改配置流程)未开始。
+- **第二阶段已完成(未提交)**:配置页按 e 进入修改流程。面板从数据库重新生成 JSON,用 $EDITOR 编辑;拼错的字段名会报错,不会被悄悄忽略;在数据库副本上用真实的 `apply_trading_config` 和 `reconfigure_config` 试运行;用中文列出改动,停用 leader 用红字标出;然后依次备份、停服务、`copy_config_apply`、重新生成 env、`persistent_control reconfigure`、复查、确认启动;出错可以按 r 回滚。只改显示名时不停服务。子进程里才加载私钥,面板进程本身不读。新增 11 个测试(共 35 个);`--all-features` 全量 433 个库测试通过,严格 clippy 通过。使用说明见 `docs/OPS_PANEL.md`。
+- 还没有在真实服务器上跑过应用流程。第一次建议先按 e,看完预览后按 n 放弃,零风险;第一次正式使用,就执行已经定好的两项改动(leader2 显示名、清空 max_order_shares)。
 
 ## 模块(src/copytrading/ops/,feature `ops_panel = ["execute", "dep:ratatui"]`;复用 `persistent::PersistentRuntimeConfig::from_values` 使一致性检查与启动校验一致)
 1. `live_config.rs`:从数据库读 accounts、leader_config、启用的 leader_wallet_aliases、leader_policy 全部列、persistent_execution_config;导出为统一 JSON。**必须能原样回灌**:用导出的 JSON 调 `apply_trading_config` 结果应全部 `Unchanged`(写测试,复用 setup.rs 测试里的 TestDb 模式)。回灌要点(见 setup.rs `normalize_policy`):

@@ -17,6 +17,7 @@
 //! the same approach `dashboard` uses).
 
 pub mod checks;
+pub mod edit;
 pub mod env_file;
 pub mod labels;
 pub mod live_config;

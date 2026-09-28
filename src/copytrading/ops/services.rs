@@ -239,6 +239,53 @@ pub fn systemctl_action(action: Action, unit: &str) -> Result<(), String> {
     }
 }
 
+/// Runs `program args` in a bash child that first sources `public_env` and,
+/// when given, `secrets` (with `set -a`, so their assignments are exported),
+/// plus `extra_env`. This is how an operator runs `copy_config_apply` and
+/// `persistent_control` by hand; doing it inside the child keeps the secret
+/// out of the panel process. Returns combined stdout/stderr; a non-zero exit
+/// is an error carrying that output.
+pub fn run_with_env_files(
+    public_env: &std::path::Path,
+    secrets: Option<&std::path::Path>,
+    extra_env: &[(&str, String)],
+    program: &std::path::Path,
+    args: &[&str],
+) -> Result<String, String> {
+    let script =
+        "set -a; . \"$1\"; if [ -n \"$2\" ]; then . \"$2\"; fi; set +a; shift 2; exec \"$@\"";
+    let mut command = Command::new("bash");
+    command
+        .arg("-c")
+        .arg(script)
+        .arg("ops_panel")
+        .arg(public_env)
+        .arg(secrets.map(|p| p.as_os_str().to_owned()).unwrap_or_default())
+        .arg(program)
+        .args(args);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("无法运行 {}:{error}", program.display()))?;
+    let mut text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if !stderr.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&stderr);
+    }
+    if output.status.success() {
+        Ok(text)
+    } else if text.is_empty() {
+        Err(format!("{} 执行失败({})", program.display(), output.status))
+    } else {
+        Err(text)
+    }
+}
+
 pub fn disk_usage(path: &str) -> Option<(u8, u64)> {
     let output = Command::new("df").args(["-Pk", path]).output().ok()?;
     parse_df(&String::from_utf8_lossy(&output.stdout))
@@ -295,6 +342,41 @@ mod tests {
         assert!(!is_important_log("WS_EVENT: {\"kind\":\"connected\"}"));
         assert!(!is_important_log("backfill leader 2: fetched=1 ingested=1 rejected=0"));
         assert!(!is_important_log("intent 861: post-only GTD remains on book"));
+    }
+
+    #[test]
+    fn child_sees_sourced_env_files_and_extra_vars_and_failures_are_errors() {
+        let dir = std::env::temp_dir().join(format!("polycopy ops env test {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let public = dir.join("public env");
+        let secrets = dir.join("secrets.env");
+        std::fs::write(&public, "OPS_TEST_PUBLIC=from-public\n").unwrap();
+        std::fs::write(&secrets, "OPS_TEST_SECRET='with space'\n").unwrap();
+        let env_bin = std::path::Path::new("/usr/bin/env");
+
+        let output = run_with_env_files(
+            &public,
+            Some(&secrets),
+            &[("OPS_TEST_EXTRA", "extra".to_owned())],
+            env_bin,
+            &[],
+        )
+        .unwrap();
+        assert!(output.contains("OPS_TEST_PUBLIC=from-public"), "{output}");
+        assert!(output.contains("OPS_TEST_SECRET=with space"), "{output}");
+        assert!(output.contains("OPS_TEST_EXTRA=extra"), "{output}");
+
+        let without_secrets = run_with_env_files(&public, None, &[], env_bin, &[]).unwrap();
+        assert!(!without_secrets.contains("OPS_TEST_SECRET"), "{without_secrets}");
+        assert!(
+            std::env::var("OPS_TEST_SECRET").is_err(),
+            "the secret must never enter the panel process"
+        );
+
+        let error = run_with_env_files(&public, None, &[], std::path::Path::new("/bin/sh"), &["-c", "echo boom >&2; exit 3"])
+            .unwrap_err();
+        assert!(error.contains("boom"), "{error}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
