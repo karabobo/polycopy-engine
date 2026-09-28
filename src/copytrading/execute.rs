@@ -547,11 +547,6 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
                         } else {
                             original_target_qty
                         };
-                        if target_qty < Decimal::new(5, 0) {
-                            return Ok(SizingOutcome::Rejected(
-                                "size_ratio buy quantity is below the CLOB minimum of 5 shares",
-                            ));
-                        }
                         // GTD signs shares, not a cent budget. Reserve the
                         // ceiling of its worst-case cost; never derive shares
                         // back from a truncated budget.
@@ -2438,10 +2433,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn size_ratio_cap_below_five_shares_is_rejected() {
+    async fn size_ratio_cap_emits_a_decision_and_lets_prepare_enforce_market_minimum() {
+        // The cap is the leader's per-order notional, never a hard-coded share
+        // floor: a low event price that produces a sub-five-share decision must
+        // still surface a Decision so the maker-only prepare path can reject
+        // it on `market.minimum_order_size` instead of silently resizing here.
         let (_, _, outcome) = size_ratio_buy("300", "0.53", "2", true).await;
-        assert!(matches!(outcome, SizingOutcome::Rejected(
-            "size_ratio buy quantity is below the CLOB minimum of 5 shares")));
+        let SizingOutcome::Decision(decision) = outcome else {
+            panic!("ratio cap must not refuse; the prepare path enforces the market minimum");
+        };
+        assert!(decision.qty < Decimal::new(5, 0));
+        assert_eq!(decision.buy_budget, Some(Decimal::new(2, 0)));
     }
 
     #[test]
