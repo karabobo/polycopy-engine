@@ -4231,6 +4231,48 @@ async fn a_leader_out_of_budget_is_a_skipped_signal_not_a_halt() {
     assert_eq!(reserved, 0);
 }
 
+#[tokio::test]
+async fn an_account_per_order_overage_rejects_only_the_intent_without_opening_the_fuse() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+    let cfg = PersistentRuntimeConfig::from_values(1, true, "1", "1", "1000", 86_400, 1, 60)
+        .expect("valid persistent config");
+    init_config(&db, &cfg).await.expect("init persistent config");
+    sqlx::query(
+        "UPDATE copy_intents SET status = 'in_progress', \
+         planned_qty = '5', planned_price = '0.55', planned_notional_usdc = '1.01' \
+         WHERE id = ?",
+    )
+    .bind(intent_id).execute(&db.pool).await.expect("seed over-cap intent");
+
+    let venue = FakeVenue::succeeding(Decimal::new(5, 0));
+    let outcome = execute_one_intent_with_marker(
+        &db, &FixedBalance(Decimal::new(100, 0)), &venue, &venue, &EmptyHistory,
+        &PersistentSubmitMarker { config: &cfg }, intent_id, Utc::now(),
+    )
+    .await
+    .expect("one over-cap intent must not propagate as a runner error");
+
+    assert_eq!(outcome, OrchestrateOutcome::Rejected);
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 0);
+    let (intent_status, reason): (String, Option<String>) =
+        sqlx::query_as("SELECT status, rejection_reason FROM copy_intents WHERE id = ?")
+            .bind(intent_id).fetch_one(&db.pool).await.expect("intent row");
+    assert_eq!(intent_status, "rejected");
+    assert!(reason.unwrap_or_default().contains("per-order notional exceeded"));
+    let attempt_status: String = sqlx::query_scalar("SELECT status FROM order_attempts WHERE intent_id = ?")
+        .bind(intent_id).fetch_one(&db.pool).await.expect("attempt row");
+    assert_eq!(attempt_status, "rejected");
+    let reservations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM persistent_budget_reservations")
+        .fetch_one(&db.pool).await.expect("reservation count");
+    assert_eq!(reservations, 0);
+    let fuse_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM persistent_execution_fuse")
+        .fetch_one(&db.pool).await.expect("fuse count");
+    assert_eq!(fuse_rows, 0);
+}
+
 // --- GTD maker spec derivation ----------------------------------------------
 //
 // These pin the post-only GTD retry's market validation against

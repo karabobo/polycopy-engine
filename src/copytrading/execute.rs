@@ -518,21 +518,44 @@ pub async fn size_and_reserve<B: StrictAccountBalanceReader>(
                         let ratio: Decimal = raw_ratio.parse().map_err(|_| {
                             ExecuteError::InvalidDecimal("leader_policy.size_ratio")
                         })?;
-                        let target_qty = round_order_qty_down(event_size * ratio);
-                        if target_qty <= Decimal::ZERO {
+                        let original_target_qty = round_order_qty_down(event_size * ratio);
+                        if original_target_qty <= Decimal::ZERO {
                             return Ok(SizingOutcome::Rejected(
                                 "size_ratio produced a non-positive target",
                             ));
                         }
-                        let exact_cost = target_qty * limit_price;
+                        let max_notional: Decimal =
+                            policy.max_order_notional.parse().map_err(|_| {
+                                ExecuteError::InvalidDecimal("leader_policy.max_order_notional")
+                            })?;
+                        let original_budget = ratio_buy_budget(
+                            original_target_qty,
+                            limit_price,
+                            policy.maker_only,
+                        );
+                        let target_qty = if original_budget > max_notional {
+                            let capped = max_ratio_qty_for_notional(
+                                max_notional,
+                                limit_price,
+                                policy.maker_only,
+                            );
+                            eprintln!(
+                                "intent {}: size_ratio capped from {} shares to {} shares at leader max_order_notional {} USDC",
+                                claimed.intent_id, original_target_qty, capped, max_notional,
+                            );
+                            capped
+                        } else {
+                            original_target_qty
+                        };
+                        if target_qty < Decimal::new(5, 0) {
+                            return Ok(SizingOutcome::Rejected(
+                                "size_ratio buy quantity is below the CLOB minimum of 5 shares",
+                            ));
+                        }
                         // GTD signs shares, not a cent budget. Reserve the
                         // ceiling of its worst-case cost; never derive shares
                         // back from a truncated budget.
-                        let budget = if policy.maker_only {
-                            (exact_cost * Decimal::new(100, 0)).ceil() / Decimal::new(100, 0)
-                        } else {
-                            round_usdc_down(exact_cost)
-                        };
+                        let budget = ratio_buy_budget(target_qty, limit_price, policy.maker_only);
                         if budget > available_collateral {
                             return Ok(SizingOutcome::Rejected(
                                 "size_ratio buy budget exceeds available collateral",
@@ -826,6 +849,42 @@ fn round_order_qty_down(qty: Decimal) -> Decimal {
 /// GTD BUYs instead reserve the cent ceiling of their exact share cost.
 fn round_usdc_down(amount: Decimal) -> Decimal {
     amount.round_dp_with_strategy(2, RoundingStrategy::ToZero)
+}
+
+fn ratio_buy_budget(qty: Decimal, price: Decimal, maker_only: bool) -> Decimal {
+    let exact_cost = qty * price;
+    if maker_only {
+        (exact_cost * Decimal::new(100, 0)).ceil() / Decimal::new(100, 0)
+    } else {
+        round_usdc_down(exact_cost)
+    }
+}
+
+/// Returns the greatest two-decimal share quantity whose persisted cost does
+/// not exceed the Leader's per-order ceiling. Maker-only orders reserve the
+/// cent ceiling of exact cost; marketable orders reserve the cent floor.
+fn max_ratio_qty_for_notional(
+    max_notional: Decimal,
+    price: Decimal,
+    maker_only: bool,
+) -> Decimal {
+    if max_notional <= Decimal::ZERO || price <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    let cent = Decimal::new(1, 2);
+    let candidate_cost = if maker_only {
+        max_notional
+    } else {
+        max_notional + cent
+    };
+    let mut qty = round_order_qty_down(candidate_cost / price);
+    while qty > Decimal::ZERO && ratio_buy_budget(qty, price, maker_only) > max_notional {
+        qty -= cent;
+    }
+    while ratio_buy_budget(qty + cent, price, maker_only) <= max_notional {
+        qty += cent;
+    }
+    qty
 }
 
 /// Derives the expected market-BUY taker shares from its already-cent-rounded
@@ -2317,6 +2376,77 @@ mod tests {
             "size_ratio sizing must pin shares, not budget (the venue-side bug from docs/fixed-shares-overfill-and-price-floor.md)",
         );
         assert!(!decision.maker_only);
+    }
+
+    async fn size_ratio_buy(
+        event_size: &str,
+        price: &str,
+        max_notional: &str,
+        maker_only: bool,
+    ) -> (TestDb, i64, SizingOutcome) {
+        let db = TestDb::new().await;
+        seed_account_and_schedule(&db).await;
+        seed_leader(&db, 1).await;
+        let intent = seed_pending_intent(&db, 1, "123456", "BUY", event_size, price).await;
+        let raw: String = sqlx::query_scalar("SELECT config_snapshot_json FROM copy_intents WHERE id = ?")
+            .bind(intent).fetch_one(&*db).await.unwrap();
+        let mut policy: PolicySnapshot = serde_json::from_str(&raw).unwrap();
+        policy.size_ratio = Some("0.2".to_owned());
+        policy.max_order_notional = max_notional.to_owned();
+        policy.maker_only = maker_only;
+        sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
+            .bind(serde_json::to_string(&policy).unwrap()).bind(intent)
+            .execute(&*db).await.unwrap();
+        let claimed = claim_or_resume_intent(&db, intent).await.unwrap().unwrap();
+        let reader = FixedBalanceReader::new(Decimal::ZERO, Decimal::new(100, 0));
+        let outcome = size_and_reserve(&db, &reader, &claimed).await.unwrap();
+        (db, intent, outcome)
+    }
+
+    #[tokio::test]
+    async fn size_ratio_is_capped_at_the_leader_per_order_notional() {
+        let (db, intent, outcome) = size_ratio_buy("300", "0.50", "10", true).await;
+        let SizingOutcome::Decision(decision) = outcome else {
+            panic!("capped ratio sizing must produce a decision");
+        };
+        assert_eq!(decision.qty, Decimal::new(20, 0));
+        assert_eq!(decision.buy_budget, Some(Decimal::new(10, 0)));
+        let planned_qty: String = sqlx::query_scalar("SELECT planned_qty FROM copy_intents WHERE id = ?")
+            .bind(intent).fetch_one(&*db).await.unwrap();
+        assert_eq!(planned_qty, "20");
+    }
+
+    #[tokio::test]
+    async fn maker_ratio_cap_uses_the_cent_ceiling_of_exact_cost() {
+        let (_, _, outcome) = size_ratio_buy("300", "0.53", "10", true).await;
+        let SizingOutcome::Decision(decision) = outcome else {
+            panic!("capped maker ratio sizing must produce a decision");
+        };
+        assert_eq!(decision.qty, Decimal::new(1886, 2));
+        assert_eq!(decision.buy_budget, Some(Decimal::new(10, 0)));
+        assert_eq!(ratio_buy_budget(decision.qty + Decimal::new(1, 2), decision.limit_price, true), Decimal::new(1001, 2));
+    }
+
+    #[tokio::test]
+    async fn size_ratio_at_exactly_the_leader_cap_is_not_reduced() {
+        let (_, _, outcome) = size_ratio_buy("100", "0.50", "10", true).await;
+        let SizingOutcome::Decision(decision) = outcome else {
+            panic!("exact-cap ratio sizing must produce a decision");
+        };
+        assert_eq!(decision.qty, Decimal::new(20, 0));
+        assert_eq!(decision.buy_budget, Some(Decimal::new(10, 0)));
+    }
+
+    #[tokio::test]
+    async fn size_ratio_cap_below_five_shares_is_rejected() {
+        let (_, _, outcome) = size_ratio_buy("300", "0.53", "2", true).await;
+        assert!(matches!(outcome, SizingOutcome::Rejected(
+            "size_ratio buy quantity is below the CLOB minimum of 5 shares")));
+    }
+
+    #[test]
+    fn marketable_ratio_cap_uses_the_cent_floor_of_exact_cost() {
+        assert_eq!(max_ratio_qty_for_notional(Decimal::new(10, 0), Decimal::new(53, 2), false), Decimal::new(1888, 2));
     }
 
     #[tokio::test]

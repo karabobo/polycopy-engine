@@ -1332,6 +1332,7 @@ where
             error,
             OrchestrateError::Persistent(
                 crate::copytrading::persistent::PersistentError::LeaderBudgetExhausted { .. }
+                    | crate::copytrading::persistent::PersistentError::OrderNotionalExceeded { .. }
             )
         ) {
             let reason = error.to_string();

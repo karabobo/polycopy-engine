@@ -186,7 +186,17 @@ impl SubmitAttemptMarker for PersistentSubmitMarker<'_> {
         Box::pin(async move {
             reserve_budget_and_mark_submitting(pool, self.config, intent_id, attempt_id, now)
                 .await
-                .map_err(OrchestrateError::Persistent)
+                .map_err(|error| match error {
+                    PersistentError::BudgetExceeded { requested, .. }
+                        if requested > self.config.max_order_notional =>
+                    {
+                        OrchestrateError::Persistent(PersistentError::OrderNotionalExceeded {
+                            requested,
+                            cap: self.config.max_order_notional,
+                        })
+                    }
+                    error => OrchestrateError::Persistent(error),
+                })
         })
     }
 }
@@ -1651,6 +1661,13 @@ pub enum PersistentError {
         requested: Decimal,
         cap: Decimal,
     },
+    /// One intent exceeded the account's per-order ceiling before submission.
+    /// The orchestrator rejects only that intent; the process and fuse remain
+    /// healthy because no network boundary or budget reservation was crossed.
+    OrderNotionalExceeded {
+        requested: Decimal,
+        cap: Decimal,
+    },
     /// One Leader has spent its own budget. Deliberately not an account-level
     /// fault: the other Leaders are unaffected, and halting the process for
     /// one of them is what let a single high-frequency Leader take the whole
@@ -1678,6 +1695,7 @@ impl PersistentError {
             // reading of an unhandled budget condition.
             Self::MalformedBudgetState
             | Self::BudgetExceeded { .. }
+            | Self::OrderNotionalExceeded { .. }
             | Self::LeaderBudgetExhausted { .. } => EXIT_BUDGET_STATE,
             Self::Database(_)
             | Self::FuseNotOpen
@@ -1719,6 +1737,10 @@ impl fmt::Display for PersistentError {
             } => write!(
                 formatter,
                 "account cumulative-turnover circuit breaker exceeded: used={used} requested={requested} cap={cap}"
+            ),
+            Self::OrderNotionalExceeded { requested, cap } => write!(
+                formatter,
+                "account per-order notional exceeded: requested={requested} cap={cap}"
             ),
             Self::LeaderBudgetExhausted {
                 leader_id,
