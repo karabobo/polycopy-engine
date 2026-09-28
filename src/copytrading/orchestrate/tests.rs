@@ -253,6 +253,7 @@ struct FakeVenue {
     // the min(leader-derived ceiling, best_ask) selection logic
     // branch-by-branch (best_ask < limit_price, > limit_price, == limit_price).
     best_ask_override: Mutex<Option<Result<Decimal, String>>>,
+    minimum_order_size_override: Mutex<Option<Decimal>>,
 }
 
 impl FakeVenue {
@@ -278,6 +279,7 @@ impl FakeVenue {
             // Default: `query_prepared_envelope` returns Ok(None).
             query_receipt_result: Mutex::new(None),
         best_ask_override: Mutex::new(None),
+            minimum_order_size_override: Mutex::new(None),
         }
     }
 
@@ -294,6 +296,7 @@ impl FakeVenue {
             size_matched_override: Mutex::new(None),
             query_receipt_result: Mutex::new(None),
         best_ask_override: Mutex::new(None),
+            minimum_order_size_override: Mutex::new(None),
         }
     }
 
@@ -315,6 +318,7 @@ impl FakeVenue {
             size_matched_override: Mutex::new(None),
             query_receipt_result: Mutex::new(None),
         best_ask_override: Mutex::new(None),
+            minimum_order_size_override: Mutex::new(None),
         }
     }
 
@@ -341,6 +345,7 @@ impl FakeVenue {
             query_receipt_result: Mutex::new(None),
             size_matched_override: Mutex::new(None),
             best_ask_override: Mutex::new(None),
+            minimum_order_size_override: Mutex::new(None),
         }
     }
 
@@ -368,6 +373,7 @@ impl FakeVenue {
             order_lookup_result: Mutex::new(None),
             size_matched_override: Mutex::new(None),
             best_ask_override: Mutex::new(None),
+            minimum_order_size_override: Mutex::new(None),
             query_receipt_result: Mutex::new(Some(Ok(Some(receipt)))),
         }
     }
@@ -396,6 +402,7 @@ impl FakeVenue {
             order_lookup_result: Mutex::new(None),
             size_matched_override: Mutex::new(None),
             best_ask_override: Mutex::new(None),
+            minimum_order_size_override: Mutex::new(None),
             query_receipt_result: Mutex::new(Some(Err(detail.to_owned()))),
         }
     }
@@ -430,6 +437,14 @@ impl FakeVenue {
             .expect("fixed-share receipt")),
         ]);
         venue
+    }
+
+    fn with_minimum_order_size(&self, minimum_order_size: Decimal) -> &Self {
+        self.minimum_order_size_override
+            .lock()
+            .expect("minimum_order_size_override lock")
+            .replace(minimum_order_size);
+        self
     }
 }
 
@@ -481,10 +496,15 @@ impl EnvelopeFactory for FakeVenue {
         // condition id rather than outcome token id.
         assert_eq!(condition_id, "0xcond", "GTD market lookup must use condition_id");
         Box::pin(async {
+            let minimum_order_size = (*self
+                .minimum_order_size_override
+                .lock()
+                .expect("minimum_order_size_override lock"))
+            .unwrap_or(Decimal::new(5, 0));
             Ok(GtdMarketSpec {
                 expires_at: Utc::now() + chrono::Duration::minutes(5),
                 tick_size: Decimal::new(1, 2),
-                minimum_order_size: Decimal::new(5, 0),
+                minimum_order_size,
             })
         })
     }
@@ -4146,6 +4166,68 @@ async fn ratio_wins_over_different_flat_target_after_fak_no_match() {
     assert_ratio_fak_fallback(&db, intent_id).await;
 }
 
+/// A maker-only ratio BUY whose leader cap drops the persisted share
+/// quantity below the market's own `minimum_order_size` is the seam the
+/// executor deliberately leaves to the prepare path: the cap math is the
+/// executor's, the share-floor rule belongs to the venue. The intent must
+/// reject without preparing an attempt and without opening the fuse, with a
+/// rejection reason that names both the prepared cap and the market floor so
+/// the operator can see why nothing crossed the boundary.
+#[tokio::test]
+async fn a_capped_ratio_buy_below_market_minimum_is_rejected_in_prepare() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+    set_maker_only_policy(&db, intent_id).await;
+    let raw: String = sqlx::query_scalar("SELECT config_snapshot_json FROM copy_intents WHERE id = ?")
+        .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    let mut policy: PolicySnapshot = serde_json::from_str(&raw).unwrap();
+    policy.size_ratio = Some("0.2".to_owned());
+    policy.max_order_shares = None;
+    // Force a cap smaller than the default 100000 USDC ceiling so 300 shares
+    // * 0.53 * 0.2 = 31.80 USDC of proportional intent collapses to a
+    // 3.77-share maker-only decision below the venue's 5-share floor.
+    policy.max_order_notional = "2".to_owned();
+    sqlx::query("UPDATE copy_intents SET config_snapshot_json = ? WHERE id = ?")
+        .bind(serde_json::to_string(&policy).unwrap()).bind(intent_id)
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE leader_events SET size = '300', price = '0.53' WHERE id = (SELECT event_id FROM copy_intents WHERE id = ?)")
+        .bind(intent_id).execute(&db.pool).await.unwrap();
+    let venue = FakeVenue::succeeding(Decimal::ZERO);
+    venue.with_minimum_order_size(Decimal::new(5, 0));
+    *venue.best_ask_override.lock().unwrap() = Some(Ok(Decimal::new(60, 2)));
+    let outcome = execute_one_intent(&db, &FixedBalance(Decimal::new(100, 0)),
+        &venue, &venue, &EmptyHistory, intent_id, Utc::now()).await.unwrap();
+    assert_eq!(
+        outcome,
+        OrchestrateOutcome::Rejected,
+        "below-market-minimum maker-only ratio caps must reject at prepare time",
+    );
+    let planned_qty: String = sqlx::query_scalar("SELECT planned_qty FROM copy_intents WHERE id = ?")
+        .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(planned_qty, "3.77", "executor must persist the capped share decision");
+    let reserved: String = sqlx::query_scalar("SELECT planned_notional_usdc FROM copy_intents WHERE id = ?")
+        .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(reserved, "2");
+    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM order_attempts WHERE intent_id = ?")
+        .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(attempts, 0, "no attempt row may exist before the venue boundary");
+    let (status, reason): (String, Option<String>) =
+        sqlx::query_as("SELECT status, rejection_reason FROM copy_intents WHERE id = ?")
+            .bind(intent_id).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(status, "rejected");
+    let reason = reason.unwrap_or_default();
+    assert!(reason.contains("3.77"), "reason must name the capped qty: {reason}");
+    assert!(reason.contains("5"), "reason must name the market minimum: {reason}");
+    let reservations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM persistent_budget_reservations")
+        .fetch_one(&db.pool).await.unwrap();
+    assert_eq!(reservations, 0);
+    let fuse_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM persistent_execution_fuse")
+        .fetch_one(&db.pool).await.unwrap();
+    assert_eq!(fuse_rows, 0);
+}
+
 /// The per-Leader budget exists so one Leader running dry does not stop the
 /// others. That only holds if the runner's own path turns the error into a
 /// skipped signal; the variant was introduced with a comment saying the
@@ -4229,6 +4311,48 @@ async fn a_leader_out_of_budget_is_a_skipped_signal_not_a_halt() {
     .await
     .expect("reservation count");
     assert_eq!(reserved, 0);
+}
+
+#[tokio::test]
+async fn an_account_per_order_overage_rejects_only_the_intent_without_opening_the_fuse() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+    let cfg = PersistentRuntimeConfig::from_values(1, true, "1", "1", "1000", 86_400, 1, 60)
+        .expect("valid persistent config");
+    init_config(&db, &cfg).await.expect("init persistent config");
+    sqlx::query(
+        "UPDATE copy_intents SET status = 'in_progress', \
+         planned_qty = '5', planned_price = '0.55', planned_notional_usdc = '1.01' \
+         WHERE id = ?",
+    )
+    .bind(intent_id).execute(&db.pool).await.expect("seed over-cap intent");
+
+    let venue = FakeVenue::succeeding(Decimal::new(5, 0));
+    let outcome = execute_one_intent_with_marker(
+        &db, &FixedBalance(Decimal::new(100, 0)), &venue, &venue, &EmptyHistory,
+        &PersistentSubmitMarker { config: &cfg }, intent_id, Utc::now(),
+    )
+    .await
+    .expect("one over-cap intent must not propagate as a runner error");
+
+    assert_eq!(outcome, OrchestrateOutcome::Rejected);
+    assert_eq!(venue.submit_count.load(Ordering::SeqCst), 0);
+    let (intent_status, reason): (String, Option<String>) =
+        sqlx::query_as("SELECT status, rejection_reason FROM copy_intents WHERE id = ?")
+            .bind(intent_id).fetch_one(&db.pool).await.expect("intent row");
+    assert_eq!(intent_status, "rejected");
+    assert!(reason.unwrap_or_default().contains("per-order notional exceeded"));
+    let attempt_status: String = sqlx::query_scalar("SELECT status FROM order_attempts WHERE intent_id = ?")
+        .bind(intent_id).fetch_one(&db.pool).await.expect("attempt row");
+    assert_eq!(attempt_status, "rejected");
+    let reservations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM persistent_budget_reservations")
+        .fetch_one(&db.pool).await.expect("reservation count");
+    assert_eq!(reservations, 0);
+    let fuse_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM persistent_execution_fuse")
+        .fetch_one(&db.pool).await.expect("fuse count");
+    assert_eq!(fuse_rows, 0);
 }
 
 // --- GTD maker spec derivation ----------------------------------------------
