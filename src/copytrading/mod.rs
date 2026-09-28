@@ -37,6 +37,9 @@ pub mod ingest;
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
 
+#[cfg(feature = "ops_panel")]
+pub mod ops;
+
 pub use control_tower::{
     leader_intents, leader_lots, leader_reconciliation_cases, leader_status, trace_attempt,
     AccountSummary, AttemptTrace, ControlTowerError, CopyStrategyStatusShim, EventSummary,

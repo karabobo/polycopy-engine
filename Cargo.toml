@@ -52,6 +52,15 @@ dashboard = [
     "execute",
     "dep:ratatui",
 ]
+# Chinese operator panel (`ops_panel`): service status/start/stop, journald
+# logs, and the full live configuration with consistency checks. Needs
+# `execute` only to reuse `persistent`'s runtime-config parser so its checks
+# match exactly what `copy_persistent` enforces at startup; it never imports
+# orchestrate/execute/reconcile and has no order capability.
+ops_panel = [
+    "execute",
+    "dep:ratatui",
+]
 
 # NEW-1 (post-P0-1 architecture review): cargo auto-builds every
 # src/bin/*.rs for every feature set. Without explicit [[bin]]
@@ -114,6 +123,11 @@ required-features = ["ingest"]
 [[bin]]
 name = "lock_probe"
 path = "src/bin/lock_probe.rs"
+
+[[bin]]
+name = "ops_panel"
+path = "src/bin/ops_panel.rs"
+required-features = ["ops_panel"]
 
 [[bin]]
 name = "persistent_control"
