@@ -53,8 +53,8 @@ mod panel {
             env_file::EnvFile,
             live_config::{display_names_from_json, export_unified_json, load_live_config},
             services::{
-                describe, disk_usage, run_with_env_files, systemctl_action, systemctl_show, Action,
-                UNITS,
+                compact_journal_line, describe, disk_usage, run_with_env_files, systemctl_action,
+                systemctl_show, Action, UNITS,
             },
             stats::{outcomes_last_24h, safety_state},
             ui::{draw, AppState, Flow, FlowStage, Page, Pending},
@@ -780,8 +780,9 @@ mod panel {
 
             if !state.log_paused {
                 if let Some(journal) = &journal {
+                    let today = Local::now().format("%Y-%m-%d").to_string();
                     while let Ok(line) = journal.lines.try_recv() {
-                        state.push_log_line(line, MAX_LOG_LINES);
+                        state.push_log_line(compact_journal_line(&line, &today), MAX_LOG_LINES);
                     }
                 }
             }
