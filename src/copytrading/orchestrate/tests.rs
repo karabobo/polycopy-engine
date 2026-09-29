@@ -4313,6 +4313,119 @@ async fn a_leader_out_of_budget_is_a_skipped_signal_not_a_halt() {
     assert_eq!(reserved, 0);
 }
 
+/// Account rolling-window partner to
+/// `a_leader_out_of_budget_is_a_skipped_signal_not_a_halt`. The per-Leader
+/// path was changed to skip the signal instead of halting; the owner wants
+/// the same for the account cap so a 24h spent budget no longer takes the
+/// runner down for everyone. The two paths used to share the same fail-closed
+/// exit; this test pins the new shape against the real
+/// `PersistentSubmitMarker` so a regression to the legacy `BudgetExceeded`
+/// path (and therefore an `Err` propagating to the runner) fails loudly.
+#[tokio::test]
+async fn an_account_out_of_budget_is_a_skipped_signal_not_a_halt() {
+    let db = TestDb::new().await;
+    seed_account_and_schedule(&db).await;
+    seed_leader(&db, 1).await;
+    let intent_id = seed_pending_buy(&db).await;
+
+    // Generous per-Leader budget so the per-Leader gate does NOT fire -- the
+    // account cap must be the one that refuses. The per-order ceiling must
+    // stay above the pending order, otherwise the test would trip the
+    // per-order check first and the rolling-window path would never be reached
+    // (see the ordering at persistent.rs: per-order -> per-Leader ->
+    // account).
+    sqlx::query(
+        "INSERT INTO leader_policy \
+         (leader_id, max_signal_age_seconds, decision_window_seconds, price_tolerance_bps, \
+          tick_size, min_price, max_price, max_order_notional, min_leader_trade_size, \
+          rolling_budget_usdc, budget_window_seconds) \
+         VALUES (1, 3, 3, 100, '0.01', '0.01', '0.99', '10', '0', '1000', 86_400)",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("leader policy");
+
+    // 10 USDC per-order ceiling, 4 USDC account rolling cap: a 6 USDC
+    // pending order passes the per-order gate and trips the rolling cap.
+    let cfg = PersistentRuntimeConfig::from_values(1, true, "1", "10", "4", 86_400, 1, 60)
+        .expect("valid persistent config: 10 USDC per-order, 4 USDC account rolling cap");
+    init_config(&db, &cfg)
+        .await
+        .expect("init persistent config");
+
+    // The pending order: 6 USDC. Above the account cap (4), below the
+    // per-order ceiling (10), so the rolling-window check is the one that
+    // trips.
+    sqlx::query(
+        "UPDATE copy_intents SET status = 'in_progress', \
+         planned_qty = '12', planned_price = '0.5', planned_notional_usdc = '6' \
+         WHERE id = ?",
+    )
+    .bind(intent_id)
+    .execute(&db.pool)
+    .await
+    .expect("seed intent in_progress + planned fields above the account cap");
+
+    let venue = FakeVenue::succeeding(Decimal::new(5, 0));
+    let outcome = execute_one_intent_with_marker(
+        &db,
+        &FixedBalance(Decimal::new(100, 0)),
+        &venue,
+        &venue,
+        &EmptyHistory,
+        &PersistentSubmitMarker { config: &cfg },
+        intent_id,
+        Utc::now(),
+    )
+    .await
+    .expect("an exhausted account rolling budget must not propagate as a runner error");
+
+    assert_eq!(outcome, OrchestrateOutcome::Rejected);
+
+    let (status, reason): (String, Option<String>) =
+        sqlx::query_as("SELECT status, rejection_reason FROM copy_intents WHERE id = ?")
+            .bind(intent_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("intent row");
+    assert_eq!(status, "rejected", "the signal is skipped, durably");
+    let reason = reason.unwrap_or_default();
+    assert!(
+        reason.starts_with("account rolling budget exhausted:"),
+        "the ledger must identify the limit by its stable Display prefix, got: {reason:?}"
+    );
+
+    // The attempt is durably rejected (the orchestrator marked it after the
+    // marker refused), and no reservation row was written -- nothing crossed
+    // the venue boundary.
+    let (attempt_status, attempt_count): (String, i64) = sqlx::query_as(
+        "SELECT status, COUNT(*) OVER () FROM order_attempts WHERE intent_id = ?",
+    )
+    .bind(intent_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("attempt row");
+    assert_eq!(attempt_status, "rejected");
+    assert_eq!(attempt_count, 1);
+
+    let reserved: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM persistent_budget_reservations WHERE state = 'reserved'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("reservation count");
+    assert_eq!(reserved, 0, "no reservation row may have been written");
+
+    // The fuse must NOT be latched: that was the whole point of the change.
+    let fuse_open: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM persistent_execution_fuse WHERE account_id = 1)",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("fuse check");
+    assert_eq!(fuse_open, 0, "a refused signal must not latch the fuse");
+}
+
 #[tokio::test]
 async fn an_account_per_order_overage_rejects_only_the_intent_without_opening_the_fuse() {
     let db = TestDb::new().await;
