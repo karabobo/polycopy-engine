@@ -559,6 +559,14 @@ pub fn write_atomically(path: &Path, text: &str, mode: u32) -> Result<(), String
     let temp = parent.join(format!(".{file_name}.ops-tmp-{}", std::process::id()));
     let result = (|| -> std::io::Result<()> {
         let mut file = std::fs::File::create(&temp)?;
+        // Keep the replaced file's owner and group. The panel runs as root,
+        // and trading-config.json is group-readable by the service user so
+        // the notifier can read display names; a plain create would hand
+        // the file to root:root and lock that reader out.
+        if let Ok(existing) = std::fs::metadata(path) {
+            use std::os::unix::fs::MetadataExt as _;
+            std::os::unix::fs::fchown(&file, Some(existing.uid()), Some(existing.gid()))?;
+        }
         file.set_permissions(std::fs::Permissions::from_mode(mode))?;
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
@@ -813,6 +821,21 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o640);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "temp file left behind");
+
+        // The group survives the rewrite. Any secondary group of the test
+        // user stands in for the service group root would hand over.
+        use std::os::unix::fs::MetadataExt as _;
+        let current = std::fs::metadata(&path).unwrap().gid();
+        let groups = std::process::Command::new("id").arg("-G").output().unwrap();
+        let other = String::from_utf8_lossy(&groups.stdout)
+            .split_whitespace()
+            .filter_map(|gid| gid.parse::<u32>().ok())
+            .find(|gid| *gid != current);
+        if let Some(gid) = other {
+            std::os::unix::fs::chown(&path, None, Some(gid)).unwrap();
+            write_atomically(&path, "newer", 0o640).unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().gid(), gid, "group was not preserved");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

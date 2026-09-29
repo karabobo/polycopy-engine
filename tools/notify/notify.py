@@ -21,8 +21,10 @@ inside the noise, and polling has no reconnect state to get wrong.
 
 from __future__ import annotations
 
+import calendar
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -165,6 +167,9 @@ def intent_rows(db: sqlite3.Connection, after_id: int, watching: list[int]) -> l
 
     ids = ",".join(str(int(i)) for i in watching) if watching else None
     clause = "i.id > ?" + (f" OR i.id IN ({ids})" if ids else "")
+    # The latest attempt decides the kind of order (FAK or resting GTD): a
+    # post-only order refused for crossing is retried as a new attempt, and
+    # the first attempt of an intent may be a FAK that fell back to a maker.
     rows = db.execute(
         "SELECT i.id, i.event_id, i.status, i.rejection_reason, i.planned_price,"
         "       e.price, e.leader_id, e.side,"
@@ -172,7 +177,9 @@ def intent_rows(db: sqlite3.Connection, after_id: int, watching: list[int]) -> l
         "        WHERE a.intent_id = i.id ORDER BY a.id DESC LIMIT 1),"
         "       (SELECT a.accounted_filled_qty FROM order_attempts a"
         "        WHERE a.intent_id = i.id AND a.accounted_filled_qty > 0"
-        "        ORDER BY a.id DESC LIMIT 1)"
+        "        ORDER BY a.id DESC LIMIT 1),"
+        "       (SELECT a.status FROM order_attempts a"
+        "        WHERE a.intent_id = i.id ORDER BY a.id DESC LIMIT 1)"
         f" FROM copy_intents i JOIN leader_events e ON e.id = i.event_id"
         f" WHERE {clause} ORDER BY i.id",
         (after_id,),
@@ -197,10 +204,46 @@ def intent_rows(db: sqlite3.Connection, after_id: int, watching: list[int]) -> l
                 "side": row[7],
                 "limit_price": envelope.get("price"),
                 "budget": envelope.get("buy_budget_usdc"),
+                "size": envelope.get("size"),
+                "order_type": envelope.get("order_type") or "",
+                "expires_at": envelope.get("expires_at"),
                 "filled_qty": row[9],
+                "attempt_status": row[10] or "",
             }
         )
     return intents
+
+
+def account_budget(db: sqlite3.Connection, now: float | None = None) -> dict[str, Any] | None:
+    """The account's rolling budget as the engine counts it.
+
+    Mirrors `persistent::rolling_reserved_total`: every order reserves its
+    notional when it is submitted and keeps it for the whole window, filled
+    or not. Only a definitive venue rejection or an operator-confirmed no
+    fill releases it. The cutoff is formatted exactly like the engine's
+    (RFC 3339, milliseconds, `Z`) because the comparison is on the text.
+    """
+
+    row = db.execute(
+        "SELECT account_id, rolling_budget_usdc, budget_window_seconds"
+        " FROM persistent_execution_config WHERE id = 1"
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        account_id, cap, window = int(row[0]), float(row[1]), int(row[2])
+    except (TypeError, ValueError):
+        return None
+    now = time.time() if now is None else now
+    start = now - window
+    cutoff = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(start)) + f".{int(start % 1 * 1000):03d}Z"
+    used, oldest = db.execute(
+        "SELECT COALESCE(SUM(CAST(amount_usdc AS REAL)), 0), MIN(reserved_at)"
+        " FROM persistent_budget_reservations"
+        " WHERE account_id = ? AND state = 'reserved' AND reserved_at >= ?",
+        (account_id, cutoff),
+    ).fetchone()
+    return {"used": float(used), "cap": cap, "window": window, "oldest": oldest}
 
 
 # --- Feishu --------------------------------------------------------------
@@ -421,6 +464,24 @@ REASON_TEXT = {
 }
 
 
+#: Reasons whose text starts with a variable part (the leader id), matched by
+#: pattern. The engine's own wording is `PersistentError`'s Display, stored
+#: verbatim as the rejection reason: "leader 2 rolling budget exhausted: ...".
+REASON_PATTERNS = [
+    (re.compile(r"^leader \d+ rolling budget exhausted:?"),
+     "该 leader 的滚动预算已用尽,跳过这个信号"),
+    (re.compile(r"^account rolling budget exhausted:?"),
+     "账户滚动额度已用满,跳过这个信号(额度释放后自动恢复)"),
+    (re.compile(r"^account per-order notional exceeded:?"),
+     "超过账户单笔上限,跳过这个信号"),
+    (re.compile(r"^account cumulative-turnover circuit breaker exceeded:?"),
+     "账户滚动额度已用满,交易服务已停止"),
+]
+
+#: Written by the engine when a resting maker order ends without a fill.
+GTD_EXPIRED_REASON = "post-only GTD expired or cancelled without a fill"
+
+
 def _reason(raw: str) -> str:
     if not raw:
         return "(未记录)"
@@ -428,9 +489,16 @@ def _reason(raw: str) -> str:
         if raw.startswith(english):
             extra = raw[len(english):].strip()
             return f"{chinese}{(' ' + extra) if extra else ''}"
-    if "LeaderBudgetExhausted" in raw or "leader budget" in raw.lower():
-        return f"该 leader 的滚动预算已用尽\n{raw}"
+    for pattern, chinese in REASON_PATTERNS:
+        match = pattern.match(raw)
+        if match:
+            extra = raw[match.end():].strip()
+            return f"{chinese}{chr(10) + extra if extra else ''}"
     return raw
+
+
+def is_account_budget_refusal(raw: str) -> bool:
+    return raw.startswith("account rolling budget exhausted")
 
 
 def _decimal(value: Any, places: int = 4) -> str:
@@ -467,15 +535,34 @@ def _card(title: str, colour: str, fields: list[dict], slug: str = "") -> dict[s
     }
 
 
+def _notional(size: Any, price: Any) -> str:
+    try:
+        return f"{float(size) * float(price):.2f} USDC"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _local_time(stamp: Any, fmt: str = "%H:%M:%S") -> str:
+    """An RFC 3339 UTC stamp from the ledger or an envelope, in the server's
+    zone (the one the journal and the ops panel show)."""
+
+    try:
+        seconds = calendar.timegm(time.strptime(str(stamp)[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (TypeError, ValueError):
+        return str(stamp or "-")
+    return time.strftime(fmt, time.localtime(seconds))
+
+
+def _versus_leader(price: Any, leader_price: Any) -> str:
+    try:
+        ours, lead = float(price), float(leader_price)
+        return f"{ours - lead:+.4f} ({(ours - lead) / lead * 100:+.1f}%)"
+    except (TypeError, ValueError, ZeroDivisionError):
+        return "-"
+
+
 def leader_card(event: dict, label: str, short_address: str) -> dict[str, Any]:
     direction = "买入" if event["side"] == "BUY" else "卖出"
-    colour = "green" if event["side"] == "BUY" else "orange"
-    notional = ""
-    try:
-        notional = f"{float(event['size']) * float(event['price']):.2f} USDC"
-    except (TypeError, ValueError):
-        notional = "-"
-
     who = f"{label} · id={event['leader_id']}"
     if short_address:
         who += f" · {short_address}"
@@ -486,54 +573,200 @@ def leader_card(event: dict, label: str, short_address: str) -> dict[str, Any]:
         _field("方向", f"{direction} {event['outcome'] or ''}".strip()),
         _field("价格", _decimal(event["price"])),
         _field("股数", _decimal(event["size"], 4)),
-        _field("金额", notional),
+        _field("金额", _notional(event["size"], event["price"])),
     ]
-    if not event["realtime"]:
-        fields.append(
-            _field("来源", "REST 回填(非实时,不会触发跟单)", short=False)
-        )
-    return _card(f"{direction} · Leader 出手", colour, fields, event["event_slug"])
+    if event["realtime"]:
+        colour = "green" if event["side"] == "BUY" else "orange"
+        return _card(f"{direction} · Leader 出手(实时)", colour, fields, event["event_slug"])
+    fields.append(_field("成交时间", _local_time(event["occurred_at"], "%m-%d %H:%M:%S")))
+    fields.append(_field("来源", "REST 回填:事后补抓到的,已过时效,不会跟单", short=False))
+    return _card(f"{direction} · Leader 出手(REST 回填,不跟单)", "grey", fields, event["event_slug"])
 
 
-def outcome_card(intent: dict, label: str, short_address: str) -> dict[str, Any]:
-    who = f"{label} · id={intent['leader_id']}"
-    if short_address:
-        who += f" · {short_address}"
+def backfill_summary_card(events: list[dict], label: str) -> dict[str, Any]:
+    """Many backfilled trades at once (after a restart or an outage) become
+    one card: none of them will be copied, and a card each only buries the
+    live ones that will."""
 
-    if intent["status"] == "completed":
-        effective = None
-        if intent["budget"] and intent["filled_qty"]:
-            try:
-                effective = float(intent["budget"]) / float(intent["filled_qty"])
-            except (TypeError, ValueError, ZeroDivisionError):
-                effective = None
-        slip = ""
-        if effective is not None and intent["leader_price"]:
-            try:
-                lead = float(intent["leader_price"])
-                slip = f"{effective - lead:+.4f} ({(effective - lead) / lead * 100:+.1f}%)"
-            except (TypeError, ValueError, ZeroDivisionError):
-                slip = ""
-        spent = f"{float(intent['budget']):.2f} USDC" if intent["budget"] else "-"
-        fields = [
-            _field("Leader", who, short=False),
-            _field("成交股数", _decimal(intent["filled_qty"], 4)),
-            _field("花费", spent),
-            _field("实付均价", _decimal(effective) if effective is not None else "-"),
-            _field("Leader 价", _decimal(intent["leader_price"])),
-            _field("限价", _decimal(intent["limit_price"], 2)),
-            _field("滑价", slip or "-"),
-        ]
-        return _card("已跟单成交", "green", fields)
-
+    total = 0.0
+    for event in events:
+        try:
+            total += float(event["size"]) * float(event["price"])
+        except (TypeError, ValueError):
+            pass
+    first = _local_time(events[0]["occurred_at"], "%m-%d %H:%M")
+    last = _local_time(events[-1]["occurred_at"], "%m-%d %H:%M")
     fields = [
-        _field("Leader", who, short=False),
+        _field("Leader", label, short=False),
+        _field("笔数", str(len(events))),
+        _field("金额合计", f"{total:.2f} USDC"),
+        _field("成交时间", f"{first} ~ {last}", short=False),
+        _field("来源", "REST 回填:事后补抓到的,已过时效,不会跟单", short=False),
+    ]
+    return _card(f"Leader 成交 · REST 回填 {len(events)} 笔(不跟单)", "grey", fields)
+
+
+def outcome_kind(intent: dict) -> str:
+    """Which card an intent gets.
+
+    - "fak_filled": a FAK order took liquidity and filled at once;
+    - "resting": a post-only GTD is on the book (the venue accepted it);
+    - "maker_filled": a resting GTD filled, fully or in part;
+    - "maker_expired": a resting GTD ended without a fill;
+    - "not_copied": refused or failed before or at the venue;
+    - "pending": nothing to say yet.
+    """
+
+    status = intent["status"]
+    gtd = intent["order_type"] == "GTD"
+    if status in ("completed", "partially_filled"):
+        return "maker_filled" if gtd else "fak_filled"
+    if status in TERMINAL:
+        if intent["reason"].startswith(GTD_EXPIRED_REASON):
+            return "maker_expired"
+        return "not_copied"
+    if gtd and intent["attempt_status"] == "accepted":
+        return "resting"
+    return "pending"
+
+
+def is_settled(intent: dict) -> bool:
+    """No further card will ever be due. A partial fill is final once its
+    attempt is finalized; until then the rest of the order may still fill."""
+
+    if intent["status"] == "partially_filled":
+        return intent["attempt_status"] in ("finalized", "rejected", "error")
+    return intent["status"] in TERMINAL
+
+
+def _who(intent: dict, label: str, short_address: str) -> str:
+    who = f"{label} · id={intent['leader_id']}"
+    return f"{who} · {short_address}" if short_address else who
+
+
+def fak_card(intent: dict, label: str, short_address: str) -> dict[str, Any]:
+    # A FAK BUY spends its USDC budget and the venue fills as many shares as
+    # that buys at or under the limit, so the price actually paid is
+    # budget / shares, often below the limit.
+    effective = None
+    try:
+        effective = float(intent["budget"]) / float(intent["filled_qty"])
+    except (TypeError, ValueError, ZeroDivisionError):
+        effective = None
+    spent = f"{float(intent['budget']):.2f} USDC" if intent["budget"] else "-"
+    fields = [
+        _field("Leader", _who(intent, label, short_address), short=False),
+        _field("成交股数", _decimal(intent["filled_qty"], 4)),
+        _field("花费", spent),
+        _field("实付均价", _decimal(effective) if effective is not None else "-"),
+        _field("Leader 价", _decimal(intent["leader_price"])),
+        _field("限价", _decimal(intent["limit_price"], 2)),
+        _field("比 Leader 价", _versus_leader(effective, intent["leader_price"]) if effective else "-"),
+    ]
+    return _card("FAK 吃单跟单成交", "green", fields)
+
+
+def resting_card(intent: dict, label: str, short_address: str) -> dict[str, Any]:
+    fields = [
+        _field("Leader", _who(intent, label, short_address), short=False),
+        _field("挂单价", _decimal(intent["limit_price"], 3)),
+        _field("股数", _decimal(intent["size"], 4)),
+        _field("金额", _notional(intent["size"], intent["limit_price"])),
+        _field("Leader 价", _decimal(intent["leader_price"])),
+        _field("比 Leader 价", _versus_leader(intent["limit_price"], intent["leader_price"])),
+        _field("到期", _local_time(intent["expires_at"]) if intent["expires_at"] else "-"),
+    ]
+    return _card("开始挂单(maker,等对手成交)", "blue", fields)
+
+
+def maker_filled_card(intent: dict, label: str, short_address: str) -> dict[str, Any]:
+    # A maker fill happens at the order's own price; the spend is the filled
+    # shares at that price, not the whole order's budget (a partial fill
+    # spends less). A fee can come off the shares received (9.9912 of 10),
+    # so only a real shortfall counts as partial.
+    partial = False
+    try:
+        partial = float(intent["filled_qty"]) < float(intent["size"]) * 0.99
+    except (TypeError, ValueError):
+        partial = intent["status"] == "partially_filled"
+    fields = [
+        _field("Leader", _who(intent, label, short_address), short=False),
+        _field("成交股数", f"{_decimal(intent['filled_qty'], 4)} / {_decimal(intent['size'], 4)}"),
+        _field("成交价", _decimal(intent["limit_price"], 3)),
+        _field("花费", _notional(intent["filled_qty"], intent["limit_price"])),
+        _field("Leader 价", _decimal(intent["leader_price"])),
+        _field("比 Leader 价", _versus_leader(intent["limit_price"], intent["leader_price"])),
+    ]
+    return _card("挂单部分成交" if partial else "挂单成交", "green", fields)
+
+
+def maker_expired_card(intent: dict, label: str, short_address: str) -> dict[str, Any]:
+    fields = [
+        _field("Leader", _who(intent, label, short_address), short=False),
+        _field("挂单价", _decimal(intent["limit_price"], 3)),
+        _field("股数", _decimal(intent["size"], 4)),
+        _field("Leader 价", _decimal(intent["leader_price"])),
+        _field("结果", "到期无人成交,挂单已取消,没有买入", short=False),
+    ]
+    return _card("挂单到期取消(未成交)", "grey", fields)
+
+
+def not_copied_card(intent: dict, label: str, short_address: str) -> dict[str, Any]:
+    fields = [
+        _field("Leader", _who(intent, label, short_address), short=False),
         _field("Leader 价", _decimal(intent["leader_price"])),
         _field("限价", _decimal(intent["limit_price"], 2)),
         _field("结果", intent["status"]),
         _field("原因", _reason(intent["reason"]), short=False),
     ]
     return _card("未跟上", "red", fields)
+
+
+CARD_FOR_KIND = {
+    "fak_filled": fak_card,
+    "resting": resting_card,
+    "maker_filled": maker_filled_card,
+    "maker_expired": maker_expired_card,
+    "not_copied": not_copied_card,
+}
+
+
+def _window_zh(seconds: int) -> str:
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600} 小时"
+    if seconds % 60 == 0:
+        return f"{seconds // 60} 分钟"
+    return f"{seconds} 秒"
+
+
+def budget_card(budget: dict, high: bool, skipped: int = 0) -> dict[str, Any]:
+    # Half up, like the ops panel (Python's format rounds half to even).
+    percent = int(budget["used"] / budget["cap"] * 100 + 0.5) if budget["cap"] else 0
+    usage = f"{budget['used']:.2f} / {budget['cap']:g} USDC({percent}%)"
+    window = _window_zh(budget["window"])
+    if high:
+        release = "-"
+        if budget.get("oldest"):
+            try:
+                oldest = calendar.timegm(time.strptime(budget["oldest"][:19], "%Y-%m-%dT%H:%M:%S"))
+                release = time.strftime("%m-%d %H:%M", time.localtime(oldest + budget["window"])) + " 起逐步释放"
+            except ValueError:
+                release = "-"
+        fields = [
+            _field(f"已用(滚动 {window})", usage, short=False),
+            _field("最早的占用", release, short=False),
+            _field(
+                "影响",
+                "额度用满后不能再跟新的单,直到最早的占用释放。"
+                "挂出去没成交的单也占额度,直到过了窗口。",
+                short=False,
+            ),
+        ]
+        return _card("账户额度即将用满", "orange", fields)
+    fields = [_field(f"已用(滚动 {window})", usage, short=False)]
+    if skipped:
+        fields.append(_field("期间因额度跳过的信号", f"{skipped} 个", short=False))
+    return _card("账户额度已恢复", "green", fields)
 
 
 def engine_card(active: bool) -> dict[str, Any]:
@@ -555,7 +788,133 @@ def engine_card(active: bool) -> dict[str, Any]:
 
 # --- main ----------------------------------------------------------------
 
-TERMINAL = {"completed", "rejected", "cancelled", "failed", "expired"}
+TERMINAL = {"completed", "rejected", "cancelled", "failed", "expired", "dead_letter"}
+
+#: More backfilled trades than this in one pass become a single summary card.
+BACKFILL_SUMMARY_AT = 3
+
+#: The account budget and the display names change slowly; once a minute is
+#: plenty, and keeps this sidecar's reads of the ledger rare.
+SLOW_CHECK_SECONDS = 60.0
+
+#: Warn when the rolling window is this full; clear the warning only once it
+#: drops below the lower mark, so usage hovering at the line cannot flap.
+BUDGET_HIGH = 0.90
+BUDGET_CLEAR = 0.80
+
+TRADING_CONFIG = os.environ.get("NOTIFY_TRADING_CONFIG", "/etc/polycopy-engine/trading-config.json")
+
+
+def display_names(path: str = TRADING_CONFIG) -> dict[str, str]:
+    """label -> display_name from the owner's trading config. Missing or
+    unreadable means every leader shows under its database label."""
+
+    try:
+        with open(path, encoding="utf-8") as handle:
+            config = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    names = {}
+    for leader in config.get("leaders") or []:
+        if isinstance(leader, dict) and leader.get("label") and leader.get("display_name"):
+            names[str(leader["label"])] = str(leader["display_name"])
+    return names
+
+
+def process_events(db, state: dict, sender, names: dict[str, str]) -> bool:
+    events = new_leader_events(db, state["event_cursor"])
+    backfilled: dict[int, list[dict]] = {}
+    for event in events:
+        if not event["realtime"]:
+            backfilled.setdefault(event["leader_id"], []).append(event)
+    summarize = sum(len(group) for group in backfilled.values()) > BACKFILL_SUMMARY_AT
+    for event in events:
+        label, short = leader_identity(db, event["leader_id"])
+        label = names.get(label, label)
+        if summarize and not event["realtime"]:
+            continue
+        sender.send(
+            leader_card(event, label, short),
+            f"leader event {event['id']}",
+            dedup=f"polycopy-ev-{event['id']}",
+        )
+    if summarize:
+        for leader_id, group in backfilled.items():
+            label, _ = leader_identity(db, leader_id)
+            sender.send(
+                backfill_summary_card(group, names.get(label, label)),
+                f"backfill {len(group)} events",
+                dedup=f"polycopy-bf-{group[0]['id']}-{group[-1]['id']}",
+            )
+    if events:
+        state["event_cursor"] = events[-1]["id"]
+    return bool(events)
+
+
+def process_intents(db, state: dict, sender, names: dict[str, str]) -> bool:
+    watching = [int(i) for i in state.get("watching", [])]
+    rested = {int(i) for i in state.get("rested", [])}
+    intents = intent_rows(db, state["intent_cursor"], watching)
+    still_watching = []
+    for intent in intents:
+        if intent["id"] > state["intent_cursor"]:
+            state["intent_cursor"] = intent["id"]
+        kind = outcome_kind(intent)
+        label, short = leader_identity(db, intent["leader_id"])
+        label = names.get(label, label)
+        if not is_settled(intent):
+            still_watching.append(intent["id"])
+            if kind == "resting" and intent["id"] not in rested:
+                sender.send(
+                    resting_card(intent, label, short),
+                    f"intent {intent['id']} resting",
+                    dedup=f"polycopy-in-{intent['id']}-resting",
+                )
+                rested.add(intent["id"])
+            continue
+        # Reached exactly once: an id is either newly past the cursor or
+        # still on the watch list, never both, and a settled one leaves it.
+        rested.discard(intent["id"])
+        if is_account_budget_refusal(intent["reason"]):
+            if not state.get("budget_high"):
+                check_budget(db, state, sender, force_high=True)
+            state["budget_skipped"] = int(state.get("budget_skipped", 0)) + 1
+            log(f"intent {intent['id']} skipped for the account budget (card suppressed)")
+            continue
+        sender.send(
+            CARD_FOR_KIND.get(kind, not_copied_card)(intent, label, short),
+            f"intent {intent['id']} {kind}",
+            dedup=f"polycopy-in-{intent['id']}-{intent['status']}",
+        )
+    state["watching"] = still_watching
+    state["rested"] = sorted(rested & set(still_watching))
+    return bool(intents)
+
+
+def check_budget(db, state: dict, sender, force_high: bool = False) -> bool:
+    """One card when the rolling window gets nearly full, one when it has
+    room again. While it is full, each refused signal is counted instead of
+    carded, so a full day does not become a wall of red."""
+
+    budget = account_budget(db)
+    if budget is None or budget["cap"] <= 0:
+        return False
+    ratio = budget["used"] / budget["cap"]
+    high = bool(state.get("budget_high"))
+    if not high and (force_high or ratio >= BUDGET_HIGH):
+        sender.send(budget_card(budget, True), f"account budget high {ratio:.2f}")
+        state["budget_high"] = True
+        state["budget_skipped"] = 0
+        return True
+    if high and not force_high and ratio < BUDGET_CLEAR:
+        sender.send(
+            budget_card(budget, False, int(state.get("budget_skipped", 0))),
+            f"account budget clear {ratio:.2f}",
+        )
+        state["budget_high"] = False
+        state["budget_skipped"] = 0
+        return True
+    return False
 
 
 #: The database poll is cheap; spawning a process is not, and the engine
@@ -644,42 +1003,19 @@ def main() -> int:
 
     last_engine_state = state.get("engine_active", True)
     last_engine_check = 0.0
+    last_slow_check = 0.0
+    names: dict[str, str] = {}
 
     while True:
         try:
-            events = new_leader_events(db, state["event_cursor"])
-            for event in events:
-                label, short = leader_identity(db, event["leader_id"])
-                sender.send(
-                    leader_card(event, label, short),
-                    f"leader event {event['id']}",
-                    dedup=f"polycopy-ev-{event['id']}",
-                )
-                state["event_cursor"] = event["id"]
-
-            watching = [int(i) for i in state.get("watching", [])]
-            intents = intent_rows(db, state["intent_cursor"], watching)
-            still_watching = []
-            for intent in intents:
-                if intent["id"] > state["intent_cursor"]:
-                    state["intent_cursor"] = intent["id"]
-                if intent["status"] in TERMINAL:
-                    # Reached here exactly once: an id is either newly past the
-                    # cursor or still on the watch list, never both, and a
-                    # terminal one is dropped from the list below.
-                    label, short = leader_identity(db, intent["leader_id"])
-                    sender.send(
-                        outcome_card(intent, label, short),
-                        f"intent {intent['id']} {intent['status']}",
-                        dedup=f"polycopy-in-{intent['id']}-{intent['status']}",
-                    )
-                else:
-                    still_watching.append(intent["id"])
-            state["watching"] = still_watching
-
-            dirty = bool(events or intents)
-
             now = time.monotonic()
+            slow_due = now - last_slow_check >= SLOW_CHECK_SECONDS
+            if slow_due:
+                names = display_names()
+
+            dirty = process_events(db, state, sender, names)
+            dirty = process_intents(db, state, sender, names) or dirty
+
             if now - last_engine_check >= ENGINE_CHECK_SECONDS:
                 last_engine_check = now
                 active = engine_active()
@@ -688,6 +1024,10 @@ def main() -> int:
                     last_engine_state = active
                     state["engine_active"] = active
                     dirty = True
+
+            if slow_due:
+                last_slow_check = now
+                dirty = check_budget(db, state, sender) or dirty
 
             if dirty:
                 save_state(state)

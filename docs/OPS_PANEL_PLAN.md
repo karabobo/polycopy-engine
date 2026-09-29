@@ -14,6 +14,7 @@
 - **发布前提**:配置页"单笔上限"的说明描述的是方案 B(Codex 的 89117c7,比例单超限时压缩份数)上线后的行为,面板必须与它一起或在它之后发布。
 - **第二阶段已完成(未提交)**:配置页按 e 进入修改流程。面板从数据库重新生成 JSON,用 $EDITOR 编辑;拼错的字段名会报错,不会被悄悄忽略;在数据库副本上用真实的 `apply_trading_config` 和 `reconfigure_config` 试运行;用中文列出改动,停用 leader 用红字标出;然后依次备份、停服务、`copy_config_apply`、重新生成 env、`persistent_control reconfigure`、复查、确认启动;出错可以按 r 回滚。只改显示名时不停服务。子进程里才加载私钥,面板进程本身不读。新增 11 个测试(共 35 个);`--all-features` 全量 433 个库测试通过,严格 clippy 通过。使用说明见 `docs/OPS_PANEL.md`。
 - **2026-09-29 已上线(a2e0fd4)**,服务器上总览和日志页显示正常。首次查看后的显示修正:日志去掉主机名/进程号前缀并自动换行;数据库时间(最新信号、保险丝、异常单)换算成北京时间;总览表格在窄窗口里隐藏"说明"列、启动时间缩短为 `09-29 06:04`。
+- **额度与通知(未发布)**:总览加账户滚动额度一行(复用引擎的 `rolling_reserved_total`);面板重写配置文件时保留原属主/属组(trading-config.json 需对服务组可读,通知程序读显示名)。飞书通知区分实时/REST 回填、FAK 成交、开始挂单、挂单成交、挂单到期取消;额度 90% 预警、80% 以下恢复,满额期间拒单只计数;修正 leader 预算原因的中文匹配;显示名;通知服务 Nice=10、最低 IO 优先级。
 - 还没有在真实服务器上跑过应用流程。第一次建议先按 e,看完预览后按 n 放弃,零风险;第一次正式使用,就执行已经定好的两项改动(leader2 显示名、清空 max_order_shares)。
 
 ## 模块(src/copytrading/ops/,feature `ops_panel = ["execute", "dep:ratatui"]`;复用 `persistent::PersistentRuntimeConfig::from_values` 使一致性检查与启动校验一致)
@@ -34,6 +35,5 @@
 ## 相关待办(不在本分支)
 - Codex:比例模式超上限按方案 B 压缩下单量;账户级单笔 BudgetExceeded 改为只拒该笔(说明已给业主)。
 - Codex:部署脚本自动清理旧版本、删除编译中间产物、编译前检查磁盘。
-- `tools/notify/notify.py` 使用 display_name。
 - leader2 小额单回报分析,决定 min_leader_trade_size(暂不改)。
 - 本地另一份旧的 trading-config.json 副本同样过时,待业主决定是否删除。

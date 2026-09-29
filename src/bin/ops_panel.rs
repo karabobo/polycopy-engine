@@ -56,7 +56,7 @@ mod panel {
                 compact_journal_line, describe, disk_usage, run_with_env_files, systemctl_action,
                 systemctl_show, Action, UNITS,
             },
-            stats::{outcomes_last_24h, safety_state},
+            stats::{account_budget, outcomes_last_24h, safety_state},
             ui::{draw, AppState, Flow, FlowStage, Page, Pending},
         },
     };
@@ -768,6 +768,13 @@ mod panel {
                         let env = read_env(&paths.public_env);
                         state.checks =
                             consistency_checks(&live, env.as_ref(), secrets_present, &state.display_names);
+                        match &live.runtime {
+                            Some(runtime) => match account_budget(&pool, runtime, Utc::now()).await {
+                                Ok(budget) => state.account_budget = Some(budget),
+                                Err(error) => errors.push(format!("账户额度:{error}")),
+                            },
+                            None => state.account_budget = None,
+                        }
                         if state.selected_leader >= live.leaders.len() {
                             state.selected_leader = live.leaders.len().saturating_sub(1);
                         }
