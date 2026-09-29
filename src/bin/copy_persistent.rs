@@ -169,7 +169,25 @@ mod live {
                         );
                     }
                     Ok(OrchestrateOutcome::Rejected) => {
-                        eprintln!("intent {intent_id}: rejected");
+                        // Pull the persisted reason so the line tells the
+                        // operator which limit tripped. The token `rejected`
+                        // is kept verbatim for the ops panel's important-only
+                        // filter (`ops/services.rs` `is_important_log`).
+                        let reason: Option<String> = sqlx::query_scalar(
+                            "SELECT rejection_reason FROM copy_intents WHERE id = ?",
+                        )
+                        .bind(intent_id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap_or(None);
+                        match reason {
+                            Some(detail) if !detail.is_empty() => {
+                                eprintln!("intent {intent_id}: rejected: {detail}");
+                            }
+                            _ => {
+                                eprintln!("intent {intent_id}: rejected");
+                            }
+                        }
                     }
                     Ok(OrchestrateOutcome::Expired | OrchestrateOutcome::NotClaimed) => {
                         eprintln!("intent {intent_id}: non-submitted outcome");
@@ -194,17 +212,37 @@ mod live {
                         // A budget refusal is a limit doing its job: the
                         // ledger is consistent and nothing needs an operator,
                         // so it stops this run without also latching the fuse
-                        // that would block the next one. Both budget variants
-                        // belong here; listing only the account one let a
-                        // per-Leader refusal latch the fuse on its way out,
-                        // so recovering from it needed a manual resume on top
-                        // of a restart. submit_prepared now intercepts the
-                        // per-Leader case long before this, and this arm is
-                        // the backstop agreeing with it.
+                        // that would block the next one. Three variants
+                        // belong in the no-fuse list:
+                        //   * `BudgetExceeded` -- legacy variant covering
+                        //     `reconfigure_config`'s start-up refusal and
+                        //     the `amount <= 0` branch. The marker now maps
+                        //     the per-order ceiling (`requested > max_order
+                        //     _notional`) to `OrderNotionalExceeded`, so
+                        //     this arm is no longer hit on the live submit
+                        //     path. Kept here for symmetry / for callers
+                        //     outside `submit_prepared`.
+                        //   * `LeaderBudgetExhausted` -- one Leader spent
+                        //     its own rolling window.
+                        //   * `AccountBudgetExhausted` -- the account
+                        //     rolling window is full.
+                        // `OrderNotionalExceeded` is deliberately absent:
+                        // it is intercepted by `submit_prepared` long before
+                        // this arm, so the runner would only see it if the
+                        // intercept were bypassed. If that ever happens,
+                        // latching the fuse is the right backstop because
+                        // the marker's mapping is a single, well-understood
+                        // line that cannot quietly regress. Listing only the
+                        // account variant here used to let a per-Leader
+                        // refusal latch the fuse on its way out, so
+                        // recovering from it needed a manual resume on top
+                        // of a restart; that gap is what motivated
+                        // extending this list.
                         if !matches!(
                             error,
                             PersistentError::BudgetExceeded { .. }
                                 | PersistentError::LeaderBudgetExhausted { .. }
+                                | PersistentError::AccountBudgetExhausted { .. }
                         ) {
                             open_runtime_fuse(&pool, config.account_id, &error.to_string()).await?;
                         }

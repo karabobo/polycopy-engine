@@ -670,7 +670,12 @@ pub async fn reserve_budget_and_mark_submitting(
             used += existing;
         }
         if used + amount > config.rolling_budget {
-            return Err(PersistentError::BudgetExceeded {
+            // The ceiling itself stays exact: nothing past it has been
+            // reserved and nothing has crossed the venue boundary. The
+            // reaction (skip this signal, keep running) is the orchestrator's
+            // job -- see submit_prepared's intercept arm in orchestrate/mod.rs.
+            // Hitting this is the limit doing its job, not a fault.
+            return Err(PersistentError::AccountBudgetExhausted {
                 used,
                 requested: amount,
                 cap: config.rolling_budget,
@@ -1678,6 +1683,18 @@ pub enum PersistentError {
         requested: Decimal,
         cap: Decimal,
     },
+    /// The account rolling-window cap cannot fit the next order. The cap
+    /// itself stays exact: no reservation may be written past it. Only the
+    /// reaction changes from "halt the process" to "skip this signal" -- the
+    /// orchestrator intercepts this variant and converts it to a
+    /// pre-boundary rejection, exactly like `LeaderBudgetExhausted`. A
+    /// fail-closed exit is still wired as a backstop so an unhandled site
+    /// stops the runner instead of silently bypassing the ceiling.
+    AccountBudgetExhausted {
+        used: Decimal,
+        requested: Decimal,
+        cap: Decimal,
+    },
 }
 
 impl PersistentError {
@@ -1692,11 +1709,16 @@ impl PersistentError {
             // LeaderBudgetExhausted shares the fail-closed exit as a backstop
             // only. The caller is expected to intercept it and reject the one
             // intent; reaching here means nobody did, and halting is the safe
-            // reading of an unhandled budget condition.
+            // reading of an unhandled budget condition. AccountBudgetExhausted
+            // is the same shape: submit_prepared intercepts it long before
+            // this point, and the runner's no-fuse list agrees; the exit
+            // mapping is a backstop that only fires if both layers were
+            // bypassed.
             Self::MalformedBudgetState
             | Self::BudgetExceeded { .. }
             | Self::OrderNotionalExceeded { .. }
-            | Self::LeaderBudgetExhausted { .. } => EXIT_BUDGET_STATE,
+            | Self::LeaderBudgetExhausted { .. }
+            | Self::AccountBudgetExhausted { .. } => EXIT_BUDGET_STATE,
             Self::Database(_)
             | Self::FuseNotOpen
             | Self::InvalidAttemptTransition
@@ -1751,6 +1773,16 @@ impl fmt::Display for PersistentError {
                 formatter,
                 "leader {leader_id} rolling budget exhausted: \
                  used={used} requested={requested} cap={cap}"
+            ),
+            // The "account rolling budget exhausted" prefix is the contract
+            // with the notifier / ops panel; do not rephrase it.
+            Self::AccountBudgetExhausted {
+                used,
+                requested,
+                cap,
+            } => write!(
+                formatter,
+                "account rolling budget exhausted: used={used} requested={requested} cap={cap}"
             ),
         }
     }
@@ -2038,9 +2070,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_account_ceiling_still_halts_even_when_leader_budgets_allow_it() {
-        // The account budget stays fail-closed: per-Leader limits are an extra
-        // gate, never a way around the shared one.
+    async fn the_account_ceiling_still_refuses_even_when_leader_budgets_allow_it() {
+        // The account budget stays fail-closed at the seam: per-Leader limits
+        // are an extra gate, never a way around the shared one. The reaction
+        // to a refusal changes from "halt the process" to "skip this signal"
+        // -- see orchestrate::submit_prepared's intercept arm and the runner's
+        // no-fuse list -- so this test now asserts the new skippable variant
+        // and proves nothing was written past the ceiling.
         let db = TestDb::new().await;
         seed_base(&db).await;
         set_leader_budget(&db, 1, "50", None).await;
@@ -2058,11 +2094,211 @@ mod tests {
 
         let (second_intent, second_attempt) =
             seed_attempt_for_leader(&db, 1, "cap-b", "1", deadline).await;
-        assert!(matches!(
+        let refused =
             reserve_budget_and_mark_submitting(&db, &config, second_intent, second_attempt, now)
+                .await;
+        assert!(
+            matches!(
+                refused,
+                Err(PersistentError::AccountBudgetExhausted { .. })
+            ),
+            "the rolling-window refusal must surface as AccountBudgetExhausted, not the legacy BudgetExceeded variant"
+        );
+
+        // Exactly one reservation row, belonging to the first intent. The
+        // refusal path rolled back its transaction, so nothing was written
+        // past the ceiling.
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT order_attempt_id, state FROM persistent_budget_reservations ORDER BY id",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .expect("reservation rows");
+        assert_eq!(rows.len(), 1, "exactly one reservation fits the ceiling");
+        assert_eq!(rows[0].0, first_attempt);
+        assert_eq!(rows[0].1, "reserved");
+
+        // The refused intent's attempt is still `prepared` -- nothing crossed
+        // the venue boundary and the mark_submitting transition did not fire.
+        let attempt_status: String =
+            sqlx::query_scalar("SELECT status FROM order_attempts WHERE id = ?")
+                .bind(second_attempt)
+                .fetch_one(&db.pool)
+                .await
+                .expect("refused attempt status");
+        assert_eq!(
+            attempt_status, "prepared",
+            "a refused reservation must not have transitioned the attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_account_cap_stays_exact_under_repeated_refusals() {
+        // Per docs/account-rolling-budget-halts-engine.md: the cap must hold
+        // even with repeated refusals -- nothing past the ceiling is ever
+        // reserved, and the reserved total never overshoots.
+        let db = TestDb::new().await;
+        seed_base(&db).await;
+        set_leader_budget(&db, 1, "50", None).await;
+        let config = PersistentRuntimeConfig::from_values(1, true, "1", "5", "10", 86_400, 1, 60)
+            .expect("config: 10 USDC account cap, 5 USDC per-order ceiling");
+        init_config(&db, &config).await.expect("config persisted");
+        let now = Utc::now();
+        let deadline = now + chrono::Duration::seconds(60);
+
+        // 4 + 4 fits exactly. The third 4 must be refused and the reserved
+        // total must stay at 8.
+        for key in ["cap-x", "cap-y"] {
+            let (intent, attempt) =
+                seed_attempt_for_leader(&db, 1, key, "4", deadline).await;
+            reserve_budget_and_mark_submitting(&db, &config, intent, attempt, now)
+                .await
+                .expect("4 + (0 or 4) fits under a 10 USDC account ceiling");
+        }
+
+        let (refused_intent, refused_attempt) =
+            seed_attempt_for_leader(&db, 1, "cap-z", "4", deadline).await;
+        assert!(matches!(
+            reserve_budget_and_mark_submitting(&db, &config, refused_intent, refused_attempt, now)
                 .await,
-            Err(PersistentError::BudgetExceeded { .. })
+            Err(PersistentError::AccountBudgetExhausted { .. })
         ));
+
+        let reserved_amounts: Vec<String> = sqlx::query_scalar(
+            "SELECT amount_usdc FROM persistent_budget_reservations \
+             WHERE state = 'reserved' ORDER BY id",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .expect("reservation amounts");
+        let reserved_total: Decimal = reserved_amounts
+            .iter()
+            .map(|s| s.parse::<Decimal>().expect("amount parses"))
+            .sum();
+        assert_eq!(
+            reserved_total,
+            Decimal::new(8, 0),
+            "the reserved total must never exceed the cap, even after refusals"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_account_budget_refusal_rolls_off_without_a_restart() {
+        // The whole point of changing the reaction from "halt" to "skip":
+        // once the filling reservations age out of the window, the same
+        // process must accept the next signal -- no operator intervention
+        // required.
+        let db = TestDb::new().await;
+        seed_base(&db).await;
+        // 60-second account window so the test can advance past it.
+        let config = PersistentRuntimeConfig::from_values(1, true, "1", "5", "8", 60, 1, 60)
+            .expect("config");
+        init_config(&db, &config).await.expect("config persisted");
+        let now = Utc::now();
+        let deadline = now + chrono::Duration::seconds(120);
+
+        let (first_intent, first_attempt) =
+            seed_attempt_for_leader(&db, 1, "roll-a", "4", deadline).await;
+        reserve_budget_and_mark_submitting(&db, &config, first_intent, first_attempt, now)
+            .await
+            .expect("first fits the ceiling");
+
+        let (second_intent, second_attempt) =
+            seed_attempt_for_leader(&db, 1, "roll-b", "4", deadline).await;
+        reserve_budget_and_mark_submitting(&db, &config, second_intent, second_attempt, now)
+            .await
+            .expect("second fits the ceiling");
+
+        // Third intent at the same `now` cannot fit (4 + 4 = 8 used).
+        let (refused_intent, refused_attempt) =
+            seed_attempt_for_leader(&db, 1, "roll-c", "4", deadline).await;
+        assert!(matches!(
+            reserve_budget_and_mark_submitting(&db, &config, refused_intent, refused_attempt, now)
+                .await,
+            Err(PersistentError::AccountBudgetExhausted { .. })
+        ));
+
+        // Advance past the 60s window. The earlier two reservations fall
+        // outside it, so the next attempt fits again -- in the same process,
+        // without a restart and without touching the fuse.
+        let later = now + chrono::Duration::seconds(120);
+        let (resumed_intent, resumed_attempt) = seed_attempt_for_leader(
+            &db,
+            1,
+            "roll-d",
+            "4",
+            later + chrono::Duration::seconds(60),
+        )
+        .await;
+        reserve_budget_and_mark_submitting(&db, &config, resumed_intent, resumed_attempt, later)
+            .await
+            .expect("after the window rolls off the next signal must be accepted");
+
+        let fuse_open: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM persistent_execution_fuse WHERE account_id = ?)",
+        )
+        .bind(1)
+        .fetch_one(&db.pool)
+        .await
+        .expect("fuse check");
+        assert_eq!(
+            fuse_open, 0,
+            "a refused signal must not have latched the fuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_budget_exhausted_exit_code_matches_its_backstop() {
+        // Mirrors `LeaderBudgetExhausted` and `OrderNotionalExceeded`: the
+        // new variant keeps the same fail-closed exit code as a backstop,
+        // even though the orchestrator intercepts it before the runner ever
+        // sees it. Anyone bypassing the intercept must still stop the runner.
+        assert_eq!(
+            PersistentError::AccountBudgetExhausted {
+                used: Decimal::new(550, 0),
+                requested: Decimal::new(50, 0),
+                cap: Decimal::new(600, 0),
+            }
+            .exit_code(),
+            EXIT_BUDGET_STATE
+        );
+        // The Display prefix is the notifier contract -- pin it.
+        let rendered = PersistentError::AccountBudgetExhausted {
+            used: Decimal::new(550, 0),
+            requested: Decimal::new(50, 0),
+            cap: Decimal::new(600, 0),
+        }
+        .to_string();
+        assert!(
+            rendered.starts_with("account rolling budget exhausted:"),
+            "Display must start with the stable prefix, got: {rendered}"
+        );
+        assert!(rendered.contains("used=550"));
+        assert!(rendered.contains("requested=50"));
+        assert!(rendered.contains("cap=600"));
+
+        // What must NOT change: MalformedBudgetState, the per-order
+        // BudgetExceeded that the marker maps to OrderNotionalExceeded, and
+        // the reconfigure BudgetExceeded all keep their old exit code. They
+        // are still fail-closed.
+        assert_eq!(PersistentError::MalformedBudgetState.exit_code(), EXIT_BUDGET_STATE);
+        assert_eq!(
+            PersistentError::BudgetExceeded {
+                used: Decimal::ZERO,
+                requested: Decimal::new(15, 0),
+                cap: Decimal::new(10, 0),
+            }
+            .exit_code(),
+            EXIT_BUDGET_STATE
+        );
+        assert_eq!(
+            PersistentError::OrderNotionalExceeded {
+                requested: Decimal::new(15, 0),
+                cap: Decimal::new(10, 0),
+            }
+            .exit_code(),
+            EXIT_BUDGET_STATE
+        );
     }
 
     /// A live halt: leader 2 bought 11.36 shares for 5.00 USDC at 0.50, the

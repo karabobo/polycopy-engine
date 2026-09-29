@@ -1318,23 +1318,36 @@ where
         .mark_submitting(pool, intent_id, attempt.id, now)
         .await
     {
-        // One Leader spending its own window budget is that limit working,
-        // not a fault. Every other error here is a reason to stop; this one
-        // is a reason to skip a signal. Without this arm it reaches the
-        // runner as EXIT_BUDGET_STATE, which systemd is told not to restart,
-        // so the busiest Leader silently halts copying for all the others --
-        // precisely the coupling per-Leader budgets exist to remove. It did:
-        // "leader 2 rolling budget exhausted: used=9.36 requested=9.3590
-        // cap=10" stopped the engine for eight hours. Nothing crossed the
-        // venue boundary, and no reservation was taken, so the attempt and
-        // its intent close out exactly like any other pre-submit rejection.
+        // Three budget refusals mean the limit is working, not a fault: a
+        // per-order ceiling (`OrderNotionalExceeded`, mapped by the marker
+        // from the legacy BudgetExceeded branch), a per-Leader rolling
+        // window (`LeaderBudgetExhausted`), and the account rolling window
+        // (`AccountBudgetExhausted`). Every other error here is a reason to
+        // stop; these are reasons to skip a signal. Without this arm they
+        // reach the runner as EXIT_BUDGET_STATE, which systemd is told not
+        // to restart, so the busiest Leader (or one full window) silently
+        // halts copying for all the others -- precisely the coupling
+        // per-Leader and account budgets exist to remove. It did: "leader
+        // 2 rolling budget exhausted: used=9.36 requested=9.3590 cap=10"
+        // stopped the engine for eight hours, and at the planned leader 2
+        // ratio bump the account ceiling would do the same for everyone.
+        // Nothing crossed the venue boundary, and no reservation was taken,
+        // so the attempt and its intent close out exactly like any other
+        // pre-submit rejection.
         if matches!(
             error,
             OrchestrateError::Persistent(
                 crate::copytrading::persistent::PersistentError::LeaderBudgetExhausted { .. }
                     | crate::copytrading::persistent::PersistentError::OrderNotionalExceeded { .. }
+                    | crate::copytrading::persistent::PersistentError::AccountBudgetExhausted { .. }
             )
         ) {
+            // A budget exhaustion is that limit working, not a fault: nothing
+            // crossed the venue boundary, no reservation was taken, and the
+            // other signals are unaffected. The runner reads the persisted
+            // `rejection_reason` afterwards to log a "rejected: <reason>"
+            // line that satisfies the ops panel's important-only filter
+            // (which keys on the token "rejected").
             let reason = error.to_string();
             mark_attempt_rejected(pool, intent_id, attempt.id, &reason).await?;
             reject_pre_submit_intent(pool, intent_id, &reason).await?;
