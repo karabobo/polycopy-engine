@@ -163,6 +163,70 @@ pub fn is_important_log(line: &str) -> bool {
     SIGNAL.iter().any(|signal| lower.contains(signal))
 }
 
+/// `2026-09-29T13:18:34+08:00` -> (`2026-09-29`, `13:18:34`).
+fn split_iso_timestamp(token: &str) -> Option<(&str, &str)> {
+    let head = token.as_bytes().get(..19)?;
+    let shaped = head.iter().enumerate().all(|(index, byte)| match index {
+        4 | 7 => *byte == b'-',
+        10 => *byte == b'T',
+        13 | 16 => *byte == b':',
+        _ => byte.is_ascii_digit(),
+    });
+    shaped.then(|| (&token[..10], &token[11..19]))
+}
+
+/// `2026-09-29` -> true.
+fn is_iso_date(token: &str) -> bool {
+    token.len() == 10
+        && token.bytes().enumerate().all(|(index, byte)| match index {
+            4 | 7 => byte == b'-',
+            _ => byte.is_ascii_digit(),
+        })
+}
+
+/// Shortens a `journalctl -o short-iso` line for a narrow terminal:
+/// `2026-09-29T13:18:34+08:00 <host> copy_persistent[123]: msg` becomes
+/// `13:18:34 msg`, or `09-28 13:18:34 msg` when the line is not from `today`
+/// (`YYYY-MM-DD`, the server's local date, the zone journald prints in).
+/// A leading UTC timestamp the program wrote itself is dropped as a
+/// duplicate. Lines of another shape (`-- Boot …`) are returned unchanged.
+pub fn compact_journal_line(line: &str, today: &str) -> String {
+    let mut parts = line.splitn(4, ' ');
+    let (Some(stamp), Some(_host), Some(ident), Some(message)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return line.to_owned();
+    };
+    let Some((date, time)) = split_iso_timestamp(stamp) else {
+        return line.to_owned();
+    };
+    if !ident.ends_with(':') {
+        return line.to_owned();
+    }
+    let message = match message.split_once(' ') {
+        Some((first, rest)) if first.ends_with('Z') && split_iso_timestamp(first).is_some() => rest,
+        _ => message,
+    };
+    if date == today {
+        format!("{time} {message}")
+    } else {
+        format!("{} {time} {message}", &date[5..])
+    }
+}
+
+/// systemd's `Tue 2026-09-29 06:04:32 CST` -> `09-29 06:04`.
+pub fn short_since(since: &str) -> String {
+    let mut tokens = since.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if is_iso_date(token) {
+            if let Some(minutes) = tokens.next().and_then(|time| time.get(..5)) {
+                return format!("{} {minutes}", &token[5..]);
+            }
+        }
+    }
+    since.to_owned()
+}
+
 /// Parses the data line of `df -Pk <path>` into (used percent, free bytes).
 pub fn parse_df(text: &str) -> Option<(u8, u64)> {
     let line = text.lines().nth(1)?;
@@ -342,6 +406,46 @@ mod tests {
         assert!(!is_important_log("WS_EVENT: {\"kind\":\"connected\"}"));
         assert!(!is_important_log("backfill leader 2: fetched=1 ingested=1 rejected=0"));
         assert!(!is_important_log("intent 861: post-only GTD remains on book"));
+    }
+
+    #[test]
+    fn journal_lines_lose_the_host_and_process_prefix() {
+        let today = "2026-09-29";
+        assert_eq!(
+            compact_journal_line(
+                "2026-09-29T13:24:48+08:00 host copy_persistent[4070970]: backfill leader 2: fetched=1",
+                today
+            ),
+            "13:24:48 backfill leader 2: fetched=1"
+        );
+        assert_eq!(
+            compact_journal_line(
+                "2026-09-28T13:47:18+08:00 host book_sampler[3619066]: book sample event=1779",
+                today
+            ),
+            "09-28 13:47:18 book sample event=1779"
+        );
+        // notify.py prints its own UTC stamp; the journal's local one is kept.
+        assert_eq!(
+            compact_journal_line(
+                "2026-09-26T22:42:20+08:00 host python3[3469599]: 2026-09-26T14:42:20Z unexpected error in poll",
+                today
+            ),
+            "09-26 22:42:20 unexpected error in poll"
+        );
+        for untouched in ["-- Boot 5e1f --", "-- No entries --", "", "2026-09-29T13:24:48+08:00 host"] {
+            assert_eq!(compact_journal_line(untouched, today), untouched);
+        }
+        assert_eq!(
+            compact_journal_line("2026-09-29T13:24:4é+08:00 host x[1]: m", today),
+            "2026-09-29T13:24:4é+08:00 host x[1]: m"
+        );
+    }
+
+    #[test]
+    fn service_start_time_is_shortened() {
+        assert_eq!(short_since("Tue 2026-09-29 06:04:32 CST"), "09-29 06:04");
+        assert_eq!(short_since("n/a"), "n/a");
     }
 
     #[test]

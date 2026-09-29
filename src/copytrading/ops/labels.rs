@@ -9,6 +9,7 @@
 //! The notes below mirror `execute.rs`'s sizing precedence; keep them in step
 //! with it.
 
+use chrono::{DateTime, Local, TimeZone};
 use rust_decimal::Decimal;
 
 use super::live_config::LivePolicy;
@@ -74,6 +75,23 @@ pub fn duration_zh(seconds: i64) -> String {
         s if s > 0 && s % 60 == 0 => format!("{} 分钟", s / 60),
         s => format!("{s} 秒"),
     }
+}
+
+/// A ledger timestamp (RFC 3339, stored in UTC) as `MM-DD HH:MM:SS` in
+/// `zone`. Unparseable text is shown as stored.
+pub fn ledger_time_in<Tz: TimeZone>(stored: &str, zone: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    DateTime::parse_from_rfc3339(stored)
+        .map(|at| at.with_timezone(zone).format("%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|_| stored.to_owned())
+}
+
+/// [`ledger_time_in`] the server's local zone, the one the header clock and
+/// the journal use (Beijing time on the production server).
+pub fn ledger_time(stored: &str) -> String {
+    ledger_time_in(stored, &Local)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,5 +386,13 @@ mod tests {
         assert_eq!(duration_zh(86_400), "1 天");
         assert_eq!(duration_zh(600), "10 分钟");
         assert_eq!(duration_zh(45), "45 秒");
+    }
+
+    #[test]
+    fn ledger_times_are_shown_in_the_local_zone() {
+        let beijing = chrono::FixedOffset::east_opt(8 * 3_600).unwrap();
+        // 21:33 UTC is already the next morning in Beijing.
+        assert_eq!(ledger_time_in("2026-09-28T21:33:52.123Z", &beijing), "09-29 05:33:52");
+        assert_eq!(ledger_time_in("2026-09-25", &beijing), "2026-09-25");
     }
 }

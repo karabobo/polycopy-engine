@@ -13,9 +13,11 @@ use ratatui::{
 
 use super::{
     checks::{worst_level, Check, Level},
-    labels::{duration_zh, leader_field_rows, short_address, strategy_summary, Effect},
+    labels::{duration_zh, leader_field_rows, ledger_time, short_address, strategy_summary, Effect},
     live_config::LiveConfig,
-    services::{describe, human_bytes, is_important_log, Action, ServiceStatus, Unit, UNITS},
+    services::{
+        describe, human_bytes, is_important_log, short_since, Action, ServiceStatus, Unit, UNITS,
+    },
     stats::{case_type_zh, OutcomeCounts, SafetyState},
 };
 
@@ -176,6 +178,22 @@ impl AppState {
         filtered[start..end].to_vec()
     }
 
+    /// Screen rows for a log view `width` columns wide and `height` rows
+    /// high, newest at the bottom. Long lines wrap instead of being cut off;
+    /// each row carries the log line it came from (for colouring).
+    pub fn log_view_rows(&self, height: usize, width: usize) -> Vec<(String, &str)> {
+        let mut rows = Vec::new();
+        for line in self.visible_log_lines(usize::MAX).into_iter().rev() {
+            if rows.len() >= height {
+                break;
+            }
+            rows.extend(wrap_log_line(line, width).into_iter().rev().map(|row| (row, line)));
+        }
+        rows.truncate(height);
+        rows.reverse();
+        rows
+    }
+
     /// Consequences the owner should read before confirming `action`.
     pub fn action_warnings(&self, action: Action, unit_index: usize) -> Vec<String> {
         let mut warnings = Vec::new();
@@ -233,6 +251,61 @@ fn level_mark(level: Level) -> &'static str {
 
 fn boxed(title: &str) -> Block<'_> {
     Block::default().borders(Borders::ALL).title(format!(" {title} "))
+}
+
+/// Terminal columns `text` occupies (CJK characters take two).
+fn text_width(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+/// Continuation rows of a wrapped log line start under its message, after
+/// the `HH:MM:SS ` or `MM-DD HH:MM:SS ` prefix of a compacted journal line.
+fn log_indent(line: &str) -> usize {
+    let digits_at = |range: std::ops::Range<usize>| {
+        line.as_bytes()
+            .get(range)
+            .is_some_and(|bytes| bytes.iter().all(u8::is_ascii_digit))
+    };
+    let time_at = |start: usize| {
+        digits_at(start..start + 2)
+            && digits_at(start + 3..start + 5)
+            && digits_at(start + 6..start + 8)
+            && line.as_bytes().get(start + 8) == Some(&b' ')
+    };
+    if time_at(0) {
+        9
+    } else if digits_at(0..2) && digits_at(3..5) && time_at(6) {
+        15
+    } else {
+        2
+    }
+}
+
+/// Splits `line` into rows at most `width` columns wide.
+pub fn wrap_log_line(line: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let indent = log_indent(line).min(width / 2);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut used = 0;
+    let mut row_start = 0;
+    for ch in line.chars() {
+        let mut buffer = [0; 4];
+        let char_width = text_width(ch.encode_utf8(&mut buffer));
+        if used + char_width > width && used > row_start {
+            rows.push(std::mem::take(&mut row));
+            row.push_str(&" ".repeat(indent));
+            used = indent;
+            row_start = indent;
+        }
+        if ch == ' ' && used == row_start && !rows.is_empty() {
+            continue;
+        }
+        row.push(ch);
+        used += char_width;
+    }
+    rows.push(row);
+    rows
 }
 
 pub fn draw(frame: &mut Frame, state: &AppState) {
@@ -330,19 +403,44 @@ fn draw_overview(frame: &mut Frame, state: &AppState, area: Rect) {
         ])
         .split(area);
 
+    let states: Vec<(Level, String)> = state
+        .services
+        .iter()
+        .map(|service| match (&service.status, &service.error) {
+            (_, Some(error)) => (Level::Warn, format!("读取失败:{error}")),
+            (Some(status), None) => describe(status),
+            (None, None) => (Level::Warn, "读取中…".to_owned()),
+        })
+        .collect();
+    // Service, state, release and start time always fit; the description
+    // column is shown only when the terminal is wide enough for all of it.
+    const NAME: u16 = 10;
+    const RELEASE: u16 = 8;
+    const SINCE: u16 = 11;
+    let state_width = states
+        .iter()
+        .map(|(_, text)| text_width(text))
+        .chain([text_width("状态")])
+        .max()
+        .unwrap_or(0) as u16;
+    let description_width = state
+        .services
+        .iter()
+        .map(|service| text_width(service.unit.description))
+        .max()
+        .unwrap_or(0) as u16;
+    let with_description =
+        rows[0].width >= 2 + NAME + state_width + RELEASE + SINCE + description_width + 4;
+
     let service_rows: Vec<Row> = state
         .services
         .iter()
+        .zip(states)
         .enumerate()
-        .map(|(index, service)| {
+        .map(|(index, (service, (level, text)))| {
             let marker = if index == state.selected_service { "›" } else { " " };
-            let (level, text) = match (&service.status, &service.error) {
-                (_, Some(error)) => (Level::Warn, format!("读取失败:{error}")),
-                (Some(status), None) => describe(status),
-                (None, None) => (Level::Warn, "读取中…".to_owned()),
-            };
             let status = service.status.as_ref();
-            Row::new(vec![
+            let mut cells = vec![
                 Line::from(format!("{marker} {}", service.unit.name)),
                 Line::from(Span::styled(text, level_style(level))),
                 Line::from(
@@ -352,28 +450,35 @@ fn draw_overview(frame: &mut Frame, state: &AppState, area: Rect) {
                 ),
                 Line::from(
                     status
-                        .and_then(|s| s.since.clone())
+                        .and_then(|s| s.since.as_deref())
+                        .map(short_since)
                         .unwrap_or_else(|| "-".to_owned()),
                 ),
-                Line::from(service.unit.description),
-            ])
+            ];
+            if with_description {
+                cells.push(Line::from(service.unit.description));
+            }
+            Row::new(cells)
         })
         .collect();
-    let table = Table::new(
-        service_rows,
-        [
-            Constraint::Length(12),
-            Constraint::Length(34),
-            Constraint::Length(10),
-            Constraint::Length(30),
-            Constraint::Min(10),
-        ],
-    )
-    .header(
-        Row::new(vec!["  服务", "状态", "运行版本", "启动时间", "说明"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-    )
-    .block(boxed("服务"));
+    let mut widths = vec![
+        Constraint::Length(NAME),
+        if with_description {
+            Constraint::Length(state_width)
+        } else {
+            Constraint::Fill(1)
+        },
+        Constraint::Length(RELEASE),
+        Constraint::Length(SINCE),
+    ];
+    let mut header = vec!["  服务", "状态", "运行版本", "启动时间"];
+    if with_description {
+        widths.push(Constraint::Fill(1));
+        header.push("说明");
+    }
+    let table = Table::new(service_rows, widths)
+        .header(Row::new(header).style(Style::default().add_modifier(Modifier::BOLD)))
+        .block(boxed("服务"));
     frame.render_widget(table, rows[0]);
 
     let bottom = Layout::default()
@@ -392,7 +497,10 @@ fn draw_overview(frame: &mut Frame, state: &AppState, area: Rect) {
                 ]),
                 Some((reason, at)) => Line::from(vec![
                     Span::raw("保险丝:"),
-                    Span::styled(format!("已打开 — {reason}({at})"), level_style(Level::Error)),
+                    Span::styled(
+                        format!("已打开 — {reason}({})", ledger_time(at)),
+                        level_style(Level::Error),
+                    ),
                 ]),
             });
             if safety.open_cases.is_empty() {
@@ -413,13 +521,13 @@ fn draw_overview(frame: &mut Frame, state: &AppState, area: Rect) {
                         case.intent_id
                             .map(|id| id.to_string())
                             .unwrap_or_else(|| "-".to_owned()),
-                        case.opened_at
+                        ledger_time(&case.opened_at)
                     )));
                 }
             }
             safety_lines.push(Line::from(format!(
                 "最新 leader 信号:{}",
-                safety.last_signal_at.as_deref().unwrap_or("-")
+                safety.last_signal_at.as_deref().map(ledger_time).unwrap_or_else(|| "-".to_owned())
             )));
         }
     }
@@ -500,10 +608,11 @@ fn draw_logs(frame: &mut Frame, state: &AppState, area: Rect) {
         format!("日志 · {unit} · {}", flags.join(" · "))
     };
     let height = area.height.saturating_sub(2) as usize;
+    let width = area.width.saturating_sub(2) as usize;
     let lines: Vec<Line> = state
-        .visible_log_lines(height)
+        .log_view_rows(height, width)
         .into_iter()
-        .map(|line| {
+        .map(|(row, line)| {
             let style = if is_important_log(line) {
                 let lower = line.to_ascii_lowercase();
                 if lower.contains("fuse") || lower.contains("error") || lower.contains("failed") || lower.contains("panicked") {
@@ -516,7 +625,7 @@ fn draw_logs(frame: &mut Frame, state: &AppState, area: Rect) {
             } else {
                 Style::default()
             };
-            Line::from(Span::styled(line.to_owned(), style))
+            Line::from(Span::styled(row, style))
         })
         .collect();
     frame.render_widget(Paragraph::new(lines).block(boxed(&title)), area);
@@ -802,7 +911,11 @@ mod tests {
     };
 
     fn render(state: &AppState) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(140, 42)).unwrap();
+        render_sized(state, 140, 42)
+    }
+
+    fn render_sized(state: &AppState, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| draw(frame, state)).unwrap();
         terminal
             .backend()
@@ -896,6 +1009,50 @@ mod tests {
         for text in ["跟单操作面板", "交易服务", "运行中", "c0cd23d", "盘口采样", "保险丝已打开", "保险丝:正常", "已用43%,剩余22.0GB", "已成交9"] {
             assert!(has(&rendered, text), "missing {text}: {rendered}");
         }
+    }
+
+    #[test]
+    fn overview_drops_the_description_column_before_cutting_state_or_time() {
+        let mut state = state();
+        state.services[1].status = state.services[0].status.clone();
+        let wide = render(&state);
+        assert!(has(&wide, "说明"), "{wide}");
+        assert!(has(&wide, "只读,不下单"), "{wide}");
+
+        let narrow = render_sized(&state, 80, 42);
+        assert!(!has(&narrow, "说明"), "{narrow}");
+        for text in ["运行中", "c0cd23d", "09-2622:38"] {
+            assert!(has(&narrow, text), "missing {text}: {narrow}");
+        }
+        assert!(!has(&narrow, "Sat2026"), "{narrow}");
+    }
+
+    #[test]
+    fn long_log_lines_wrap_under_the_message() {
+        let line = "13:24:48 intent 862: filled_qty=17.2 price=0.47 order=0xabc";
+        assert_eq!(
+            wrap_log_line(line, 30),
+            vec![
+                "13:24:48 intent 862: filled_qt".to_owned(),
+                "         y=17.2 price=0.47 ord".to_owned(),
+                "         er=0xabc".to_owned(),
+            ]
+        );
+        assert_eq!(wrap_log_line("short", 30), vec!["short".to_owned()]);
+        assert_eq!(
+            wrap_log_line("09-28 13:47:18 abcdefghijklmnopqrst", 30)[1],
+            "               pqrst"
+        );
+        assert_eq!(wrap_log_line("中文日志", 5), vec!["中文".to_owned(), "  日".to_owned(), "  志".to_owned()]);
+
+        let mut state = state();
+        for line in ["13:00:00 old", "13:00:01 newest line that wraps"] {
+            state.push_log_line(line.to_owned(), 100);
+        }
+        // The newest line keeps both of its rows; the view fills upwards.
+        let rows: Vec<String> = state.log_view_rows(2, 20).into_iter().map(|(row, _)| row).collect();
+        assert_eq!(rows, vec!["13:00:01 newest line".to_owned(), "         that wraps".to_owned()]);
+        assert_eq!(state.log_view_rows(3, 20)[0].0, "13:00:00 old");
     }
 
     #[test]
