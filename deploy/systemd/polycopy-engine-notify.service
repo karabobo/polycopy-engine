@@ -14,7 +14,9 @@ Type=exec
 User=polycopy-engine
 Group=polycopy-engine
 UMask=0077
-WorkingDirectory=/opt/polycopy-engine/current
+# Its own directory, not the release symlink: a cwd resolved into a
+# release pins that release directory for as long as this process runs.
+WorkingDirectory=/opt/polycopy-engine/notify
 EnvironmentFile=/etc/polycopy-engine/persistent-public.env
 # FEISHU_APP_SECRET signs for everything the app can do, not just this
 # notifier. It goes through the credential store rather than the environment
@@ -26,6 +28,11 @@ Environment=NOTIFY_STATE_DIR=/var/lib/polycopy-engine-notify
 ExecStart=/usr/bin/python3 /opt/polycopy-engine/notify/notify.py
 Restart=always
 RestartSec=10s
+# A notification sidecar must never compete with the trading process:
+# lower CPU priority, and the lowest best-effort disk priority.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 
 NoNewPrivileges=yes
 CapabilityBoundingSet=

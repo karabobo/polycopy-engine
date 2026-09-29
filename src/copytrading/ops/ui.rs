@@ -18,7 +18,7 @@ use super::{
     services::{
         describe, human_bytes, is_important_log, short_since, Action, ServiceStatus, Unit, UNITS,
     },
-    stats::{case_type_zh, OutcomeCounts, SafetyState},
+    stats::{case_type_zh, AccountBudget, OutcomeCounts, SafetyState},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +98,7 @@ pub struct AppState {
     pub disk: Option<(u8, u64)>,
     pub safety: Option<SafetyState>,
     pub outcomes: Option<OutcomeCounts>,
+    pub account_budget: Option<AccountBudget>,
     pub live: Option<LiveConfig>,
     pub display_names: BTreeMap<String, String>,
     pub checks: Vec<Check>,
@@ -132,6 +133,7 @@ impl AppState {
             disk: None,
             safety: None,
             outcomes: None,
+            account_budget: None,
             live: None,
             display_names: BTreeMap::new(),
             checks: Vec::new(),
@@ -546,6 +548,41 @@ fn draw_overview(frame: &mut Frame, state: &AppState, area: Rect) {
             )
         },
     ]));
+    if let Some(budget) = &state.account_budget {
+        let percent = budget.percent();
+        let level = if percent >= 90 {
+            Level::Error
+        } else if percent >= 80 {
+            Level::Warn
+        } else {
+            Level::Ok
+        };
+        // In hours, like the Feishu notice ("24 小时", not "1 天").
+        let window = if budget.window_seconds > 0 && budget.window_seconds % 3_600 == 0 {
+            format!("{} 小时", budget.window_seconds / 3_600)
+        } else {
+            duration_zh(budget.window_seconds)
+        };
+        safety_lines.push(Line::from(vec![
+            Span::raw(format!("账户额度(滚动 {window}):")),
+            Span::styled(
+                format!(
+                    "已用 {} / {} USDC({percent}%)",
+                    budget.used.round_dp(2),
+                    budget.cap.normalize()
+                ),
+                level_style(level),
+            ),
+        ]));
+        if percent >= 80 {
+            if let Some(release) = &budget.first_release_at {
+                safety_lines.push(Line::from(format!(
+                    "  最早的占用 {} 起释放;挂单没成交的也占额度",
+                    ledger_time(release)
+                )));
+            }
+        }
+    }
     safety_lines.push(match state.disk {
         Some((percent, free)) => {
             let level = if percent >= 90 {
@@ -1053,6 +1090,25 @@ mod tests {
         let rows: Vec<String> = state.log_view_rows(2, 20).into_iter().map(|(row, _)| row).collect();
         assert_eq!(rows, vec!["13:00:01 newest line".to_owned(), "         that wraps".to_owned()]);
         assert_eq!(state.log_view_rows(3, 20)[0].0, "13:00:00 old");
+    }
+
+    #[test]
+    fn overview_shows_the_account_budget_and_when_room_returns() {
+        let mut state = state();
+        state.account_budget = Some(AccountBudget {
+            used: "555".parse().unwrap(),
+            cap: "600".parse().unwrap(),
+            window_seconds: 86_400,
+            first_release_at: Some("2026-09-29T08:38:42.319Z".into()),
+        });
+        let rendered = render(&state);
+        for text in ["账户额度(滚动24小时):已用555/600USDC(93%)", "最早的占用", "起释放"] {
+            assert!(has(&rendered, text), "missing {text}: {rendered}");
+        }
+        state.account_budget.as_mut().unwrap().used = "216.15".parse().unwrap();
+        let rendered = render(&state);
+        assert!(has(&rendered, "已用216.15/600USDC(36%)"), "{rendered}");
+        assert!(!has(&rendered, "最早的占用"), "release time only matters when nearly full");
     }
 
     #[test]
